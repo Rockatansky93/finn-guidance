@@ -1,37 +1,53 @@
 # ESP32 Firmware
 
-This crate is the ESP32 steering controller firmware. It is built separately 
-from the PC workspace using the ESP-IDF toolchain.
+**This directory is the original placeholder.** The firmware has been split into
+two separate crates for the two-ESP32 architecture:
 
-## Status: Phase 4 (not yet implemented)
+- **`firmware-sensor/`** — ESP32 #1 (Sensor Module): WAS pot ADC, BNO055 IMU, GPS NMEA passthrough
+- **`firmware-motor/`** — ESP32 #2 (Motor Controller): IBT-2 H-bridge PWM, steer command watchdog
 
-The first real-world test focuses on GPS guidance only (PC side). 
-The ESP32 firmware for motor control will be implemented after the 
-guidance system is validated in the field.
-
-## Planned functionality
-
-- Read wheel angle sensor (WAS) via ADC
-- Read BNO055 IMU via I2C  
-- Drive IBT-2 H-bridge via PWM
-- Communicate with PC via UDP over WiFi
-- Local PID safety loop (watchdog - stop motor if PC comms lost)
-
-## Build requirements
-
-- Rust with ESP32 target: `espup install`
-- ESP-IDF toolchain
-- `cargo build --target xtensa-esp32-espidf`
-
-## Hardware connections
-
+Both are standalone ESP-IDF Rust projects built outside the workspace with:
+```bash
+cd firmware-sensor   # or firmware-motor
+cargo build --target xtensa-esp32-espidf
 ```
-ESP32 Pin       Connection
-─────────       ──────────
-GPIO 34 (ADC)   WAS signal (via voltage divider 5V->3.3V)
-GPIO 21 (SDA)   BNO055 I2C SDA
-GPIO 22 (SCL)   BNO055 I2C SCL
-GPIO 25 (PWM)   IBT-2 RPWM
-GPIO 26 (PWM)   IBT-2 LPWM
-GPIO 27         IBT-2 R_EN + L_EN
+
+## Serial protocol
+
+All communication is text-based NMEA-style over USB serial for easy debugging
+with any serial monitor.
+
+### Sensor module → PC (USB-A)
+| Sentence | Fields | Rate |
+|----------|--------|------|
+| `$GPGGA,...` | GPS position (passthrough from LC29H) | 1Hz |
+| `$GPVTG,...` | GPS velocity (passthrough from LC29H) | 1Hz |
+| `$FINNWAS,<raw_adc>,<voltage_mv>*XX` | Wheel angle sensor | 20Hz |
+| `$FINNIMU,<roll>,<pitch>,<heading>,<cal_sys>,<cal_gyro>,<cal_accel>,<cal_mag>*XX` | BNO055 orientation + calibration | 20Hz |
+| `$FINNHB,<uptime_ms>*XX` | Heartbeat | 0.5Hz |
+
+### PC → Motor controller (USB-B)
+| Sentence | Fields | Rate |
+|----------|--------|------|
+| `$FINNSTEER,<pwm_value>*XX` | Steer command, -255 to 255 | ~20Hz from PID |
+
+### Motor controller → PC (USB-B)
+| Sentence | Fields | Rate |
+|----------|--------|------|
+| `$FINNMTR,<current_pwm>,<enabled>,<uptime_ms>*XX` | Motor status | 5Hz |
+
+### Checksum
+Standard NMEA XOR checksum — XOR of all bytes between `$` and `*`, rendered as
+two hex digits. Same algorithm used by GPS NMEA sentences.
+
+## Prerequisite: ESP Rust toolchain
+
+```bash
+# Install espup (ESP32 Rust toolchain manager)
+cargo install espup
+espup install
+
+# Source the environment (adds to PATH)
+# Windows: restart terminal after espup install
+# Linux/Mac: source ~/export-esp.sh
 ```

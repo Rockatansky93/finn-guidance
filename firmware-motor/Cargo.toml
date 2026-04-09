@@ -1,0 +1,19 @@
+[package]
+name = "finn-motor"
+version = "0.1.0"
+edition = "2021"
+description = "FINN Guidance - ESP32 Motor Controller (IBT-2 steering)"
+
+[dependencies]
+esp-idf-sys = { version = "0.35", features = ["binstart"] }
+esp-idf-hal = "0.44"
+esp-idf-svc = "0.49"
+log = "0.4"
+esp_idf_logger = "0.1"
+
+[build-dependencies]
+embuild = "0.32"
+
+# ESP-IDF configuration
+[package.metadata.esp-idf-sys]
+esp_idf_version = "v5.1"

@@ -5,23 +5,25 @@
 > Updated at the end of each working session.
 
 ## Last updated
-Session 10 — 1 April 2026
+Session 11 — 9 April 2026 (Phase 4 firmware scaffolding)
 
 ## What we're working on
-**Phase 3 is COMPLETE.** Phase 1 and Phase 2 were completed in earlier sessions.
-All three guidance-display phases are done and field-verified. The system is a
-fully functional GPS guidance display with AB line management, auto-pass selection,
-coverage logging, configurable lightbar, and persistent settings.
+**Phase 4 — ESP32 firmware.** Two firmware crates created:
+- `firmware-sensor/` — ESP32 #1: WAS pot ADC (GPIO 34), BNO055 I2C (21/22),
+  GPS NMEA passthrough via UART2 (16/17), GPIO 33 HIGH as pot 3.3V reference
+- `firmware-motor/` — ESP32 #2: IBT-2 PWM (GPIO 25/26), enable lines (27/14),
+  500ms watchdog, steer command parsing
 
-Session 10 covered:
-- Bugfixes for egui 0.29 API changes and smart-quote corruption (DECISIONS.md #012)
-- Field-verified AB line save/load and nudge (completed Phase 2 sign-off)
-- Configuration persistence: implement width, overlap, lightbar sensitivity, and
-  last-loaded AB line all saved to SQLite and restored on startup (#013)
-- Coverage data management: zoom-dependent render thinning, 100k-point memory cap
-  with oldest-half downsample, and "🗑 Clear Coverage" button (#014)
-- Job management UI: JOB HISTORY section with list/delete
-- Lightbar sensitivity UI: LIGHTBAR section in Setup page (±1 cm/seg, 1–50 range)
+Serial protocol is text-based NMEA-style (not UDP — both ESP32s on USB serial):
+- Sensor → PC: `$FINNWAS`, `$FINNIMU`, `$FINNHB`, plus raw GPS passthrough
+- PC → Motor: `$FINNSTEER,<pwm>*XX`
+- Motor → PC: `$FINNMTR,<pwm>,<enabled>,<uptime>*XX`
+
+**Not yet done:**
+- ESP Rust toolchain not yet installed (`espup install`)
+- PC-side parser for FINN sentences not yet written (currently only parses NMEA)
+- WAS calibration routine not yet implemented
+- PID controller (Phase 5) — depends on sensor data flowing first
 
 ## Current state of the code
 All features below are IMPLEMENTED and working:
@@ -64,23 +66,128 @@ All features below are IMPLEMENTED and working:
 - #013: Persist width/overlap/lightbar/last-AB-line, exclude nudge
 - #014: Coverage data management (render thinning, memory cap, clear button)
 
+## Phase 4 hardware inventory (as of 9 April 2026)
+- **ESP32 #1 (sensor node)**: reads WAS (ADC GPIO 34), BNO055 (I2C GPIO 21/22),
+  forwards GPS NMEA via UART2 passthrough (GPIO 16/17). USB A to laptop.
+- **ESP32 #2 (controller node)**: drives IBT-2 via PWM (GPIO 25/26) and enable
+  lines (GPIO 27/14). USB B to laptop.
+- **BNO055**: 3.3V I2C, connects direct to sensor ESP32, no level shifting needed.
+- **WAS**: RQH100030 replaced with a 10kΩ potentiometer. Wiper → GPIO 34 direct
+  (no voltage divider needed — pot powered from ESP32 3.3V rail, output 0–3.3V).
+  Calibration (centre, left lock, right lock ADC counts) to be stored in SQLite
+  config table. A "recalibrate WAS" button needed in Setup page.
+- **IBT-2**: RPWM/LPWM from ESP32 PWM pins. R_EN/L_EN on GPIO 27/14 for hard stop.
+  Logic powered from ESP32 #2 VIN (5V). Motor supply 12V direct from battery.
+- **GPS**: Quectel LC29H DA on ArduSimple board, UART to sensor ESP32 GPIO 16/17.
+  Powered from ESP32 #1 VIN (5V). Check ArduSimple header voltage (3.3V serial
+  header, not 5V) before wiring UART lines.
+- **No buck converter**: ESP32s powered via USB from laptop. IBT-2 logic and GPS
+  draw 5V from the VIN pins of their respective ESP32s (bench-tested OK).
+
+## Phase 4 ESP32 pinout map
+
+### ESP32 #1 — Sensor Module (USB-A to laptop)
+
+| GPIO | Function           | Direction | Notes                                          |
+|------|--------------------|-----------|-------------------------------------------------|
+| 34   | WAS pot wiper (ADC)| Input     | ADC1_CH6. Input-only pin, no pull needed. 0–3.3V from pot |
+| 33   | WAS pot VCC (3.3V) | Output    | Set HIGH at boot. Powers high side of 10kΩ pot (0.33mA draw) |
+| 21   | BNO055 SDA (I2C)   | I/O       | 3.3V I2C, internal pull-ups OK for short runs   |
+| 22   | BNO055 SCL (I2C)   | I/O       | 3.3V I2C, internal pull-ups OK for short runs   |
+| 16   | GPS UART2 RX       | Input     | Receives NMEA from ArduSimple 3.3V serial header |
+| 17   | GPS UART2 TX       | Output    | Sends config commands to LC29H DA               |
+| GND  | Common ground      | —         | Shared with pot low side, BNO055, GPS            |
+| VIN  | 5V out to GPS      | Power     | USB-powered. GPS module draws 5V from this pin   |
+
+**WAS pot wiring:** GPIO 33 (HIGH=3.3V) → pot pin 1 → wiper → GPIO 34 (ADC) → pot pin 3 → GND
+
+**Free pins (available for future use):** 4, 5, 12, 13, 14, 15, 18, 19, 23, 25, 26, 27, 32, 35
+
+### ESP32 #2 — Motor Controller (USB-B to laptop)
+
+| GPIO | Function           | Direction | Notes                                          |
+|------|--------------------|-----------|-------------------------------------------------|
+| 25   | IBT-2 RPWM         | Output    | PWM channel A (steer right). 20kHz recommended  |
+| 26   | IBT-2 LPWM         | Output    | PWM channel B (steer left). 20kHz recommended   |
+| 27   | IBT-2 R_EN         | Output    | Right enable. HIGH to enable, LOW for hard stop  |
+| 14   | IBT-2 L_EN         | Output    | Left enable. HIGH to enable, LOW for hard stop   |
+| GND  | Common ground      | —         | Shared with IBT-2 logic GND                      |
+| VIN  | 5V out to IBT-2    | Power     | USB-powered. IBT-2 logic VCC draws 5V from this pin |
+
+**Free pins (available for Trimble motor encoder):** 4, 5, 12, 13, 16, 17, 18, 19, 21, 22, 23, 32, 33, 34, 35, 36, 39
+
+**Trimble encoder notes (future):** If the encoder is quadrature (A/B channels), use two interrupt-capable GPIOs (e.g. 16/17 or 18/19). If it's a simple pulse output, one GPIO with interrupt is enough. Need to identify the encoder type and connector pinout from the Trimble motor datasheet.
+
+### Power distribution
+
+```
+Laptop USB-A ──► ESP32 #1 (sensor)
+                   ├── 3.3V rail → BNO055, pot ref (GPIO 33)
+                   └── VIN (5V)  → GPS module (ArduSimple board)
+
+Laptop USB-B ──► ESP32 #2 (controller)
+                   └── VIN (5V)  → IBT-2 logic VCC
+
+12V Battery ───► IBT-2 motor supply (direct, high current)
+```
+
+**No buck converter needed.** Both ESP32s are USB-powered from the field laptop.
+The 5V VIN pins back-feed 5V to the GPS and IBT-2 logic (bench-tested OK).
+
 ## What's blocked
-- **Field laptop**: original laptop couldn't fill the role. Two Dell Latitude 7390
-  2-in-1 units (i5 8350U, 8GB, 256GB SSD, touchscreen) ordered — still in the post.
-  Blocks tractor cab field testing.
 - **RTK**: no base station or NTRIP subscription yet. Running standalone GPS
   (HDOP 0.4 with 42–50 sats — usable for guidance display, not centimetre-accurate)
 
+## Field test checklist (tractor cab — 9 April 2026)
+This is the first build-and-run on the Dell 7390 2-in-1. Key things to verify:
+
+**Build / startup:**
+- [ ] `cargo build --release` completes clean on the Dell
+- [ ] GPS auto-detect finds the LC29H on the correct COM port
+- [ ] Module config commands send without errors (check console output)
+- [ ] App opens, GPS status bar shows sats/HDOP
+
+**Touch targets:**
+- [ ] ENGAGE button easy to hit with fingers while bouncing
+- [ ] ⚙ Setup and ◄ Working View buttons work with touch
+- [ ] +/- buttons for implement width, overlap, lightbar all usable
+- [ ] Save Line / Load dialogs operable without keyboard
+
+**Guidance display:**
+- [ ] Lightbar readable in sunlight / tractor cab lighting conditions
+- [ ] XTE readout visible from driving position
+- [ ] Vehicle triangle moves smoothly (interpolation working)
+- [ ] Auto-pass notification visible when triggered
+
+**AB line workflow:**
+- [ ] Set A → drive to B → Set B → line appears correct
+- [ ] Save line to a field, load it back
+- [ ] Auto-pass snaps correctly at headland turns
+- [ ] Nudge ±5cm step feels right for inter-row alignment
+
+**Coverage:**
+- [ ] Coverage strips painting correctly on field view
+- [ ] No slowdown or lag after extended working period
+
+**Notes to record after the test:**
+- Any touch targets that are too small or awkward
+- Lightbar sensitivity — does 20 cm/seg feel right? Too sensitive / not sensitive enough?
+- Any crashes or errors (note which operation triggered them)
+- Screen readability — any glare/contrast issues
+- Any features missing that would be needed for a real day's work
+
 ## Next session should
-1. Review this file and `DECISIONS.md` for context
-2. **Field test on Dell 2-in-1** when laptops arrive — install Rust toolchain,
-   build, verify touchscreen interaction, test full workflow in tractor cab
-   (lightbar readability, touch targets, auto-pass, nudge, save/load, overlap)
-3. **Phase 4 planning** — ESP32 steering controller. Review hardware shopping list,
-   plan wiring, set up ESP Rust toolchain. This is a fundamentally different kind
-   of work (hardware + firmware) compared to Phases 1–3.
-4. Consider adding area calculation (hectares from coverage points) before moving
-   to Phase 4 — useful for the operator and relatively simple to implement
+1. Read this file and DECISIONS.md for context
+2. **Install ESP Rust toolchain** — `cargo install espup && espup install`, verify
+   with a blink test on one ESP32 before attempting the full firmware
+3. **Build and flash firmware-sensor** — test GPS passthrough first (easiest to
+   verify), then WAS ADC reads, then BNO055 I2C
+4. **Build and flash firmware-motor** — test with manual `$FINNSTEER` commands from
+   a serial terminal, verify watchdog stops motor on disconnect
+5. **PC-side FINN sentence parser** — extend `pc/src/gps/parser.rs` (or new module)
+   to parse `$FINNWAS`, `$FINNIMU`, `$FINNHB`, `$FINNMTR` alongside existing NMEA
+6. **WAS calibration** — add calibration routine (centre/left-lock/right-lock) and
+   store in SQLite config table, add "Recalibrate WAS" button to Setup page
 
 ## File map (quick reference)
 ```
@@ -97,9 +204,12 @@ pc/src/position/tracker.rs   — position history and odometer
 pc/src/position/interpolator.rs — dead-reckoning between 1Hz GPS fixes for smooth GUI
 common/src/types.rs          — GpsFix, CrossTrackError, GuidanceLine, FixQuality
 common/src/coords.rs         — haversine, bearing, cross-track distance
-common/src/protocol.rs       — UDP message types (for ESP32 comms, Phase 4)
+common/src/protocol.rs       — serial protocol types (FINN sentences, was UDP, now serial)
+firmware-sensor/src/main.rs  — ESP32 #1: WAS ADC + BNO055 I2C + GPS NMEA passthrough
+firmware-motor/src/main.rs   — ESP32 #2: IBT-2 PWM + steer command parsing + watchdog
 docs/IMPLEMENTATION_PLAN.md  — full phase plan, task tracking, session log
 docs/DECISIONS.md            — architectural decision log (#001–#014)
+docs/INSTALLATION_GUIDE.md   — hardware wiring, PC setup, ESP32 flashing, troubleshooting
 docs/ACTIVE_CONTEXT.md       — this file
 ```
 
