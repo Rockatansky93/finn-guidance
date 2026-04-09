@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "pc",
+    "common",
+    # "firmware" - built separately with ESP-IDF toolchain
+]
+resolver = "2"
