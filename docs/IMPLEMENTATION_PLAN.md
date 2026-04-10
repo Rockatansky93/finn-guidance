@@ -86,69 +86,13 @@ automatically select the correct pass line when turning at the headland.
 
 ### Tasks
 1. **AB line creation** ✅
-   - "Set A" button captures current GPS position
-   - "Set B" button captures second position
-   - Draw the AB line on the field view
-   - Extend AB line infinitely in both directions
-
 2. **Cross-track error calculation** ✅
-   - Calculate perpendicular distance from current position to AB line
-   - Calculate heading error (current heading vs line bearing)
-   - Display as large, readable number (cm) with left/right indicator
-   - Colour code: green (<5cm), yellow (5-15cm), red (>15cm)
-
 3. **Pass management** ✅ (manual next/prev)
-   - Set implement width
-   - Next/previous pass buttons offset the guidance line
-   - Display current pass number
-   - Draw parallel pass lines on field view
-
-4. **Auto-pass selection** ✅
-   - Distance-based approach: continuously monitors cross-track error from the
-     current pass line. When the operator drifts more than `snap_threshold` (default
-     60%) of the implement width from the current line, snaps to the nearest pass.
-   - Works for all scenarios: headland U-turns, driving around obstacles, skipping
-     rows, diagonal approaches — no heading analysis needed.
-   - Hysteresis via snap_threshold (0.6 = must cross 60% before snapping, prevents
-     flickering at the boundary between two passes)
-   - Speed gate: auto-pass disabled below 0.5 m/s (~1.8 km/h) to avoid GPS jitter
-     at standstill causing false snaps
-   - Manual override still available via next/prev buttons
-   - "Auto ✓"/"Auto ✗" toggle button in controls bar
-   - Blue notification ("Auto → Pass N") on screen for ~3 seconds when triggered
-   - Active pass line rendered in blue (3px) to distinguish from red AB line and
-     faint red hypothetical pass lines
-   - Design note: skip factor (Decision #002) is no longer needed for auto-pass
-     selection — the distance approach is inherently skip-agnostic. Skip factor
-     remains relevant only for future auto-turn path generation (Phase 5+).
-
+4. **Auto-pass selection** ✅ (distance-based, Decision #005)
 5. **Lightbar indicator** ✅
-   - 31 segments (15 per side + 1 centre) rendered as painter overlay at top of
-     working page field view
-   - Segments light up in the direction you need to steer TOWARDS (left of line →
-     right segments light up)
-   - Colour ramp: green (centre) → yellow (mid) → red (edges), computed via
-     `lightbar_colour()` helper function
-   - Sensitivity: `lightbar_cm_per_seg` (default 2.0 cm/segment, 30cm full scale)
-   - Semi-transparent black background bar for readability over field view
-   - Unlit segments shown as dim outlines
-   - Centre segment always lit green when guidance is active
+6. **AB line persistence** ✅ (field→line model, Decision #010)
 
-6. **AB line persistence** ✅
-   - Save AB lines to SQLite database with optional name
-   - Load saved AB lines from database
-   - Two-level field→line model, JSON export/import, last-loaded auto-restore
-   - Associate active AB line with coverage segments
-
-### Done when
-- Can set AB line, drive parallel passes, and see accurate cross-track error ✅
-- System automatically selects the correct pass line when operator moves laterally ✅
-- Active pass line visually distinct (blue) from reference lines (red) ✅
-- Lightbar provides intuitive at-a-glance guidance ✅
-- Pass offset works correctly for implement width ✅
-- Implement width and overlap adjustable in the UI ✅
-- AB lines persist across sessions via database ✅
-- Field-verified: AB line save/load and nudge confirmed working ✅
+### Done when ✅ (all criteria met)
 
 ### Estimated effort: 3-4 sessions
 
@@ -160,97 +104,77 @@ render real-time coverage on the field view, and manage data volume efficiently.
 
 ### Tasks
 1. **GUI page system** ✅
-   - **Working page**: full-screen field view with lightbar overlay (31 segments),
-     large overlaid XTE readout (56pt, semi-transparent pill), auto-pass notification,
-     large engage/auto buttons in bottom bar, "⚙ Setup" button. All buttons sized
-     for tractor-cab touch targets (min_size).
-   - **Setup page**: right side panel (240px, scrollable) with sections for AB LINE,
-     IMPLEMENT (width +/- 0.5m steps, overlap +/- 5cm steps, pass spacing readout),
-     GUIDANCE, COVERAGE, POSITION, VIEW. Field view still visible alongside panel.
-   - Page switching via prominent buttons ("⚙ Setup" / "◄ Working View")
-   - ActivePage enum (Working/Setup) — not yet persisted across restarts
-   - Both pages share the GPS status strip (fix quality, sats, HDOP, speed, heading,
-     REC indicator)
-
 2. **Coverage rendering on field view** ✅
-   - Draw logged coverage points as quad strips between consecutive points
-     (using implement width and per-point heading for correct strip orientation)
-   - Colour-code strips by fix quality (green=RTK, yellow=float, blue=DGPS,
-     orange=GPS, red=NoFix) — semi-transparent so grid/lines show through
-   - Segment boundaries respected (no strip drawn across disengage/engage gaps)
-   - Viewport culling: skip off-screen points before computing quad geometry
-   - Last point in a segment draws as a small standalone rectangle
-   - Rendered on Layer 1.5 (above grid, below guidance lines and vehicle)
-   - Still needed: area calculation (hectares), spatial indexing for large datasets
-
 3. **Coverage data management** ✅
-   - Zoom-dependent render thinning in draw_coverage() (step 1–4 based on visible width)
-   - Memory cap at 100,000 points with oldest-half downsample (CSV unaffected)
-   - "🗑 Clear Coverage" button for task transitions (CSVs on disk untouched)
-
 4. **Job management** ✅
-   - JOB HISTORY section in Setup page COVERAGE area
-   - List last 10 jobs (date, points, segments) with delete button
-   - list_jobs() and delete_job() methods in db.rs
-
 5. **Configuration persistence** ✅
-   - SQLite config table (key-value store, already existed in db.rs)
-   - Implement width, overlap, lightbar sensitivity saved on every UI change
-   - Last-loaded AB line ID saved on load, auto-restored on startup
-   - Nudge deliberately excluded (session-specific, cleared by align-grid)
-   - Lightbar sensitivity adjustable in new LIGHTBAR section (1–50 cm/seg, ±1 steps)
 
-### Done when
-- Working page is clean enough to use while driving — large readouts, no clutter ✅
-- Setup page has all the controls for configuration and AB line management ✅
-- Field view shows coverage strips in real-time while working ✅
-- Coverage logging runs at a sustainable data rate for full-day operation ✅
-- Can resume work with saved AB lines and see previous coverage ✅
-- All settings persist across sessions ✅
+### Done when ✅ (all criteria met)
 
 ### Estimated effort: 4-5 sessions
 
 ---
 
-## Phase 4: ESP32 Steering Controller
-**Goal:** ESP32 firmware that reads sensors and controls the steering motor.
+## Phase 4: ESP32 Sensor & Motor Firmware
+**Goal:** ESP32 firmware that reads sensors and controls the steering motor,
+communicating with the PC over USB serial using text-based NMEA-style protocol.
+
+**Platform:** Arduino/PlatformIO (C++). See Decision #015 for rationale — Rust
+ESP-IDF toolchain was abandoned after multiple blocking toolchain issues.
 
 ### Tasks
-1. **ESP32 Rust setup**
-   - Install ESP Rust toolchain (`espup install`)
-   - Create firmware crate with `esp-idf-hal`
-   - Blink LED to verify toolchain works
+1. **ESP32 development environment** ✅
+   - ~~Install ESP Rust toolchain (`espup install`)~~ (abandoned — Decision #015)
+   - Installed PlatformIO CLI (`pip install platformio`)
+   - Arduino framework for ESP32 DevKit
+   - Build and flash verified working for both modules
 
-2. **Wheel angle sensor**
-   - Wire WAS through voltage divider (5V -> 3.3V)
-   - Read ADC on GPIO 34
-   - Calibration routine (record centre position, counts per degree)
-   - Filter/smooth readings
+2. **Sensor module firmware (ESP32 #1)** ✅
+   - `firmware-sensor-pio/` — PlatformIO Arduino project
+   - WAS: ADC read on GPIO 34, powered by GPIO 33 (3.3V HIGH), 20Hz
+   - BNO055: Adafruit library on I2C (GPIO 21/22), NDOF mode, 20Hz
+   - GPS: NMEA passthrough from ArduSimple via UART2 (GPIO 16 RX / 17 TX)
+   - Heartbeat every 2 seconds
+   - Output: `$FINNWAS`, `$FINNIMU`, `$FINNHB`, raw `$GPGGA`/`$GPVTG` passthrough
+   - Flashed and running ✅
 
-3. **BNO055 IMU**
-   - Wire BNO055 on I2C (GPIO 21/22)
-   - Read roll, pitch, heading at 100Hz
-   - Axis remapping for mounting orientation
-   - Calibration save/restore
+3. **Motor controller firmware (ESP32 #2)** ✅
+   - `firmware-motor-pio/` — PlatformIO Arduino project
+   - IBT-2: PWM on GPIO 25 (RPWM) / 26 (LPWM), 20kHz 8-bit via LEDC
+   - Enable lines: GPIO 27 (R_EN) / 14 (L_EN), LOW on startup
+   - Serial command parsing: `$FINNSTEER,<pwm>*<checksum>`
+   - Watchdog: motor stops if no valid command for 500ms
+   - Status output at 5Hz: `$FINNMTR,<pwm>,<enabled>,<uptime>*<checksum>`
+   - Flashed and running ✅
 
-4. **Motor control**
-   - Wire IBT-2 H-bridge to GPIO 25/26/27
-   - PWM output for speed control
-   - Direction control via RPWM/LPWM
-   - Safety: motor stops if no command received for 500ms (watchdog)
+4. **PC-side FINN sentence parser** 🔲
+   - Extend `pc/src/gps/parser.rs` (or new `pc/src/serial/` module) to parse
+     `$FINNWAS`, `$FINNIMU`, `$FINNHB`, `$FINNMTR` alongside existing NMEA
+   - Route sensor data to GUI (WAS readout, IMU heading/calibration status)
+   - Route motor status to GUI (PWM, enabled state)
+   - Separate serial port for motor controller (second USB)
 
-5. **UDP communication**
-   - ESP32 connects to WiFi
-   - Send sensor data (WAS + IMU) to PC at 10Hz
-   - Receive steer commands from PC
-   - Heartbeat / connection monitoring
+5. **WAS calibration** 🔲
+   - Calibration routine: record centre, left-lock, right-lock ADC counts
+   - Store calibration in SQLite config table
+   - Convert raw ADC to steering angle (degrees)
+   - "Recalibrate WAS" button in Setup page
+
+6. **Bench testing** 🔲
+   - Sensor ESP32: verify WAS ADC responds to pot, BNO055 heading changes,
+     GPS passthrough works (needs sky view or confirms empty-position sentences)
+   - Motor ESP32: verify motor responds to `$FINNSTEER` commands, watchdog
+     stops motor within 500ms, status messages at 5Hz
 
 ### Done when
-- ESP32 reads WAS and IMU, sends to PC
-- ESP32 drives motor in response to PC commands
-- Motor stops automatically if communication lost
+- ESP32 sensor module reads WAS, IMU, and GPS, sends data to PC over USB ✅ (firmware done)
+- ESP32 motor controller drives motor in response to PC commands ✅ (firmware done)
+- Motor stops automatically if communication lost ✅ (watchdog implemented)
+- PC application parses FINN sentences and displays sensor data 🔲
+- WAS calibration routine stores and applies calibration values 🔲
+- All sensors bench-tested and verified 🔲
 
-### Estimated effort: 4-5 sessions
+### Estimated effort: 4-5 sessions (firmware done in 1, PC integration remaining)
 
 ---
 
@@ -266,8 +190,8 @@ render real-time coverage on the field view, and manage data volume efficiently.
    - GUI controls for tuning
 
 2. **Steer integration**
-   - Send PID output to ESP32 as steer command
-   - ESP32 applies PWM to motor
+   - Send PID output to ESP32 as `$FINNSTEER` command over USB serial
+   - ESP32 applies PWM to motor via IBT-2
    - WAS feedback closes the inner loop
    - IMU roll compensation (adjust for hillside)
 
@@ -277,7 +201,7 @@ render real-time coverage on the field view, and manage data volume efficiently.
    - GPS fix quality gate (disable steer if fix degrades)
    - Speed-dependent gain adjustment
    - Physical disengage switch input on ESP32
-   - Watchdog: motor off if any sensor times out
+   - Watchdog: motor off if any sensor times out (already implemented in firmware)
 
 4. **Auto-turn at headland** 🔲
    - Detect end of run (approaching field boundary or user-defined headland line)
@@ -351,7 +275,6 @@ render real-time coverage on the field view, and manage data volume efficiently.
 - [x] Load previous coverage CSV files
 - [x] First field test completed (walk test, GPS fix confirmed, coverage recorded)
 - [x] Second field test completed (ute drive, 42 sats, HDOP 0.4, trail + AB line working)
-- [ ] Rust toolchain on field laptop (Dell Latitude 7390 2-in-1 ordered, in the post)
 
 **Phase 2: COMPLETE**
 - [x] AB line set A/B from GPS position
@@ -379,10 +302,27 @@ render real-time coverage on the field view, and manage data volume efficiently.
 - [x] Job management UI (JOB HISTORY list with delete)
 - [x] Configuration persistence (implement width, overlap, lightbar sensitivity, last AB line)
 
-### Next up: Phase 4 — ESP32 Steering Controller
-- Waiting on Dell Latitude 7390 2-in-1 laptops for field testing
-- Phase 4 is hardware + firmware (ESP32, WAS, IMU, motor control)
-- Review hardware shopping list before starting
+**Phase 4: IN PROGRESS** (firmware complete, PC integration remaining)
+- [x] PlatformIO development environment installed
+- [x] Sensor module firmware written and flashed (firmware-sensor-pio/)
+- [x] Motor controller firmware written and flashed (firmware-motor-pio/)
+- [x] Serial protocol implemented (FINNWAS, FINNIMU, FINNHB, FINNSTEER, FINNMTR)
+- [x] Watchdog safety (500ms timeout, motor stops automatically)
+- [x] PC-side FINN sentence parser (finn_parser.rs — parses $FINN* with checksums)
+- [x] PC-side sensor data pipeline (crossbeam channel, GUI SENSORS section)
+- [x] PC-side motor command sender (second serial port, MotorHandle, MOTOR TEST UI)
+- [x] Dual-ESP32 auto-detect (sensor vs motor by sentence type, Decision #016)
+- [x] Bench testing (WAS pot sweep, BNO055 movement, GPS passthrough, motor status)
+- [ ] WAS calibration routine and UI
+- [ ] Full field test on tractor (hardware being installed)
+
+### Next up: Field test on Dell 7390
+- Install all hardware on tractor (GPS, BNO055, WAS, IBT-2, motor, ESP32s)
+- Clone repo onto Dell 7390 laptop, build and run
+- Verify dual-port auto-detect on new PC
+- Run through field test checklist
+- Determine motor direction convention
+- Implement WAS calibration after mounting confirmed
 
 ---
 
@@ -410,210 +350,113 @@ render real-time coverage on the field view, and manage data volume efficiently.
 
 ### Session 3 (Mar 2026)
 - Identified critical logging bug: 27x point duplication per GPS epoch
-  - Root cause: GUI loop at ~200Hz draining channel, logging each received fix
-  - Parser emitted fix on every NMEA sentence, not just GGA
-  - 3830 CSV rows for only 138 unique GPS positions
 - Fixed NMEA parser: epoch-based emission, only emit fix on GGA sentences
-  - VTG data accumulated but doesn't trigger a fix
-  - One fix per GPS epoch instead of one per NMEA sentence
-- Rewrote coverage logger with three-gate filtering:
-  1. Epoch deduplication (skip if same timestamp_ms as last log)
-  2. Time filter (configurable minimum interval)
-  3. Distance filter (configurable minimum distance)
-- Added LogFilter presets: every_fix(), distance_based(), time_based()
-- Added SQLite coverage database (rusqlite with bundled feature):
-  - Jobs table: CSV filename, implement width, timestamps, totals
-  - Segments table: per-engage/disengage cycle within a job
-  - AB Lines table: save/load guidance lines across sessions
-  - Config table: key-value store for persistent settings
-- Reorganised Phase 1-3 in implementation plan:
-  - Phase 1 now includes field view canvas and coverage logging
-  - Phase 2 focuses on AB line guidance with persistence
-  - Phase 3 covers coverage rendering, job management, and config
+- Rewrote coverage logger with three-gate filtering
+- Added SQLite coverage database (rusqlite with bundled feature)
+- Reorganised Phase 1-3 in implementation plan
 
 ### Session 4 (Mar 2026) — Ute road test + planning
 - Second field test: drove ute along road with laptop + GPS
-  - Confirmed 42 satellites, HDOP 0.4 (excellent signal quality)
-  - Position trail, AB line, and pass lines all rendering correctly
-  - Cross-track error readout working (showing -28331cm = ~283m off-line, expected for road test)
-  - Coverage logging operational with 22 points recorded
-- Reviewed real-world usability and identified key improvements needed:
-  - **Auto-pass selection**: system must detect headland turns and automatically
-    snap to the correct next pass line (how existing AG systems work)
-  - **GUI page split**: current single-page layout too cluttered for tractor cab use.
-    Need a clean "working page" (big lightbar, big XTD, big engage) and separate
-    "setup page" (AB lines, config, detailed stats). HDOP + sats always visible.
-  - **Coverage data management**: logging volume is a real concern for full-day
-    operation. Need display-layer thinning, memory budgets, and rate monitoring
-    separate from the CSV recording fidelity.
-- Updated implementation plan:
-  - Phase 2 expanded with auto-pass selection as a key task
-  - Phase 3 restructured around GUI pages, coverage display, and data management
-  - Added priority ordering for next development tasks
+- Confirmed 42 satellites, HDOP 0.4 (excellent signal quality)
+- Reviewed real-world usability and identified key improvements needed
+- Updated implementation plan with auto-pass and GUI priorities
 
 ### Session 5 (27 Mar 2026) — Auto-pass, coverage rendering, field test + fixes
-- Implemented auto-pass selection (initially heading-based with 90° threshold):
-  - TravelDirection enum, heading reversal detection, debounce (30m + 0.5 m/s speed gate)
-  - "Auto ✓"/"Auto ✗" toggle button and blue "Auto → Pass N" notification in GUI
-- Implemented coverage strip rendering on field view canvas:
-  - Quad strips between consecutive CoveragePoints using heading + implement width
-  - Colour-coded by fix quality (green RTK, yellow float, blue DGPS, orange GPS, red NoFix)
-  - Semi-transparent (alpha ~90/255) so grid and guidance lines show through
-  - Viewport culling for performance, segment boundaries respected
-  - Rendered on Layer 1.5 (above grid, below guidance lines)
+- Implemented auto-pass selection (initially heading-based, then replaced)
+- Implemented coverage strip rendering on field view canvas
 - Third field test: ute drive with coverage + auto-pass
-  - 46-50 satellites, HDOP 0.4 — coverage strips painting correctly in orange
-  - Discovered pass line normal vector sign mismatch: drawing used `(-uy, ux)` (CCW)
-    but cross_track_distance uses CW convention → blue highlight on wrong side
-  - Fixed normal to `(uy, -ux)` to match cross-track sign convention
-  - Discovered auto-pass heading approach was fragile: driving around obstacles or
-    curves could trigger false pass changes when heading crossed 90° threshold
-- Replaced heading-based auto-pass with distance-based approach (Decision #005):
-  - Continuously monitors cross-track error from current pass line
-  - Snaps to nearest pass when error exceeds 60% of implement width (7.2m for 12m)
-  - Inherently handles all scenarios: turns, obstacles, row skipping, diagonal approaches
-  - No heading analysis, no debounce position tracking, no TravelDirection state
-  - Removed TravelDirection enum, last_direction, last_turn_position, turn_debounce_distance_m
-  - Added snap_threshold (0.6) as the single tuning parameter
-- Changed active pass line colour from green to blue (rgb 80, 160, 255) at 3px width
-  to clearly distinguish from red AB line and faint red hypothetical passes
+- Replaced heading-based auto-pass with distance-based approach (Decision #005)
 
 ### Session 6 (27 Mar 2026) — GUI page split, lightbar, implement width/overlap
-- Implemented GUI page split (Decision #004):
-  - `ActivePage` enum (Working/Setup) controls which page is shown
-  - **Working page**: full-screen field view, no side panel. Overlaid lightbar at top,
-    large XTE readout (56pt) in semi-transparent pill top-right, auto-pass notification
-    top-centre. Bottom bar: large ENGAGE button (20pt, 160×40px), Auto toggle, pass
-    indicator, "⚙ Setup" button. All buttons have min_size for touch targets.
-  - **Setup page**: right SidePanel (240px, scrollable) with sections — AB LINE
-    (Set A/B, pass next/prev, auto-pass toggle), IMPLEMENT (width +/-, overlap +/-,
-    pass spacing readout), GUIDANCE (XTE + heading error), COVERAGE (engage, stats),
-    POSITION (lat/lon/alt/speed/heading), VIEW (heading-up/north-up, grid, zoom).
-    Field view still visible in central panel.
-  - GPS status bar extracted to `draw_status_bar()` — shared by both pages, shows
-    fix quality, sats, HDOP, speed, heading, REC indicator.
-  - `fix_quality_display()` helper replaced duplicated match blocks.
-- Implemented lightbar indicator:
-  - 31 segments (15 per side + 1 centre) rendered via egui Painter API
-  - Segments light up towards the direction you need to steer (left of line → right
-    segments illuminate)
-  - Colour ramp via `lightbar_colour()`: green (centre) → yellow (mid) → red (edges)
-  - Sensitivity: `lightbar_cm_per_seg` field (default 2.0), full scale = 30cm
-  - Semi-transparent black background bar, unlit segments shown as dim outlines
-  - Centre segment always lit green when guidance is active
-- Implemented adjustable implement width:
-  - +/− buttons in 0.5m steps (range 0.5–36.0m) in setup page
-  - Changes synced to both `AbLineGuide.implement_width_m` and
-    `CoverageLogger.set_implement_width()`
-  - Pass offset recalculated immediately on width change
-- Implemented overlap setting (Decision #006):
-  - Added `overlap_m` field to `AbLineGuide` (default 0.0)
-  - Added `pass_spacing()` method: `(implement_width_m - overlap_m).max(0.1)`
-  - Updated all pass logic to use `pass_spacing()`: `next_pass()`, `prev_pass()`,
-    `update_auto_pass()` (threshold + offset), `find_nearest_pass()`, field_view
-    pass line rendering
-  - Coverage strips still use full implement width (correct: shows actual swath)
-  - UI: +/− in 5cm steps, capped at 90% of width, displayed in cm
-  - Pass spacing shown as computed readout below controls
-- All changes tested and verified working
+- Implemented GUI page split (Decision #004)
+- Implemented lightbar indicator (31 segments)
+- Implemented adjustable implement width and overlap (Decision #006)
 
 ### Session 7 (27 Mar 2026) — GPS 5Hz, auto-detect, distance-based logging
-- Identified GUI sluggishness caused by 1Hz GPS output rate — the module was only
-  sending one GGA sentence per second, so position/lightbar/XTE only updated once
-  per second regardless of the GUI's 60fps refresh rate.
-- Confirmed the existing architecture already supports decoupled rates: the GPS
-  reader sends every fix through the channel, the GUI drains all available fixes
-  per frame, and the coverage logger has independent three-gate filtering.
-- Implemented GPS module configuration on startup (Decision #007):
-  - `ensure_module_config()` sends PAIR commands to set 5Hz fix rate (200ms interval)
-    and disable GSA/GSV sentences (we only use GGA + VTG)
-  - Commands are idempotent — safe to send every boot
-  - `format_pair_command()` helper computes NMEA checksums correctly
-  - Configuration sent after port open, before the read loop starts
-- Implemented auto-detection of GPS serial port:
-  - `auto_detect_gps_port()` uses `serialport::available_ports()` to enumerate ports
-  - USB ports probed first (most likely to be GPS), then others
-  - Each port opened briefly at configured baud rate, checks for NMEA prefixes
-    (`$G`, `$PAIR`, `$PQTM`) in up to 20 lines
-  - `GpsConfig.port_name` defaults to `"auto"` — no manual COM port needed
-  - Logs port type (USB product name, PCI, Bluetooth, Unknown) during scan
-- Changed coverage logger default filter from every-fix to distance-based:
-  - `LogFilter::default()` now uses `min_distance_m: 1.0` (was 0.0)
-  - CSV only records when machine has moved ≥1m since last logged point
-  - Naturally adapts to speed: more points when moving fast, zero when stationary
-  - ~2,800 points/hr at 10km/h working speed (vs ~18,000/hr at 5Hz every-fix)
-- Updated `GpsConfig`: added `fix_rate_hz` field (default 10), default baud 115200,
-  default port "auto". `main.rs` now uses `GpsConfig::default()` instead of
-  hardcoded values.
-- Improved `ensure_module_config()` to disable sentences before setting rate (frees
-  module CPU first), read back PAIR001 acks, and fall back through rates on rejection.
-  Now disables GLL, GSA, GSV, RMC (not just GSA/GSV) — only GGA + VTG remain.
-- Discovered LC29H DA variant only accepts 1Hz PVT: PAIR001,050 returned error code
-  2 ("invalid parameter") for 100ms, 200ms, and 500ms intervals. 1000ms accepted.
-  The EA variant would be needed for higher-rate hardware output.
-- Implemented position interpolation (Decision #008):
-  - New `PositionInterpolator` in `pc/src/position/interpolator.rs`
-  - Dead-reckons between 1Hz fixes using `destination_point()` (spherical Earth
-    model, same as existing coord math)
-  - `display_fix` updated every GUI frame (~60fps) for smooth vehicle movement
-  - Real fixes (`current_fix`) still used for: coverage logging, auto-pass detection,
-    Set A/B, status bar metadata
-  - Trail uses real fixes only (1Hz breadcrumb path is sufficient)
-  - Safety: no interpolation below 0.3 m/s, capped at 2 seconds max extrapolation
-  - Unit tests for `destination_point()` (north, east, zero distance)
-- Changed lightbar sensitivity from 2 cm/segment to 20 cm/segment:
-  - Old: 30cm full scale — far too acute for standalone GPS
-  - New: 3.0m full scale — usable feedback without permanent max-out
-  - Will reduce to 5-10 cm/segment when RTK is added
-- All changes tested and verified working — smooth GUI, correct coverage logging,
-  auto-detect and module config functioning correctly
+- Implemented GPS module configuration on startup (Decision #007)
+- Implemented auto-detection of GPS serial port
+- Changed coverage logger to distance-based filtering
+- Discovered LC29H DA limited to 1Hz PVT
+- Implemented position interpolation (Decision #008)
+- Changed lightbar sensitivity to 20 cm/segment
 
 ### Session 8 (31 Mar 2026) — Nudge, align grid to here
-- Implemented nudge feature (Decision #009):
-  - `nudge_m` field on `AbLineGuide`, applied in `calculate_error()` and
-    `find_nearest_pass()`. Three methods: `nudge_right()`, `nudge_left()`, `nudge_reset()`
-  - Field view renders all pass lines at nudged positions
-  - UI: NUDGE section in Setup page (±5cm standard, ±1cm fine, Reset button)
-  - Working page: amber "Nudge N cm →R/←L" indicator when nudge ≠ 0
-  - Hard cap ±200 cm to prevent accidental large shifts
-- Implemented "Align Grid to Here" (Decision #011):
-  - "⊕ Align Grid to Here" button in AB LINE section
-  - Snaps pass grid so current GPS position falls on nearest whole pass line
-  - Resets nudge to zero, preserves AB line geometry
-  - Greyed out until line loaded + GPS fix available
+- Implemented nudge feature (Decision #009)
+- Implemented "Align Grid to Here" (Decision #011)
 
 ### Session 9 (31 Mar 2026) — AB line persistence, field→line model
-- Implemented AB line persistence (Decision #010):
-  - Two-level field→line model: fields (paddocks) group AB lines
-  - `fields` table added to SQLite schema, `ab_lines` has optional `field_id` FK
-  - "💾 Save Line…" button with inline dialog (name + field picker)
-  - SAVED LINES section with collapsible field headers, Load/Delete per line
-  - "+ Field" button for creating new field groups
-  - "⬆ Export JSON" / "⬇ Import JSON" for cross-PC transfer
-    (`data/finn_ab_lines.json`, idempotent import with duplicate detection)
-- Session was interrupted but all intended work was completed
+- Implemented AB line persistence (Decision #010)
+- Two-level field→line model with JSON export/import
 
 ### Session 10 (1 Apr 2026) — Bugfixes, config persistence, coverage management, Phase 3 completion
-- Fixed compile errors from egui 0.29 API changes (Decision #012):
-  - 3× curly-quote `format!()` errors (smart-quote corruption)
-  - 1× `show_tooltip_text` signature change (added `LayerId` parameter)
-  - 3× deprecated `id_source` → `id_salt` renames
-  - 1× unused `PathBuf` import in db.rs
-  - 1× borrow checker fix (unassigned lines Vec held references into self)
-- Field tested — AB line save/load and nudge both confirmed working
-- Implemented configuration persistence (Decision #013):
-  - Implement width and overlap saved to SQLite config table on every UI change
-  - Lightbar sensitivity saved (new LIGHTBAR section in Setup, ±1 cm/seg, 1–50 range)
-  - Last-loaded AB line ID saved, auto-restored on startup
-  - Nudge deliberately excluded (session-specific)
-- Implemented coverage data management (Decision #014):
-  - Zoom-dependent render thinning (step 1 at ≤100m visible, step 4 at ≥500m)
-  - Memory cap at 100k points with oldest-half downsample
-  - "🗑 Clear Coverage" button for task transitions (CSVs untouched)
-- Implemented job management:
-  - `list_jobs()` and `delete_job()` methods added to db.rs, `SavedJob` struct
-  - JOB HISTORY section in Setup page (last 10 jobs, date/points/segments, delete)
-- **Phase 3 complete.** Phases 1, 2, and 3 all done and field-verified.
+- Fixed compile errors from egui 0.29 API changes (Decision #012)
+- Field tested — AB line save/load and nudge confirmed working
+- Implemented configuration persistence (Decision #013)
+- Implemented coverage data management (Decision #014)
+- Implemented job management UI
+- **Phase 3 complete.**
+
+### Session 11 (10 Apr 2026) — ESP32 firmware: Rust abandoned, Arduino/PlatformIO adopted
+- Attempted Rust/esp-idf-hal firmware build for ESP32 sensor and motor modules
+- Encountered cascading toolchain issues (Decision #015):
+  - Cargo workspace conflict → fixed with `workspace.exclude`
+  - Missing Xtensa target → fixed with `rustup override set esp`
+  - No prebuilt `core` → fixed with `build-std` in `.cargo/config.toml`
+  - Windows path too long → fixed with `CARGO_TARGET_DIR=/c/espbuild`
+  - `time_t` size mismatch (`i64` vs `i32`) between esp-idf-sys and toolchain
+  - `i8`/`u8` pointer mismatch in esp-idf-svc TLS bindings
+  - Version resolution failures (esp-idf-hal 0.44 vs 0.46 conflict)
+  - 465MB esp-clang download repeatedly failing on unstable internet (final straw)
+- Used `cargo generate esp-rs/esp-idf-template` to identify correct version
+  combinations — confirmed the ecosystem requires git-master crates with
+  ESP-IDF v5.5.3, `espidf_time64` rustflag, and `[patch.crates-io]` overrides
+- **Decision: abandon Rust for ESP32 firmware, switch to Arduino/PlatformIO (C++)**
+- Created `firmware-sensor-pio/` — PlatformIO Arduino project for ESP32 #1:
+  - WAS ADC (GPIO 34), GPIO 33 HIGH for pot power
+  - BNO055 via Adafruit library on I2C (GPIO 21/22)
+  - GPS NMEA passthrough via HardwareSerial UART2 (GPIO 16/17)
+  - 20Hz sensor output, 2s heartbeat, NMEA checksum on all FINN sentences
+- Created `firmware-motor-pio/` — PlatformIO Arduino project for ESP32 #2:
+  - IBT-2 PWM via LEDC (GPIO 25/26, 20kHz 8-bit)
+  - Enable lines (GPIO 27/14), LOW on startup
+  - `$FINNSTEER` command parsing with checksum verification
+  - 500ms watchdog, 5Hz status output
+- **Both ESP32 modules flashed successfully** — total time ~10 minutes vs hours
+  of failed Rust toolchain debugging
+- Updated root `Cargo.toml` workspace exclude to include PlatformIO directories
+- Serial protocol identical to original Rust design — PC-side code unaffected
+- Old Rust firmware crates (`firmware-sensor/`, `firmware-motor/`) archived in repo
+
+### Session 12 (10 Apr 2026) — Sensor bench testing
+- Bench tested sensor ESP32 with all three sensors connected
+- WAS pot: clean linear sweep 0–4095 across rotation, no noise
+- BNO055: roll/pitch/heading responding to movement, cal status updating
+- GPS passthrough: full NMEA constellation data flowing (3D fix, HDOP 0.86)
+- All three data streams interleaved correctly on single USB serial
+
+### Session 13 (10 Apr 2026) — PC-side FINN parser, motor test UI, dual auto-detect
+- Created `finn_parser.rs` — parses $FINNWAS, $FINNIMU, $FINNHB, $FINNMTR with
+  NMEA checksum validation. Unit tests against real serial output (all passing).
+- Rewrote `protocol.rs` — replaced old UDP-based types with actual serial protocol.
+  New `FinnMessage` enum, `nmea_checksum()`, `format_steer_command()`.
+- Updated `types.rs` — ImuData now has cal fields, WasReading has voltage_mv,
+  added EspHeartbeat and MotorStatus structs.
+- Wired FINN channel (crossbeam bounded:128) from serial reader to GUI.
+- Added SENSORS section to Setup page — live WAS/IMU/heartbeat display.
+- Built motor serial reader (`comms/serial.rs`) — auto-detects motor ESP32 on
+  separate COM port, MotorHandle with Arc<Mutex> for thread-safe steer commands.
+- Added MOTOR TEST section to Setup page — preset PWM buttons (-100 to +100),
+  ±10 fine adjust, emergency STOP, motor status and WAS feedback display.
+- Fixed dual-ESP32 auto-detect issue (Decision #016): sensor reader now
+  distinguishes sensor ESP32 ($FINNWAS/$FINNIMU) from motor ESP32 ($FINNMTR),
+  skips motor port. Reads 40 lines to catch FINN sentences when GPS NMEA arrives
+  first. Skips GPS module config (PAIR commands) for ESP32 connections.
+- Fixed port coordination: sensor reader reports claimed port via channel so
+  motor reader excludes it during auto-detect.
+- Replaced `comms/udp.rs` with `comms/serial.rs`.
+- **Full bench test successful**: sensor data + motor status flowing through
+  complete pipeline to GUI. Motor test panel connected and responsive.
+- **Hardware being installed on tractor for first full prototype field test.**
 
 ---
 
@@ -621,33 +464,38 @@ render real-time coverage on the field view, and manage data volume efficiently.
 
 Already have:
 - [x] 24V 500rpm brushed DC motor
-- [x] Wheel angle sensor (WAS)
+- [x] Wheel angle sensor (WAS) — 10kΩ potentiometer
 - [x] H-bridge motor driver (IBT-2)
-- [x] GPS receiver (Quectel lc29h on ArduSimple board)
+- [x] GPS receiver (Quectel LC29H DA on ArduSimple board)
+- [x] 2× ESP32 DevKit modules (flashed and running)
+- [x] BNO055 IMU breakout board
 
 Still needed:
-- [ ] BNO055 IMU breakout board (~$35 AUD from Adafruit/Core Electronics)
-- [ ] ESP32 DevKit (~$15 AUD)
-- [ ] Voltage divider resistors for WAS (10kΩ + 20kΩ, ~$0.50)
 - [ ] Mounting hardware for motor + GPS antenna
 - [ ] RTK base station OR NTRIP subscription for corrections
+- [ ] Dell Latitude 7390 2-in-1 field laptops (on order)
 
 ---
 
-## Key Dependencies (Rust Crates)
+## Key Dependencies
+
+### PC application (Rust)
 
 | Crate           | Version | Purpose                          |
 |-----------------|---------|----------------------------------|
 | nmea            | 0.7     | NMEA sentence parsing            |
-| serialport      | 4.0     | Serial port for GPS              |
+| serialport      | 4.0     | Serial port for GPS + ESP32s     |
 | eframe/egui     | 0.29    | GUI framework                    |
 | rusqlite        | 0.31    | Coverage database (bundled SQLite)|
 | pid             | 4.0     | PID controller (Phase 5)         |
-| bno055          | 0.4     | IMU driver (Phase 4)             |
-| esp-idf-hal     | 0.44    | ESP32 hardware abstraction       |
-| serde           | 1.0     | Serialisation for UDP protocol   |
-| tokio           | 1.0     | Async runtime                    |
+| serde           | 1.0     | Serialisation for JSON export    |
 | crossbeam       | 0.5     | Thread-safe channels             |
-| tracing         | 0.1     | Structured logging               |
 | chrono          | 0.4     | Timestamps                       |
-| ublox           | 0.9     | UBX protocol (optional, for F9P config) |
+
+### ESP32 firmware (Arduino/PlatformIO)
+
+| Library                    | Purpose                          |
+|----------------------------|----------------------------------|
+| espressif32 (platform)     | ESP32 Arduino framework          |
+| Adafruit BNO055            | IMU driver (sensor module)       |
+| Adafruit Unified Sensor    | Sensor abstraction (BNO055 dep)  |

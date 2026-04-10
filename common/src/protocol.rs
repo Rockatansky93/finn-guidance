@@ -1,46 +1,56 @@
-use serde::{Deserialize, Serialize};
+//! Serial protocol definitions for FINN ESP32 ↔ PC communication.
+//!
+//! Both ESP32 modules communicate with the PC over USB serial using text-based
+//! NMEA-style sentences with XOR checksums.
+//!
+//! ## Sensor ESP32 → PC
+//! - `$FINNWAS,<raw_adc>,<voltage_mv>*<checksum>`      (20Hz)
+//! - `$FINNIMU,<roll>,<pitch>,<heading>,<cal_sys>,<cal_gyro>,<cal_accel>,<cal_mag>*<checksum>` (20Hz)
+//! - `$FINNHB,<uptime_ms>*<checksum>`                   (every 2s)
+//! - Raw NMEA passthrough: `$GNGGA,...`, `$GNVTG,...`    (1Hz from LC29H DA)
+//!
+//! ## PC → Motor ESP32
+//! - `$FINNSTEER,<pwm_value>*<checksum>`   (pwm: -255 to 255)
+//!
+//! ## Motor ESP32 → PC
+//! - `$FINNMTR,<current_pwm>,<enabled>,<uptime_ms>*<checksum>`  (5Hz)
+
 use crate::types::*;
 
-/// Messages sent from ESP32 to PC
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum EspToPC {
-    /// Periodic sensor report (sent at ~10Hz)
-    SensorReport {
-        imu: ImuData,
-        wheel_angle: WasReading,
-    },
-    /// Heartbeat / alive signal
-    Heartbeat {
-        uptime_ms: u64,
-    },
+/// All possible messages parsed from ESP32 serial streams
+#[derive(Debug, Clone)]
+pub enum FinnMessage {
+    /// Wheel angle sensor reading (from sensor ESP32, 20Hz)
+    Was(WasReading),
+    /// IMU orientation + calibration (from sensor ESP32, 20Hz)
+    Imu(ImuData),
+    /// Sensor ESP32 heartbeat (every 2s)
+    SensorHeartbeat(EspHeartbeat),
+    /// Motor controller status (from motor ESP32, 5Hz)
+    MotorStatus(MotorStatus),
 }
 
-/// Messages sent from PC to ESP32
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum PCToEsp {
-    /// Steering command from PID controller
-    SteerCommand {
-        pwm_value: i16,  // -255 to 255 (negative = left, positive = right)
-    },
-    /// Request current sensor state
-    RequestSensors,
-    /// Calibration command for WAS
-    CalibrateWas {
-        centre_value: u16,  // ADC value when wheels are straight
-        counts_per_degree: f64,
-    },
-    /// Heartbeat / alive signal
-    Heartbeat,
+/// GPS serial baud rate (LC29H DA default, also used by both ESP32s)
+pub const SERIAL_BAUD_RATE: u32 = 115200;
+
+/// Compute NMEA-style XOR checksum over a message body (between $ and *)
+pub fn nmea_checksum(body: &str) -> u8 {
+    body.bytes().fold(0u8, |acc, b| acc ^ b)
 }
 
-/// Default UDP port for ESP32 -> PC communication
-pub const ESP_TO_PC_PORT: u16 = 9500;
-
-/// Default UDP port for PC -> ESP32 communication  
-pub const PC_TO_ESP_PORT: u16 = 9501;
-
-/// Default GPS serial baud rate (ZED-F9P default)
-pub const GPS_BAUD_RATE: u32 = 115200;
-
-/// Sensor report rate in Hz
-pub const SENSOR_REPORT_HZ: u32 = 10;
+/// Format a steer command for sending to the motor ESP32.
+/// Returns a complete sentence including `$`, `*`, checksum, and `\r\n`.
+///
+/// # Example
+/// ```
+/// use finn_guidance_common::protocol::format_steer_command;
+/// let cmd = format_steer_command(128);
+/// assert!(cmd.starts_with("$FINNSTEER,128*"));
+/// assert!(cmd.ends_with("\r\n"));
+/// ```
+pub fn format_steer_command(pwm: i16) -> String {
+    let pwm = pwm.clamp(-255, 255);
+    let body = format!("FINNSTEER,{}", pwm);
+    let cs = nmea_checksum(&body);
+    format!("${}*{:02X}\r\n", body, cs)
+}

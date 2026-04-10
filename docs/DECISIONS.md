@@ -384,3 +384,114 @@ current volumes), time-based recency windows (rejected: adds complexity for mini
 benefit over the simple oldest-half downsample), automatic clear on job end (rejected:
 the operator should decide when to clear — a breakdown recovery needs the data to
 persist across disengage/re-engage cycles).
+
+---
+
+## #015 — Arduino/PlatformIO for ESP32 firmware, not Rust/esp-idf-hal
+**Date:** 10 April 2026  
+**Context:** Phase 4 required flashing two ESP32 DevKit modules with firmware for
+sensor reading (WAS + BNO055 + GPS passthrough) and motor control (IBT-2 H-bridge).
+The initial approach used Rust with `esp-idf-hal` / `esp-idf-svc` crates, targeting
+the `xtensa-esp32-espidf` target. This required:
+- Espressif's custom Rust toolchain fork (`espup install`)
+- A `.cargo/config.toml` with `build-std = ["std", "panic_abort"]` (no prebuilt
+  standard library for Xtensa)
+- `CARGO_TARGET_DIR` redirection to a short path (ESP-IDF build scripts fail with
+  long Windows paths, even with directory junctions)
+- Precise version alignment between `esp-idf-sys`, `esp-idf-hal`, `esp-idf-svc`,
+  `embuild`, and the ESP-IDF SDK version
+
+Multiple blocking issues were encountered:
+1. **Workspace conflict**: `firmware-sensor/` auto-discovered by root workspace.
+   Fixed with `workspace.exclude`.
+2. **Missing Xtensa target**: needed `rustup override set esp` to use the espup
+   toolchain instead of stable.
+3. **No prebuilt `core`**: required `build-std` in `.cargo/config.toml`.
+4. **Path too long**: ESP-IDF build output exceeded Windows path limits. Required
+   `CARGO_TARGET_DIR=/c/espbuild`.
+5. **`time_t` size mismatch** (`i64` vs `i32`): `esp-idf-sys 0.34` incompatible
+   with the installed toolchain. Required `--cfg espidf_time64` rustflag.
+6. **`i8`/`u8` pointer mismatch**: `esp-idf-svc 0.49` TLS bindings generated
+   incorrect pointer types against ESP-IDF v5.1.
+7. **Version resolution failures**: `esp-idf-svc` on git master required
+   `esp-idf-hal 0.46`, conflicting with pinned `0.44`.
+8. **465MB clang download**: the `esp-clang` toolchain download repeatedly failed
+   due to unstable internet, with no resume support. This was the final straw.
+
+The fundamental problem: `esp-idf-sys` compiles the entire ESP-IDF C framework from
+source and generates Rust bindings on top. You pay all the complexity of C *plus* a
+thick layer of binding issues. The Rust safety guarantees provide minimal value for
+this firmware — the code is simple, single-threaded, and the failure modes are
+electrical (wrong pin, wrong voltage) not logical.
+
+**Decision:** Replace the Rust firmware crates with Arduino/PlatformIO (C++) projects.
+New directories: `firmware-sensor-pio/` and `firmware-motor-pio/`. The serial
+protocol is identical — the PC-side Rust code needs no changes.
+
+**Result:** Both ESP32 modules flashed successfully in under 5 minutes each. The
+PlatformIO ESP32 Arduino framework download was ~200MB (vs 465MB+ for Rust ESP-IDF
+clang alone) and completed without issues. Build times are seconds, not 10-20 minutes.
+
+**What stayed the same:**
+- Pin assignments (GPIO 34 WAS, 33 power, 21/22 I2C, 16/17 GPS, 25/26 PWM, 27/14 EN)
+- Serial protocol ($FINNWAS, $FINNIMU, $FINNHB, $FINNSTEER, $FINNMTR)
+- NMEA checksum algorithm
+- Watchdog timeout (500ms)
+- PWM frequency (20kHz) and resolution (8-bit)
+- BNO055 NDOF mode with calibration readout
+
+**What changed:**
+- BNO055 uses Adafruit library instead of raw I2C register access (same result,
+  less code, well-tested library)
+- LEDC PWM uses Arduino `ledcSetup()`/`ledcWrite()` instead of `esp-idf-hal` wrapper
+- GPS UART uses Arduino `HardwareSerial` instead of `esp-idf-hal::uart`
+
+**Old Rust crates** (`firmware-sensor/`, `firmware-motor/`) remain in the repo but
+are archived — no longer built or maintained.
+
+**Alternatives considered:** Persevering with Rust (rejected: multiple hours spent
+on toolchain issues with no firmware actually running — the complexity tax is not
+justified for simple embedded I/O), ESP-IDF native C without Arduino (rejected:
+Arduino framework provides the same ESP-IDF underneath with a simpler API and
+better library ecosystem, no practical downside for this use case).
+
+---
+
+## #016 — Dual-ESP32 auto-detect: distinguish sensor vs motor by sentence type
+**Date:** 10 April 2026  
+**Context:** The sensor ESP32 and motor ESP32 are both connected via USB serial
+(separate COM ports). Both send `$FINN`-prefixed sentences, so the original
+auto-detect (which just looked for `$FINN`) could not distinguish them. On first
+run, the sensor reader grabbed COM6 (motor) because USB ports were enumerated in
+an unexpected order. This caused two problems: (1) the sensor reader tried to send
+PAIR GPS config commands to the motor ESP32, which blocked for 90 seconds waiting
+for an ack that would never come; (2) the motor reader then couldn't find its port
+because the sensor reader had already claimed it.
+
+**Decision:** The sensor reader's auto-detect reads up to 40 lines from each port
+and classifies by sentence type:
+- `$FINNWAS`, `$FINNIMU`, `$FINNHB` → sensor ESP32 (claim this port)
+- `$FINNMTR` → motor ESP32 (skip this port, let the motor reader find it)
+- `$GNGGA`, `$GNVTG` etc. → raw GPS module (claim, but keep reading to check
+  for FINN sentences — the sensor ESP32 also passes through GPS NMEA)
+
+The motor reader runs in a separate thread and auto-detects independently, excluding
+the port already claimed by the sensor reader (communicated via a one-shot channel).
+
+**Why 40 lines:** The sensor ESP32 sends WAS+IMU at 20Hz and GPS at 1Hz. In the
+worst case, the auto-detect's first line is a GPS sentence. At 20Hz FINN output,
+a `$FINNWAS` or `$FINNIMU` will appear within 2-3 more lines. 40 lines gives
+comfortable margin even with GPS GSV satellite blocks (which can be 10+ lines
+per epoch).
+
+**ESP32-aware config skip:** When `is_esp32` is true, the reader skips
+`ensure_module_config()` entirely. PAIR commands sent to the ESP32's USB serial
+would be consumed by the ESP32's main loop (which doesn't understand them) rather
+than reaching the LC29H behind UART2. The GPS module retains its 1Hz default
+config, which is correct for the DA variant.
+
+**Alternatives considered:** Separate config for port names (rejected: defeats the
+purpose of auto-detect and breaks portability between PCs), USB VID/PID matching
+(rejected: both ESP32s use identical CH340 USB-serial chips — VID/PID is the same),
+fixed port assignment (rejected: COM port numbers change when USB ports are
+rearranged or the system moves to a different PC).

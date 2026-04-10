@@ -1,8 +1,7 @@
 [workspace]
+exclude = ["firmware-sensor-pio", "firmware-motor-pio"]
 members = [
     "pc",
     "common",
-    # firmware-sensor and firmware-motor are standalone ESP-IDF crates,
-    # built separately with: cargo build --target xtensa-esp32-espidf
 ]
 resolver = "2"

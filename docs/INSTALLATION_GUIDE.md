@@ -167,40 +167,37 @@ appears on. No manual port configuration is needed.
 
 ## 4. ESP32 firmware installation
 
-### 4.1 Install the ESP32 Rust toolchain
+The ESP32 firmware uses Arduino/PlatformIO (C++). Each ESP32 module has its own
+PlatformIO project directory.
+
+### 4.1 Install PlatformIO
 
 This is a one-time setup on whichever machine you use for flashing (can be the
 field laptop or a separate development PC).
 
 ```bash
-# Install espup (ESP32 Rust toolchain manager)
-cargo install espup
+# Install PlatformIO CLI
+pip install platformio
 
-# Install the ESP32 Rust toolchain (Xtensa LLVM fork, linker, etc.)
-espup install
-
-# Install espflash (flashing and monitoring tool)
-cargo install espflash
-
-# IMPORTANT: restart your terminal after this step
-# The environment variables set by espup need a fresh shell to take effect
+# Verify installation
+pio --version
 ```
+
+PlatformIO will automatically download the ESP32 Arduino framework (~200MB) on
+the first build. No additional toolchain installation is needed.
 
 ### 4.2 Flash the Sensor Module (ESP32 #1)
 
-Plug in **only** ESP32 #1 via USB so espflash can auto-detect the correct port.
+Plug in **only** ESP32 #1 via USB so PlatformIO can auto-detect the correct port.
 
 ```bash
-cd finn-guidance/firmware-sensor
+cd finn-guidance/firmware-sensor-pio
 
-# Build the firmware
-cargo build --target xtensa-esp32-espidf
-
-# Flash to the ESP32
-espflash flash target/xtensa-esp32-espidf/debug/finn-sensor
+# Build and flash
+pio run --target upload
 
 # Open a serial monitor to verify output (Ctrl+C to exit)
-espflash monitor
+pio device monitor
 ```
 
 You should see output like:
@@ -232,16 +229,13 @@ BNO055 init failed — IMU data will be zeros. Check wiring.
 Unplug ESP32 #1. Plug in **only** ESP32 #2.
 
 ```bash
-cd finn-guidance/firmware-motor
+cd finn-guidance/firmware-motor-pio
 
-# Build the firmware
-cargo build --target xtensa-esp32-espidf
-
-# Flash to the ESP32
-espflash flash target/xtensa-esp32-espidf/debug/finn-motor
+# Build and flash
+pio run --target upload
 
 # Open a serial monitor to verify output (Ctrl+C to exit)
-espflash monitor
+pio device monitor
 ```
 
 You should see status messages at 5Hz:
@@ -265,22 +259,32 @@ port explicitly:
 
 ```bash
 # Windows
-espflash flash --port COM3 target/xtensa-esp32-espidf/debug/finn-sensor
-espflash monitor --port COM3
+pio run --target upload --upload-port COM3
+pio device monitor --port COM3
 
 # Linux
-espflash flash --port /dev/ttyUSB0 target/xtensa-esp32-espidf/debug/finn-sensor
-espflash monitor --port /dev/ttyUSB0
+pio run --target upload --upload-port /dev/ttyUSB0
+pio device monitor --port /dev/ttyUSB0
 ```
 
 To find available ports on Windows, check Device Manager under
 "Ports (COM & LPT)", or run `mode` in a terminal.
 
-### 4.5 First build is slow
+### 4.5 First build downloads the framework
 
-The first `cargo build` for each firmware crate takes 10–20 minutes because it
-downloads and compiles the entire ESP-IDF C framework underneath the Rust
-bindings. Subsequent builds only recompile your Rust code and take seconds.
+The first `pio run` for each firmware project downloads the ESP32 Arduino
+framework (~200MB) and compiles it. This takes a few minutes. Subsequent builds
+only recompile your code and take seconds.
+
+### 4.6 Modifying firmware
+
+The firmware source files are:
+
+- `firmware-sensor-pio/src/main.cpp` — sensor module
+- `firmware-motor-pio/src/main.cpp` — motor controller
+
+After editing, rebuild and flash with `pio run --target upload` from the
+relevant project directory.
 
 ---
 
@@ -288,7 +292,7 @@ bindings. Subsequent builds only recompile your Rust code and take seconds.
 
 All communication between the ESP32 modules and the PC is text-based NMEA-style.
 You can debug any connection with a standard serial monitor (PuTTY, the Arduino
-serial monitor, or `espflash monitor`).
+serial monitor, or `pio device monitor`).
 
 ### 5.1 Sensor Module → PC (USB-A)
 
@@ -343,7 +347,7 @@ The motor re-enables automatically when valid commands resume.
 
 ### 6.1 Bench test — sensor module
 
-1. Flash `firmware-sensor` and open `espflash monitor`
+1. Flash `firmware-sensor-pio` and open `pio device monitor`
 2. Verify `$FINNWAS` values change when you turn the pot
 3. Verify `$FINNIMU` heading changes when you rotate the BNO055
 4. Verify `$GPGGA` sentences appear (GPS needs sky view or will show no-fix)
@@ -351,7 +355,7 @@ The motor re-enables automatically when valid commands resume.
 
 ### 6.2 Bench test — motor controller
 
-1. Flash `firmware-motor` and open `espflash monitor`
+1. Flash `firmware-motor-pio` and open `pio device monitor`
 2. Verify `$FINNMTR,0,0,...` status messages (motor disabled)
 3. In a second terminal, open the same COM port and send:
    `$FINNSTEER,100*2B` (calculate correct checksum)
@@ -371,17 +375,14 @@ The motor re-enables automatically when valid commands resume.
 
 ## 7. Troubleshooting
 
-**`espup install` fails or hangs:**
-Check your internet connection. The installer downloads several hundred MB of
-toolchain components. Retry if it times out.
+**`pio run` fails with "No device found":**
+Check that the ESP32 is plugged in. Try a different USB cable — some cables are
+charge-only with no data lines. Check Device Manager for new COM ports when you
+plug in.
 
-**`cargo build` fails with linker errors:**
-Make sure you restarted your terminal after `espup install`. The environment
-variables (`LIBCLANG_PATH`, etc.) need to be in your current shell.
-
-**ESP32 not detected on any COM port:**
-Try a different USB cable — some cables are charge-only with no data lines.
-Check Device Manager for new COM ports when you plug in.
+**`pio run` fails to download the ESP32 framework:**
+Check your internet connection. The first build downloads ~200MB. Retry if it
+times out.
 
 **BNO055 not responding (`no response on I2C`):**
 Check SDA/SCL wiring (GPIO 21/22). Ensure the BNO055 board is powered from the
@@ -406,6 +407,11 @@ command parsing is failing — check for correct `$` prefix and `*XX` suffix.
 The 500ms watchdog requires continuous commands. For manual testing, send
 commands in a loop or increase `WATCHDOG_TIMEOUT_MS` temporarily in the firmware.
 
-**First build takes forever (10+ minutes):**
-This is normal. The ESP-IDF framework is being compiled from source. Subsequent
-builds are fast.
+**Multiple serial devices causing auto-detect issues:**
+Use `--upload-port COMx` (Windows) or `--upload-port /dev/ttyUSBx` (Linux) to
+specify the port explicitly. See section 4.4.
+
+**ESP32 not detected on any COM port:**
+Try a different USB cable — some cables are charge-only with no data lines.
+Check Device Manager for new COM ports when you plug in. Some ESP32 DevKit
+boards use a CP2102 or CH340 USB-serial chip that may need a driver installed.

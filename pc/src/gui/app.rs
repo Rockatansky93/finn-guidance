@@ -11,7 +11,9 @@
 use std::collections::VecDeque;
 use eframe::egui;
 use crossbeam_channel::Receiver;
-use finn_guidance_common::types::{GpsFix, CrossTrackError, FixQuality};
+use finn_guidance_common::types::{GpsFix, CrossTrackError, FixQuality, ImuData, WasReading, MotorStatus};
+use finn_guidance_common::protocol::FinnMessage;
+use crate::comms::serial::MotorHandle;
 use crate::guidance::ab_line::AbLineGuide;
 use crate::coverage::logger::CoverageLogger;
 use crate::coverage::db::{CoverageDb, SavedField, SavedAbLine};
@@ -31,6 +33,8 @@ enum ActivePage {
 pub struct GuidanceApp {
     /// Receiver for GPS fixes from the reader thread
     gps_rx: Receiver<GpsFix>,
+    /// Receiver for FINN sensor messages (WAS, IMU, heartbeat) from the reader thread
+    finn_rx: Receiver<FinnMessage>,
     /// Latest real GPS fix (from the module, not interpolated)
     current_fix: Option<GpsFix>,
     /// Position interpolator for smooth GUI updates between 1Hz fixes
@@ -56,6 +60,22 @@ pub struct GuidanceApp {
     active_page: ActivePage,
     /// Lightbar sensitivity: how many centimetres of error each segment represents.
     lightbar_cm_per_seg: f64,
+
+    // --- ESP32 sensor state ---
+    /// Latest wheel angle sensor reading (from sensor ESP32, 20Hz)
+    latest_was: Option<WasReading>,
+    /// Latest IMU reading (from sensor ESP32, 20Hz)
+    latest_imu: Option<ImuData>,
+    /// Latest motor controller status (from motor ESP32, 5Hz)
+    latest_motor: Option<MotorStatus>,
+    /// Sensor ESP32 uptime from last heartbeat (ms)
+    sensor_uptime_ms: Option<u64>,
+    /// Handle for sending steer commands to the motor ESP32
+    motor_handle: MotorHandle,
+    /// Current test PWM value for manual motor testing (Setup page)
+    test_pwm: i16,
+    /// Status message from motor test actions
+    motor_test_msg: Option<(String, u32)>,
 
     // --- AB line persistence ---
     /// SQLite database (opened once, held for the session)
@@ -83,7 +103,7 @@ pub struct GuidanceApp {
 }
 
 impl GuidanceApp {
-    pub fn new(gps_rx: Receiver<GpsFix>, implement_width: f64) -> Self {
+    pub fn new(gps_rx: Receiver<GpsFix>, finn_rx: Receiver<FinnMessage>, motor_handle: MotorHandle, implement_width: f64) -> Self {
         // Open the coverage database.  `CoverageLogger` also holds a reference
         // in some configurations; here we open a second handle for persistence.
         let db = CoverageDb::open(std::path::Path::new("data/coverage.db")).ok();
@@ -128,6 +148,7 @@ impl GuidanceApp {
 
         Self {
             gps_rx,
+            finn_rx,
             current_fix: None,
             interpolator: PositionInterpolator::new(),
             display_fix: None,
@@ -140,6 +161,13 @@ impl GuidanceApp {
             auto_pass_notification: None,
             active_page: ActivePage::Working,
             lightbar_cm_per_seg,
+            latest_was: None,
+            latest_imu: None,
+            latest_motor: None,
+            sensor_uptime_ms: None,
+            motor_handle,
+            test_pwm: 0,
+            motor_test_msg: None,
             db,
             saved_fields,
             saved_ab_lines,
@@ -192,6 +220,26 @@ impl eframe::App for GuidanceApp {
             self.current_fix = Some(fix);
         }
 
+        // === Process FINN sensor messages from ESP32 ===
+        // These arrive at 20Hz (WAS + IMU) plus heartbeat every 2s.
+        // We only keep the latest value of each — no need to buffer history yet.
+        while let Ok(msg) = self.finn_rx.try_recv() {
+            match msg {
+                FinnMessage::Was(was) => {
+                    self.latest_was = Some(was);
+                }
+                FinnMessage::Imu(imu) => {
+                    self.latest_imu = Some(imu);
+                }
+                FinnMessage::SensorHeartbeat(hb) => {
+                    self.sensor_uptime_ms = Some(hb.uptime_ms);
+                }
+                FinnMessage::MotorStatus(mtr) => {
+                    self.latest_motor = Some(mtr);
+                }
+            }
+        }
+
         // === Interpolate position for smooth display (every frame, ~60fps) ===
         // Between 1Hz real fixes, the interpolator dead-reckons the position
         // using speed × heading. This makes the vehicle triangle, trail, lightbar,
@@ -218,6 +266,9 @@ impl eframe::App for GuidanceApp {
         }
         if let Some((_, ref mut frames)) = self.io_status_msg {
             if *frames == 0 { self.io_status_msg = None; } else { *frames -= 1; }
+        }
+        if let Some((_, ref mut frames)) = self.motor_test_msg {
+            if *frames == 0 { self.motor_test_msg = None; } else { *frames -= 1; }
         }
 
         // Request continuous repaints for real-time display
@@ -1202,6 +1253,162 @@ impl GuidanceApp {
                         ui.add_space(4.0);
                         ui.label(format!("Speed:   {:.1} km/h", fix.speed * 3.6));
                         ui.label(format!("Heading: {:.1}°", fix.heading));
+                    }
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+
+                    // === Sensors Section (ESP32 data) ===
+                    ui.label(egui::RichText::new("SENSORS").size(14.0).strong());
+                    ui.add_space(4.0);
+
+                    // WAS
+                    if let Some(was) = &self.latest_was {
+                        ui.label(format!("WAS:  {} raw  ({} mV)", was.raw_value, was.voltage_mv));
+                    } else {
+                        ui.label(egui::RichText::new("WAS: no data").size(12.0).weak());
+                    }
+
+                    // IMU
+                    if let Some(imu) = &self.latest_imu {
+                        ui.label(format!("IMU:  R{:.1}° P{:.1}° H{:.1}°", imu.roll, imu.pitch, imu.heading));
+                        let cal_colour = if imu.cal_sys >= 2 {
+                            egui::Color32::GREEN
+                        } else if imu.cal_sys >= 1 {
+                            egui::Color32::YELLOW
+                        } else {
+                            egui::Color32::from_rgb(255, 120, 60)
+                        };
+                        ui.colored_label(cal_colour, format!(
+                            "Cal: S{} G{} A{} M{}",
+                            imu.cal_sys, imu.cal_gyro, imu.cal_accel, imu.cal_mag
+                        ));
+                    } else {
+                        ui.label(egui::RichText::new("IMU: no data").size(12.0).weak());
+                    }
+
+                    // Motor
+                    if let Some(mtr) = &self.latest_motor {
+                        let en_label = if mtr.enabled { "ON" } else { "OFF" };
+                        ui.label(format!("Motor: PWM {} [{}]", mtr.current_pwm, en_label));
+                    }
+
+                    // Heartbeat
+                    if let Some(uptime) = self.sensor_uptime_ms {
+                        let secs = uptime / 1000;
+                        let mins = secs / 60;
+                        ui.label(
+                            egui::RichText::new(format!("ESP32 uptime: {}m {}s", mins, secs % 60))
+                                .size(11.0).weak()
+                        );
+                    }
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+
+                    // === Motor Test Section ===
+                    ui.label(egui::RichText::new("MOTOR TEST").size(14.0).strong());
+                    ui.add_space(4.0);
+
+                    if self.motor_handle.is_connected() {
+                        ui.colored_label(egui::Color32::GREEN, "● Motor ESP32 connected");
+                        ui.add_space(4.0);
+
+                        // Current test PWM display
+                        ui.label(
+                            egui::RichText::new(format!("PWM: {}", self.test_pwm))
+                                .size(18.0).strong()
+                        );
+
+                        ui.add_space(4.0);
+
+                        // Preset buttons
+                        ui.label(egui::RichText::new("Presets:").size(11.0).weak());
+                        ui.horizontal(|ui| {
+                            for &pwm in &[-100i16, -50, -25, 0, 25, 50, 100] {
+                                let label = if pwm == 0 {
+                                    "STOP".to_string()
+                                } else {
+                                    format!("{}", pwm)
+                                };
+                                let colour = if pwm == 0 {
+                                    egui::Color32::from_rgb(255, 60, 60)
+                                } else {
+                                    egui::Color32::LIGHT_GRAY
+                                };
+                                if ui.add(egui::Button::new(
+                                    egui::RichText::new(&label).size(12.0).color(colour)
+                                ).min_size(egui::vec2(38.0, 28.0))).clicked() {
+                                    self.test_pwm = pwm;
+                                    match self.motor_handle.send_steer(pwm) {
+                                        Ok(_) => {
+                                            self.motor_test_msg = Some((
+                                                format!("Sent PWM {}", pwm), 120
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            self.motor_test_msg = Some((
+                                                format!("Send failed: {}", e), 240
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        });
+
+                        ui.add_space(4.0);
+
+                        // Fine adjust
+                        ui.horizontal(|ui| {
+                            if ui.add(egui::Button::new("−10").min_size(egui::vec2(40.0, 28.0))).clicked() {
+                                self.test_pwm = (self.test_pwm - 10).max(-255);
+                                let _ = self.motor_handle.send_steer(self.test_pwm);
+                            }
+                            if ui.add(egui::Button::new("+10").min_size(egui::vec2(40.0, 28.0))).clicked() {
+                                self.test_pwm = (self.test_pwm + 10).min(255);
+                                let _ = self.motor_handle.send_steer(self.test_pwm);
+                            }
+                            // Emergency stop
+                            if ui.add(egui::Button::new(
+                                egui::RichText::new("⏹ STOP").size(14.0).strong()
+                                    .color(egui::Color32::from_rgb(255, 60, 60))
+                            ).min_size(egui::vec2(70.0, 28.0))).clicked() {
+                                self.test_pwm = 0;
+                                let _ = self.motor_handle.send_steer(0);
+                                self.motor_test_msg = Some(("Motor stopped".to_string(), 120));
+                            }
+                        });
+
+                        // Motor status feedback
+                        if let Some(mtr) = &self.latest_motor {
+                            ui.add_space(4.0);
+                            let en_colour = if mtr.enabled {
+                                egui::Color32::GREEN
+                            } else {
+                                egui::Color32::GRAY
+                            };
+                            ui.colored_label(en_colour, format!(
+                                "Motor: PWM {} | {} | {}s uptime",
+                                mtr.current_pwm,
+                                if mtr.enabled { "ENABLED" } else { "DISABLED" },
+                                mtr.uptime_ms / 1000
+                            ));
+                        }
+
+                        // WAS feedback for verifying motor→steering→WAS loop
+                        if let Some(was) = &self.latest_was {
+                            ui.label(format!("WAS feedback: {} raw ({} mV)", was.raw_value, was.voltage_mv));
+                        }
+                    } else {
+                        ui.colored_label(egui::Color32::GRAY, "● Motor ESP32 not connected");
+                        ui.label(egui::RichText::new("Plug in motor ESP32 USB and restart").size(11.0).weak());
+                    }
+
+                    if let Some((ref msg, _)) = self.motor_test_msg {
+                        ui.label(egui::RichText::new(msg).size(11.0)
+                            .color(egui::Color32::from_rgb(100, 220, 100)));
                     }
 
                     ui.add_space(10.0);

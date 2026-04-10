@@ -5,25 +5,43 @@
 > Updated at the end of each working session.
 
 ## Last updated
-Session 11 — 9 April 2026 (Phase 4 firmware scaffolding)
+Session 13 — 10 April 2026 (PC-side FINN parser + motor test UI + dual serial auto-detect)
 
 ## What we're working on
-**Phase 4 — ESP32 firmware.** Two firmware crates created:
-- `firmware-sensor/` — ESP32 #1: WAS pot ADC (GPIO 34), BNO055 I2C (21/22),
-  GPS NMEA passthrough via UART2 (16/17), GPIO 33 HIGH as pot 3.3V reference
-- `firmware-motor/` — ESP32 #2: IBT-2 PWM (GPIO 25/26), enable lines (27/14),
-  500ms watchdog, steer command parsing
+**Phase 4 — PC-side integration complete, heading to field test.**
 
-Serial protocol is text-based NMEA-style (not UDP — both ESP32s on USB serial):
-- Sensor → PC: `$FINNWAS`, `$FINNIMU`, `$FINNHB`, plus raw GPS passthrough
-- PC → Motor: `$FINNSTEER,<pwm>*XX`
-- Motor → PC: `$FINNMTR,<pwm>,<enabled>,<uptime>*XX`
+All ESP32 firmware is flashed. All sensor data (WAS, IMU, GPS passthrough) now
+flows end-to-end through the Rust PC application. The motor ESP32 is connected
+on a second serial port with a MOTOR TEST panel for manual PWM control.
+
+**Completed this session:**
+- FINN sentence parser (`finn_parser.rs`) — parses `$FINNWAS`, `$FINNIMU`,
+  `$FINNHB`, `$FINNMTR` with checksum validation and unit tests
+- Updated `protocol.rs` — replaced old UDP-based types with actual serial protocol
+  (`FinnMessage` enum, `nmea_checksum()`, `format_steer_command()`)
+- Updated `types.rs` — added calibration fields to `ImuData`, `voltage_mv` to
+  `WasReading`, new `EspHeartbeat` and `MotorStatus` structs
+- Serial reader routes `$FINN*` sentences through new parser alongside NMEA
+- FINN channel (`crossbeam bounded:128`) carries WAS/IMU/heartbeat/motor data
+  from serial reader threads to GUI
+- SENSORS section in Setup page — live WAS raw/mV, IMU roll/pitch/heading with
+  colour-coded calibration status, ESP32 uptime
+- Motor ESP32 on separate serial port — auto-detected, `MotorHandle` with
+  `Arc<Mutex<...>>` for thread-safe steer command sending
+- MOTOR TEST section in Setup page — preset PWM buttons (-100 to +100), ±10
+  fine adjust, emergency STOP, live motor status and WAS feedback display
+- Dual-ESP32 auto-detect — sensor reader distinguishes sensor ESP32 (`$FINNWAS`,
+  `$FINNIMU`) from motor ESP32 (`$FINNMTR`), skips motor port. Reads 40 lines
+  to catch FINN sentences even when GPS NMEA arrives first.
+- ESP32-aware startup — skips `ensure_module_config()` (PAIR commands) when
+  connected to ESP32 sensor module (GPS is behind UART passthrough, not direct)
+- Port coordination — sensor reader reports claimed port via channel so motor
+  reader can exclude it during auto-detect
 
 **Not yet done:**
-- ESP Rust toolchain not yet installed (`espup install`)
-- PC-side parser for FINN sentences not yet written (currently only parses NMEA)
-- WAS calibration routine not yet implemented
-- PID controller (Phase 5) — depends on sensor data flowing first
+- WAS calibration routine (centre/left-lock/right-lock, store in SQLite)
+- PID controller (Phase 5) — depends on WAS calibration
+- Field test on Dell 7390 laptops (hardware being installed on tractor now)
 
 ## Current state of the code
 All features below are IMPLEMENTED and working:
@@ -49,9 +67,19 @@ All features below are IMPLEMENTED and working:
 - **Job management**: JOB HISTORY list in Setup page (last 10, with delete)
 - **GUI**: working page (full-screen + overlaid lightbar/XTE/notifications) and
   setup page (scrollable panel with AB LINE, IMPLEMENT, NUDGE, GUIDANCE, COVERAGE,
-  POSITION, VIEW, LIGHTBAR sections). GPS status bar shared across both pages.
+  POSITION, SENSORS, MOTOR TEST, VIEW, LIGHTBAR sections). GPS status bar shared
+  across both pages.
 - **Configuration persistence**: implement width, overlap, lightbar sensitivity,
   last AB line ID — all via SQLite config table, saved on change, loaded on startup
+- **ESP32 firmware (Arduino/PlatformIO)**: both sensor and motor modules flashed and
+  running. Identical serial protocol to the original Rust design.
+- **FINN sentence parser**: PC-side parser for `$FINNWAS`, `$FINNIMU`, `$FINNHB`,
+  `$FINNMTR` with NMEA-style checksum validation. Unit tested against real serial output.
+- **Dual serial port**: sensor ESP32 (COM3) and motor ESP32 (COM6) auto-detected
+  and opened independently. Sensor reader handles GPS + FINN, motor reader handles
+  motor status + steer commands.
+- **Motor test UI**: Setup page MOTOR TEST section with preset PWM buttons, fine
+  adjust, emergency stop, live motor status and WAS feedback.
 
 ## Key decisions (see DECISIONS.md for full detail)
 - #001–#004: Auto-pass priority, skip factor, display thinning, GUI page split
@@ -65,12 +93,14 @@ All features below are IMPLEMENTED and working:
 - #012: egui 0.29 API migration fixes
 - #013: Persist width/overlap/lightbar/last-AB-line, exclude nudge
 - #014: Coverage data management (render thinning, memory cap, clear button)
+- #015: Arduino/PlatformIO for ESP32 firmware (replaced Rust/esp-idf-hal)
+- #016: Dual-ESP32 auto-detect (distinguish sensor vs motor by sentence type)
 
-## Phase 4 hardware inventory (as of 9 April 2026)
+## Phase 4 hardware inventory (as of 10 April 2026)
 - **ESP32 #1 (sensor node)**: reads WAS (ADC GPIO 34), BNO055 (I2C GPIO 21/22),
-  forwards GPS NMEA via UART2 passthrough (GPIO 16/17). USB A to laptop.
+  forwards GPS NMEA via UART2 passthrough (GPIO 16/17). USB A to laptop. FLASHED.
 - **ESP32 #2 (controller node)**: drives IBT-2 via PWM (GPIO 25/26) and enable
-  lines (GPIO 27/14). USB B to laptop.
+  lines (GPIO 27/14). USB B to laptop. FLASHED.
 - **BNO055**: 3.3V I2C, connects direct to sensor ESP32, no level shifting needed.
 - **WAS**: RQH100030 replaced with a 10kΩ potentiometer. Wiper → GPIO 34 direct
   (no voltage divider needed — pot powered from ESP32 3.3V rail, output 0–3.3V).
@@ -116,8 +146,6 @@ All features below are IMPLEMENTED and working:
 
 **Free pins (available for Trimble motor encoder):** 4, 5, 12, 13, 16, 17, 18, 19, 21, 22, 23, 32, 33, 34, 35, 36, 39
 
-**Trimble encoder notes (future):** If the encoder is quadrature (A/B channels), use two interrupt-capable GPIOs (e.g. 16/17 or 18/19). If it's a simple pulse output, one GPIO with interrupt is enough. Need to identify the encoder type and connector pinout from the Trimble motor datasheet.
-
 ### Power distribution
 
 ```
@@ -138,14 +166,24 @@ The 5V VIN pins back-feed 5V to the GPS and IBT-2 logic (bench-tested OK).
 - **RTK**: no base station or NTRIP subscription yet. Running standalone GPS
   (HDOP 0.4 with 42–50 sats — usable for guidance display, not centimetre-accurate)
 
-## Field test checklist (tractor cab — 9 April 2026)
-This is the first build-and-run on the Dell 7390 2-in-1. Key things to verify:
+## Field test checklist (tractor cab — Dell 7390 2-in-1)
+**Hardware installation on tractor:**
+- [ ] Mount GPS antenna with clear sky view
+- [ ] Mount BNO055 aligned with tractor centreline
+- [ ] Mount WAS pot linked to steering column
+- [ ] Mount IBT-2 + motor on steering mechanism
+- [ ] Route USB cables from ESP32s to laptop mounting position
+- [ ] Connect 12V battery supply to IBT-2 motor terminals
+- [ ] Secure all cables and connections for vibration
 
-**Build / startup:**
+**Build / startup on Dell 7390:**
+- [ ] Clone repo from git
 - [ ] `cargo build --release` completes clean on the Dell
-- [ ] GPS auto-detect finds the LC29H on the correct COM port
-- [ ] Module config commands send without errors (check console output)
+- [ ] GPS auto-detect finds sensor ESP32 on correct COM port
+- [ ] Motor ESP32 auto-detected on second COM port
 - [ ] App opens, GPS status bar shows sats/HDOP
+- [ ] SENSORS section shows live WAS/IMU data
+- [ ] MOTOR TEST section shows "Motor ESP32 connected"
 
 **Touch targets:**
 - [ ] ENGAGE button easy to hit with fingers while bouncing
@@ -169,46 +207,58 @@ This is the first build-and-run on the Dell 7390 2-in-1. Key things to verify:
 - [ ] Coverage strips painting correctly on field view
 - [ ] No slowdown or lag after extended working period
 
-**Notes to record after the test:**
-- Any touch targets that are too small or awkward
-- Lightbar sensitivity — does 20 cm/seg feel right? Too sensitive / not sensitive enough?
-- Any crashes or errors (note which operation triggered them)
-- Screen readability — any glare/contrast issues
-- Any features missing that would be needed for a real day's work
+**Motor test (bench verified, confirm on tractor):**
+- [ ] Motor responds to MOTOR TEST preset buttons
+- [ ] Motor direction matches expected (positive PWM = steer right)
+- [ ] WAS value changes when motor moves steering
+- [ ] Watchdog stops motor within 500ms when app closed
+- [ ] Emergency STOP button works
+
+**Sensor verification on tractor:**
+- [ ] WAS reads full range across steering lock-to-lock
+- [ ] BNO055 heading tracks tractor orientation
+- [ ] BNO055 calibration reaches 3/3/x/x after driving
+- [ ] GPS passthrough provides position fixes
 
 ## Next session should
 1. Read this file and DECISIONS.md for context
-2. **Install ESP Rust toolchain** — `cargo install espup && espup install`, verify
-   with a blink test on one ESP32 before attempting the full firmware
-3. **Build and flash firmware-sensor** — test GPS passthrough first (easiest to
-   verify), then WAS ADC reads, then BNO055 I2C
-4. **Build and flash firmware-motor** — test with manual `$FINNSTEER` commands from
-   a serial terminal, verify watchdog stops motor on disconnect
-5. **PC-side FINN sentence parser** — extend `pc/src/gps/parser.rs` (or new module)
-   to parse `$FINNWAS`, `$FINNIMU`, `$FINNHB`, `$FINNMTR` alongside existing NMEA
-6. **WAS calibration** — add calibration routine (centre/left-lock/right-lock) and
-   store in SQLite config table, add "Recalibrate WAS" button to Setup page
+2. **Clone repo onto Dell 7390** — `git clone`, `cargo build --release`
+3. **Verify dual-port auto-detect** on the new PC (COM ports will be different)
+4. **Field test the full prototype** — run through the checklist above
+5. **WAS calibration** — with pot mounted on steering, implement the three-point
+   calibration routine (centre/left-lock/right-lock) and store in SQLite
+6. **Determine motor direction convention** — use MOTOR TEST to confirm which
+   PWM sign corresponds to which steering direction on this tractor
+7. **Note any issues** for fix-up in the next development session
 
 ## File map (quick reference)
 ```
-pc/src/main.rs              — entry point, thread setup, GPS auto-detect config
-pc/src/gps/reader.rs         — serial port GPS reader, auto-detect, module config
+pc/src/main.rs              — entry point, thread setup, GPS + motor auto-detect
+pc/src/gps/reader.rs         — serial port reader, auto-detect, module config, FINN routing
 pc/src/gps/parser.rs         — NMEA parsing (GGA + VTG, epoch-based)
+pc/src/gps/finn_parser.rs    — FINN sentence parser ($FINNWAS, $FINNIMU, $FINNHB, $FINNMTR)
+pc/src/gps/mod.rs            — GPS + serial module declarations
+pc/src/comms/serial.rs       — Motor ESP32 serial (auto-detect, MotorHandle, steer commands)
+pc/src/comms/mod.rs          — Comms module declarations
 pc/src/guidance/ab_line.rs   — AB line guidance, cross-track error, auto-pass, overlap, nudge
-pc/src/gui/app.rs            — egui application, page split, lightbar, config persistence
+pc/src/gui/app.rs            — egui application, page split, lightbar, config persistence,
+                               SENSORS section, MOTOR TEST section
 pc/src/gui/field_view.rs     — 2D canvas rendering (grid, coverage strips, lines, trail, vehicle)
 pc/src/gui/field_projection.rs — lat/lon → local metres → screen pixels
 pc/src/coverage/logger.rs    — coverage CSV recording, 3-gate filtering, memory cap, clear
 pc/src/coverage/db.rs        — SQLite database (jobs, segments, AB lines, fields, config)
 pc/src/position/tracker.rs   — position history and odometer
 pc/src/position/interpolator.rs — dead-reckoning between 1Hz GPS fixes for smooth GUI
-common/src/types.rs          — GpsFix, CrossTrackError, GuidanceLine, FixQuality
+common/src/types.rs          — GpsFix, ImuData (with cal), WasReading (with mV),
+                               EspHeartbeat, MotorStatus, CrossTrackError, GuidanceLine
 common/src/coords.rs         — haversine, bearing, cross-track distance
-common/src/protocol.rs       — serial protocol types (FINN sentences, was UDP, now serial)
-firmware-sensor/src/main.rs  — ESP32 #1: WAS ADC + BNO055 I2C + GPS NMEA passthrough
-firmware-motor/src/main.rs   — ESP32 #2: IBT-2 PWM + steer command parsing + watchdog
+common/src/protocol.rs       — FinnMessage enum, nmea_checksum(), format_steer_command()
+firmware-sensor-pio/          — ESP32 #1 Arduino/PlatformIO project (ACTIVE)
+firmware-motor-pio/           — ESP32 #2 Arduino/PlatformIO project (ACTIVE)
+firmware-sensor/              — ESP32 #1 Rust crate (ARCHIVED — replaced by PlatformIO)
+firmware-motor/               — ESP32 #2 Rust crate (ARCHIVED — replaced by PlatformIO)
 docs/IMPLEMENTATION_PLAN.md  — full phase plan, task tracking, session log
-docs/DECISIONS.md            — architectural decision log (#001–#014)
+docs/DECISIONS.md            — architectural decision log (#001–#016)
 docs/INSTALLATION_GUIDE.md   — hardware wiring, PC setup, ESP32 flashing, troubleshooting
 docs/ACTIVE_CONTEXT.md       — this file
 ```
@@ -224,3 +274,5 @@ docs/ACTIVE_CONTEXT.md       — this file
 - Lightbar sensitivity defaults to 20 cm/segment (3.0m full scale), persisted
 - Last-loaded AB line auto-restored on startup via `last_ab_line_id` config key
 - egui 0.29 uses `id_salt` (not `id_source`), `show_tooltip_text` takes 4 args
+- ESP32 firmware uses Arduino/PlatformIO (C++), built with `pio run --target upload`
+- Old `pc/src/comms/udp.rs` is dead code — can be deleted (replaced by `serial.rs`)

@@ -24,7 +24,9 @@ use std::time::Duration;
 use tracing;
 
 use finn_guidance_common::types::GpsFix;
+use finn_guidance_common::protocol::FinnMessage;
 use super::parser;
+use super::finn_parser;
 
 /// Configuration for the GPS serial connection
 pub struct GpsConfig {
@@ -45,12 +47,20 @@ impl Default for GpsConfig {
     }
 }
 
-/// Scan all available serial ports and return the first one that produces NMEA data.
+/// Result of auto-detecting a serial port
+struct DetectedPort {
+    port_name: String,
+    /// True if the port is a FINN ESP32 (saw $FINN sentences), false if raw GPS
+    is_esp32: bool,
+}
+
+/// Scan all available serial ports and return the first one that produces
+/// NMEA or FINN data.
 ///
 /// Strategy: open each port at the configured baud rate, read for up to 2 seconds,
-/// and check if any line starts with `$G` (NMEA sentence prefix for GPS constellations).
-/// USB serial devices are tried first as they're the most likely GPS connection.
-fn auto_detect_gps_port(baud_rate: u32) -> Option<String> {
+/// and check if any line starts with `$G`, `$FINN`, `$PAIR`, or `$PQTM`.
+/// USB serial devices are tried first as they're the most likely connection.
+fn auto_detect_gps_port(baud_rate: u32) -> Option<DetectedPort> {
     let ports = match serialport::available_ports() {
         Ok(p) => p,
         Err(e) => {
@@ -100,25 +110,61 @@ fn auto_detect_gps_port(baud_rate: u32) -> Option<String> {
 
         let reader = BufReader::new(port);
         let mut found_nmea = false;
+        let mut found_sensor_finn = false;
 
-        // Read lines for up to ~2 seconds (4 attempts × 500ms timeout)
-        for line in reader.lines().take(20) {
+        // Read lines for up to ~3 seconds.
+        // We distinguish between the sensor ESP32 ($FINNWAS, $FINNIMU, $FINNHB)
+        // and the motor ESP32 ($FINNMTR). The sensor reader should only claim
+        // a port that has sensor sentences or raw GPS — not the motor port.
+        //
+        // The sensor ESP32 sends both FINN sentences AND GPS NMEA passthrough,
+        // so seeing $GNGGA alone doesn't tell us if it's ESP32 or raw GPS.
+        // We read enough lines to see at least one $FINN sentence if present
+        // (WAS+IMU come at 20Hz, so within 30 lines we'll definitely see one).
+        for line in reader.lines().take(40) {
             match line {
                 Ok(sentence) => {
+                    if sentence.starts_with("$FINNWAS") || sentence.starts_with("$FINNIMU")
+                        || sentence.starts_with("$FINNHB")
+                    {
+                        tracing::info!("    ✓ Found FINN sensor ESP32 on {} — {}", port_name, &sentence[..sentence.len().min(50)]);
+                        found_sensor_finn = true;
+                        found_nmea = true;
+                        break;
+                    }
+                    if sentence.starts_with("$FINNMTR") {
+                        // This is the motor ESP32 — skip it
+                        tracing::info!("    ✗ {} is motor ESP32 (saw $FINNMTR) — skipping", port_name);
+                        break;
+                    }
                     if sentence.starts_with("$G") || sentence.starts_with("$PAIR")
                         || sentence.starts_with("$PQTM")
                     {
-                        tracing::info!("    ✓ Found GPS on {} — NMEA: {}", port_name, &sentence[..sentence.len().min(40)]);
-                        found_nmea = true;
-                        break;
+                        // Found GPS data — mark it but keep reading to check
+                        // if FINN sensor sentences also appear (ESP32 passthrough)
+                        if !found_nmea {
+                            tracing::debug!("    Saw NMEA on {} — checking for FINN sentences...", port_name);
+                            found_nmea = true;
+                        }
                     }
                 }
                 Err(_) => continue,
             }
         }
 
+        // If we saw FINN sensor sentences, it's definitely the sensor ESP32.
+        // If we only saw NMEA with no FINN, it's a raw GPS module (direct USB).
+        if found_sensor_finn {
+            tracing::info!("    ✓ {} identified as sensor ESP32 (FINN + GPS)", port_name);
+        } else if found_nmea {
+            tracing::info!("    ✓ {} identified as raw GPS module (NMEA only)", port_name);
+        }
+
         if found_nmea {
-            return Some(port_name.clone());
+            return Some(DetectedPort {
+                port_name: port_name.clone(),
+                is_esp32: found_sensor_finn,
+            });
         }
 
         tracing::debug!("    No NMEA data on {}", port_name);
@@ -255,14 +301,28 @@ fn format_pair_command(body: &str) -> String {
 }
 
 /// Start the GPS reader loop. Blocks - call from a dedicated thread.
-pub fn run_gps_reader(config: GpsConfig, tx: Sender<GpsFix>) {
+///
+/// Reads from a single serial port (the sensor ESP32) which carries both
+/// GPS NMEA passthrough and FINN sensor sentences. GPS fixes go to `gps_tx`,
+/// FINN messages (WAS, IMU, heartbeat) go to `finn_tx`.
+///
+/// Once the port is opened, the port name is sent via `port_name_tx` so the
+/// motor reader thread knows which port to exclude during auto-detect.
+pub fn run_gps_reader(
+    config: GpsConfig,
+    gps_tx: Sender<GpsFix>,
+    finn_tx: Sender<FinnMessage>,
+    port_name_tx: Sender<String>,
+) {
     // === Step 1: Resolve port name (auto-detect or use specified) ===
-    let port_name = if config.port_name == "auto" {
+    let (port_name, is_esp32) = if config.port_name == "auto" {
         tracing::info!("GPS port set to 'auto' — scanning for GPS module...");
         match auto_detect_gps_port(config.baud_rate) {
-            Some(name) => {
-                tracing::info!("Auto-detected GPS on {}", name);
-                name
+            Some(detected) => {
+                tracing::info!("Auto-detected {} on {}",
+                    if detected.is_esp32 { "FINN ESP32" } else { "GPS module" },
+                    detected.port_name);
+                (detected.port_name, detected.is_esp32)
             }
             None => {
                 tracing::error!("No GPS module found on any serial port");
@@ -270,7 +330,7 @@ pub fn run_gps_reader(config: GpsConfig, tx: Sender<GpsFix>) {
             }
         }
     } else {
-        config.port_name.clone()
+        (config.port_name.clone(), false)
     };
 
     tracing::info!("Opening GPS on {} at {} baud", port_name, config.baud_rate);
@@ -288,8 +348,18 @@ pub fn run_gps_reader(config: GpsConfig, tx: Sender<GpsFix>) {
 
     tracing::info!("GPS port opened successfully");
 
-    // === Step 2: Configure module (disable unused sentences, set fix rate) ===
-    ensure_module_config(&mut port, config.fix_rate_hz);
+    // Notify the motor reader thread which port we claimed
+    let _ = port_name_tx.send(port_name.clone());
+
+    // === Step 2: Configure GPS module (only for direct GPS, not ESP32) ===
+    // When talking to the ESP32 sensor module, PAIR commands would be
+    // consumed by the ESP32's serial buffer rather than reaching the LC29H.
+    // The GPS is configured at 1Hz by the LC29H DA firmware defaults.
+    if is_esp32 {
+        tracing::info!("ESP32 detected — skipping GPS module config (PAIR commands)");
+    } else {
+        ensure_module_config(&mut port, config.fix_rate_hz);
+    }
 
     let reader = BufReader::new(port);
     let mut nmea_parser = parser::NmeaState::new();
@@ -301,9 +371,24 @@ pub fn run_gps_reader(config: GpsConfig, tx: Sender<GpsFix>) {
                 line_count += 1;
                 // Log first 10 raw sentences so we can see what's coming through
                 if line_count <= 10 {
-                    tracing::info!("Raw NMEA [{}]: {}", line_count, sentence);
+                    tracing::info!("Raw serial [{}]: {}", line_count, sentence);
                 }
 
+                // Try FINN sentences first (WAS, IMU, heartbeat)
+                if sentence.starts_with("$FINN") {
+                    if let Some(msg) = finn_parser::parse_finn_sentence(&sentence) {
+                        if line_count <= 20 {
+                            tracing::debug!("FINN message: {:?}", msg);
+                        }
+                        if finn_tx.send(msg).is_err() {
+                            tracing::warn!("FINN channel closed, stopping reader");
+                            return;
+                        }
+                    }
+                    continue;
+                }
+
+                // Otherwise try NMEA (GPS sentences)
                 if let Some(fix) = nmea_parser.parse_sentence(&sentence) {
                     if line_count <= 20 {
                         tracing::info!(
@@ -311,14 +396,14 @@ pub fn run_gps_reader(config: GpsConfig, tx: Sender<GpsFix>) {
                             fix.latitude, fix.longitude, fix.satellites, fix.fix_quality
                         );
                     }
-                    if tx.send(fix).is_err() {
+                    if gps_tx.send(fix).is_err() {
                         tracing::warn!("GPS channel closed, stopping reader");
                         return;
                     }
                 }
             }
             Err(e) => {
-                tracing::warn!("GPS read error: {}", e);
+                tracing::warn!("Serial read error: {}", e);
             }
         }
     }

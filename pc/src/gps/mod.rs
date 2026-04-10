@@ -1,4 +1,5 @@
-//! GPS module - reads NMEA sentences from serial port and produces GpsFix structs.
+//! GPS and ESP32 serial module — reads NMEA + FINN sentences from serial port.
 
 pub mod reader;
 pub mod parser;
+pub mod finn_parser;

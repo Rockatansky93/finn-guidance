@@ -30,13 +30,32 @@ pub struct ImuData {
     pub roll: f64,    // Degrees, positive = right side down
     pub pitch: f64,   // Degrees, positive = nose up
     pub heading: f64, // Degrees from magnetic north
+    pub cal_sys: u8,   // System calibration 0-3
+    pub cal_gyro: u8,  // Gyro calibration 0-3
+    pub cal_accel: u8, // Accelerometer calibration 0-3
+    pub cal_mag: u8,   // Magnetometer calibration 0-3
 }
 
 /// Wheel angle sensor reading
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WasReading {
     pub raw_value: u16,   // Raw ADC value (0-4095 on ESP32)
+    pub voltage_mv: u16,  // Millivolts (0-3300)
     pub angle_deg: f64,   // Calibrated angle in degrees (negative = left, positive = right)
+}
+
+/// ESP32 heartbeat
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EspHeartbeat {
+    pub uptime_ms: u64,
+}
+
+/// Motor controller status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MotorStatus {
+    pub current_pwm: i16,   // -255 to 255
+    pub enabled: bool,
+    pub uptime_ms: u64,
 }
 
 /// Combined vehicle state used for guidance calculations
