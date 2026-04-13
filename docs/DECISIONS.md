@@ -495,3 +495,63 @@ purpose of auto-detect and breaks portability between PCs), USB VID/PID matching
 (rejected: both ESP32s use identical CH340 USB-serial chips — VID/PID is the same),
 fixed port assignment (rejected: COM port numbers change when USB ports are
 rearranged or the system moves to a different PC).
+
+---
+
+## #017 — Coverage data to SQLite, replacing CSV as primary store
+**Date:** 13 April 2026  
+**Context:** First field test in the tractor cab revealed that coverage strips
+rendered as dashes rather than a continuous painted swath. The cause: the 1m
+distance-based filter produced points spaced too far apart — the quad-strip renderer
+in `draw_coverage()` draws a rectangle between consecutive points, so 1m spacing
+left 1m gaps between each strip. Additionally, the CSV-based architecture had
+structural limitations: no efficient partial reload, no spatial querying, and the
+in-memory vec with 100k downsample cap degraded rendering fidelity over long runs.
+
+**Decision:** Move all coverage point storage to SQLite, replacing CSV as the
+primary data store. Distance filter reduced from 1.0m to 0.25m for gap-free
+coverage rendering.
+
+**Schema changes (`db.rs`):**
+- New `coverage_points` table: `(id, job_id, segment, timestamp_ms, lat, lon, alt,
+  speed, heading, fix_quality, sats, hdop)` with index on `(job_id, segment)`.
+- `jobs` table: `csv_filename` column replaced with `name` (migration handles
+  existing databases).
+- New methods: `insert_coverage_batch()` (transactional batch insert),
+  `load_coverage_points()`, `count_coverage_points()`, `clear_coverage_points()`,
+  `export_coverage_csv()` (generates CSV string from DB for export).
+
+**Logger changes (`logger.rs`):**
+- Removed all CSV file handling (`File`, `PathBuf`, `fs::write`).
+- Removed in-memory vec downsample logic and 100k cap.
+- Added 50-point write buffer that flushes to SQLite in a single transaction.
+- Distance filter default changed: 1.0m → 0.25m.
+- All mutation methods (`toggle_engage`, `log_fix`, `clear_coverage`, `end_job`)
+  now take `db: Option<&CoverageDb>` parameter.
+- Added `load_job_coverage()` for reloading previous jobs into the render cache.
+- Render cache grows as points arrive (no downsample needed — SQLite is source
+  of truth and can be reloaded).
+
+**Data volume at 0.25m:**
+- At 10km/h (~2.78m/s) and 1Hz GPS: 1 point per fix (machine moves ~2.78m per
+  fix, well above 0.25m threshold). So in practice, point rate is still 1Hz —
+  the tighter filter just ensures we log at low speeds too.
+- At 5km/h: still 1 point per fix (~1.39m movement).
+- A 10-hour day: ~36,000 points. SQLite handles millions trivially.
+
+**CSV export preserved:** `export_coverage_csv()` on `CoverageDb` generates the
+same CSV format as before. Can be triggered from UI (not yet wired up — future
+job history enhancement).
+
+**What's unchanged:** `field_view.rs` renderer still takes `&[CoveragePoint]` —
+it doesn't know or care whether the source is CSV or SQLite. Zoom-dependent
+render thinning still applies. `main.rs` unchanged.
+
+**Status:** Code complete, NOT YET TESTED. Requires `cargo build` verification
+and field test to confirm gap-free coverage rendering at 0.25m.
+
+**Alternatives considered:** Reducing CSV distance filter without changing storage
+(rejected: CSV is still append-only with no efficient reload or query — just kicks
+the can on the structural issues), spatial database / R-tree (rejected:
+over-engineering for sequential coverage data — the access pattern is always
+"load all points for job X", not spatial range queries).

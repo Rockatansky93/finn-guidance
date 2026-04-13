@@ -1,35 +1,27 @@
 //! Coverage logger - records GPS positions while the implement is engaged.
 //!
-//! Writes coverage data to CSV files in a configurable directory.
-//! Each job gets its own CSV file, and each engage/disengage cycle is a segment.
+//! Writes coverage data to SQLite via the CoverageDb. Points are buffered
+//! in memory and flushed in batches for good write performance.
 //!
 //! ## Deduplication & Filtering
 //!
-//! The GPS receiver (LC29H) updates at a fixed rate (typically 1-10Hz),
+//! The GPS receiver (LC29H) updates at a fixed rate (typically 1Hz),
 //! but the GUI loop runs much faster (~200Hz). Without filtering, we'd log
-//! the same GPS fix 20-200 times per actual position update.
+//! the same GPS fix many times per actual position update.
 //!
 //! Three filters prevent redundant data:
 //!   1. **Epoch dedup**: Only logs when `timestamp_ms` changes from last logged point
 //!   2. **Distance filter**: Skip if moved less than `min_distance_m` since last log
 //!   3. **Time filter**: Skip if less than `min_interval_ms` since last log
 //!
-//! The distance and time filters are AND-combined: a point must satisfy BOTH
-//! to be logged (after passing the epoch dedup gate).
+//! ## Data flow
 //!
-//! ## CSV format
-//!
-//! ```text
-//! segment,timestamp_ms,latitude,longitude,altitude,speed,heading,fix_quality,satellites,hdop
-//! ```
-//!
-//! Files are named by date/time: `coverage_2026-03-26_120000.csv`
+//! GPS fix → filter → write buffer → batch insert to SQLite (every 50 points)
+//!                                  → append to render cache (for field_view)
 
-use std::fs::{self, File};
-use std::io::Write;
-use std::path::{Path, PathBuf};
 use finn_guidance_common::types::{GpsFix, FixQuality};
 use finn_guidance_common::coords;
+use crate::coverage::db::{CoverageDb, CoveragePointRow};
 
 /// Configuration for coverage log filtering.
 #[derive(Debug, Clone)]
@@ -43,10 +35,10 @@ pub struct LogFilter {
 impl Default for LogFilter {
     fn default() -> Self {
         Self {
-            // Default: distance-based at 1m — only logs when the machine has moved.
-            // At 5Hz GPS, this avoids flooding the CSV when stationary and keeps
-            // ~1 point per metre at working speed (~3600/hr at 10km/h).
-            min_distance_m: 1.0,
+            // Default: 0.25m — gives smooth, gap-free coverage strips at working speed.
+            // At 10km/h (~2.78m/s) and 1Hz GPS, that's ~11 points per fix (if GPS were
+            // faster) but in practice at 1Hz we get 1 point per fix when moving > 0.25m/s.
+            min_distance_m: 0.25,
             min_interval_ms: 0,
         }
     }
@@ -78,7 +70,8 @@ impl LogFilter {
     }
 }
 
-/// A single logged coverage point (kept in memory for rendering).
+/// A single coverage point for rendering on the field view canvas.
+/// Kept in memory as a render cache, sourced from SQLite.
 #[derive(Debug, Clone)]
 pub struct CoveragePoint {
     pub segment: u32,
@@ -93,31 +86,49 @@ pub struct CoveragePoint {
     pub timestamp_ms: u64,
 }
 
+impl CoveragePoint {
+    /// Convert from a database row to a render point.
+    pub fn from_row(row: &CoveragePointRow) -> Self {
+        Self {
+            segment: row.segment,
+            latitude: row.latitude,
+            longitude: row.longitude,
+            altitude: row.altitude,
+            speed: row.speed,
+            heading: row.heading,
+            fix_quality: row.fix_quality,
+            satellites: row.satellites,
+            hdop: row.hdop,
+            timestamp_ms: row.timestamp_ms,
+        }
+    }
+}
+
+/// How many points to buffer before flushing to SQLite.
+const WRITE_BUFFER_SIZE: usize = 50;
+
 /// Coverage logger state.
 pub struct CoverageLogger {
-    /// Directory to store coverage CSV files
-    log_dir: PathBuf,
     /// Whether the implement is currently engaged (logging active)
     engaged: bool,
     /// Current segment number (increments each engage/disengage cycle)
     current_segment: u32,
-    /// Active file handle for writing
-    active_file: Option<File>,
-    /// Path to the active file (for display / database)
-    active_file_path: Option<PathBuf>,
     /// Total points logged in the current job
     points_logged: u64,
     /// Points logged in the current segment
     segment_points: u64,
-    /// In-memory coverage points for rendering on the canvas
-    coverage_points: Vec<CoveragePoint>,
+    /// In-memory coverage points for rendering on the canvas.
+    /// Grows as points are logged — no downsample needed since SQLite
+    /// is the source of truth and we can reload from DB if needed.
+    render_cache: Vec<CoveragePoint>,
     /// Implement width in metres (for coverage strip rendering)
     implement_width_m: f64,
     /// Log filter configuration
     filter: LogFilter,
-    /// Maximum number of in-memory coverage points before downsampling.
-    /// CSV recording is unaffected — this only limits display memory.
-    max_display_points: usize,
+    /// Write buffer — accumulates points before batch-inserting to SQLite
+    write_buffer: Vec<CoveragePointRow>,
+    /// Current job ID in the database (None if no job started)
+    current_job_id: Option<i64>,
 
     // === Deduplication state ===
     /// Timestamp of the last point we actually logged
@@ -128,22 +139,17 @@ pub struct CoverageLogger {
 }
 
 impl CoverageLogger {
-    pub fn new(log_dir: impl Into<PathBuf>, implement_width: f64) -> Self {
-        let log_dir = log_dir.into();
-        let _ = fs::create_dir_all(&log_dir);
-
+    pub fn new(implement_width: f64) -> Self {
         Self {
-            log_dir,
             engaged: false,
             current_segment: 0,
-            active_file: None,
-            active_file_path: None,
             points_logged: 0,
             segment_points: 0,
-            coverage_points: Vec::new(),
+            render_cache: Vec::new(),
             implement_width_m: implement_width,
             filter: LogFilter::default(),
-            max_display_points: 100_000,
+            write_buffer: Vec::with_capacity(WRITE_BUFFER_SIZE),
+            current_job_id: None,
             last_logged_timestamp_ms: 0,
             last_logged_lat: 0.0,
             last_logged_lon: 0.0,
@@ -155,12 +161,9 @@ impl CoverageLogger {
         self.engaged
     }
 
-    /// Get the active CSV filename (just the name, not full path).
-    pub fn active_filename(&self) -> Option<String> {
-        self.active_file_path
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().to_string())
+    /// Get the current job ID (if a job is active).
+    pub fn current_job_id(&self) -> Option<i64> {
+        self.current_job_id
     }
 
     /// Set the log filter configuration.
@@ -179,17 +182,18 @@ impl CoverageLogger {
     }
 
     /// Toggle engage/disengage. Returns the new engaged state.
-    pub fn toggle_engage(&mut self) -> bool {
+    /// Requires a database reference to create jobs/flush data.
+    pub fn toggle_engage(&mut self, db: Option<&CoverageDb>) -> bool {
         if self.engaged {
-            self.disengage();
+            self.disengage(db);
         } else {
-            self.engage();
+            self.engage(db);
         }
         self.engaged
     }
 
     /// Engage the implement - start logging.
-    fn engage(&mut self) {
+    fn engage(&mut self, db: Option<&CoverageDb>) {
         self.engaged = true;
         self.current_segment += 1;
         self.segment_points = 0;
@@ -197,24 +201,23 @@ impl CoverageLogger {
         // Reset dedup state so the first point of a new segment always logs
         self.last_logged_timestamp_ms = 0;
 
-        // Create a new CSV file if we don't have one yet for this job
-        if self.active_file.is_none() {
-            self.start_new_job();
+        // Create a new job in the database if we don't have one yet
+        if self.current_job_id.is_none() {
+            self.start_new_job(db);
         }
 
         tracing::info!(
-            "Coverage ENGAGED - segment {}, file: {:?}",
+            "Coverage ENGAGED - segment {}, job_id: {:?}",
             self.current_segment,
-            self.active_file_path
+            self.current_job_id
         );
     }
 
-    /// Disengage the implement - stop logging (but keep file open for next engage).
-    fn disengage(&mut self) {
+    /// Disengage the implement - stop logging (but keep job open for next engage).
+    fn disengage(&mut self, db: Option<&CoverageDb>) {
         self.engaged = false;
-        if let Some(ref mut file) = self.active_file {
-            let _ = file.flush();
-        }
+        // Flush any remaining buffered points
+        self.flush_buffer(db);
         tracing::info!(
             "Coverage DISENGAGED - segment {} had {} points, {} total",
             self.current_segment,
@@ -223,29 +226,29 @@ impl CoverageLogger {
         );
     }
 
-    /// Start a new job (new CSV file).
-    fn start_new_job(&mut self) {
+    /// Start a new job in the database.
+    fn start_new_job(&mut self, db: Option<&CoverageDb>) {
         let now = chrono::Local::now();
-        let filename = format!("coverage_{}.csv", now.format("%Y-%m-%d_%H%M%S"));
-        let path = self.log_dir.join(&filename);
+        let job_name = format!("Job_{}", now.format("%Y-%m-%d_%H%M%S"));
 
-        match File::create(&path) {
-            Ok(mut file) => {
-                // Write CSV header
-                let _ = writeln!(
-                    file,
-                    "segment,timestamp_ms,latitude,longitude,altitude,speed,heading,fix_quality,satellites,hdop"
-                );
-                self.active_file = Some(file);
-                self.active_file_path = Some(path.clone());
-                self.points_logged = 0;
-                self.current_segment = 0;
-                self.coverage_points.clear();
-                tracing::info!("Started new coverage job: {}", filename);
+        if let Some(db) = db {
+            match db.create_job(&job_name, self.implement_width_m) {
+                Ok(job_id) => {
+                    self.current_job_id = Some(job_id);
+                    self.points_logged = 0;
+                    self.current_segment = 0;
+                    self.render_cache.clear();
+                    tracing::info!("Started new coverage job: {} (id={})", job_name, job_id);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to create coverage job: {}", e);
+                }
             }
-            Err(e) => {
-                tracing::error!("Failed to create coverage file {}: {}", path.display(), e);
-            }
+        } else {
+            tracing::warn!("No database available — coverage points will only be in memory");
+            self.points_logged = 0;
+            self.current_segment = 0;
+            self.render_cache.clear();
         }
     }
 
@@ -253,15 +256,12 @@ impl CoverageLogger {
     ///
     /// Call this on every GPS fix received. The logger handles deduplication
     /// internally — it's safe and expected to call this at the GUI refresh rate.
-    pub fn log_fix(&mut self, fix: &GpsFix) {
+    pub fn log_fix(&mut self, fix: &GpsFix, db: Option<&CoverageDb>) {
         if !self.engaged {
             return;
         }
 
         // === Gate 1: Epoch deduplication ===
-        // Only proceed if this is a genuinely new GPS fix (different timestamp).
-        // The ZED-F9P updates once per epoch; the GUI loop calls us many times
-        // per epoch with the same fix data.
         if fix.timestamp_ms == self.last_logged_timestamp_ms && self.last_logged_timestamp_ms != 0 {
             return;
         }
@@ -289,35 +289,9 @@ impl CoverageLogger {
 
         // === Passed all filters — log it ===
 
-        let quality_str = match fix.fix_quality {
-            FixQuality::NoFix => "NoFix",
-            FixQuality::Gps => "GPS",
-            FixQuality::Dgps => "DGPS",
-            FixQuality::Rtk => "RTK",
-            FixQuality::RtkFloat => "RtkFloat",
-        };
-
-        // Write to CSV
-        if let Some(ref mut file) = self.active_file {
-            let _ = writeln!(
-                file,
-                "{},{},{:.8},{:.8},{:.2},{:.3},{:.2},{},{},{}",
-                self.current_segment,
-                fix.timestamp_ms,
-                fix.latitude,
-                fix.longitude,
-                fix.altitude,
-                fix.speed,
-                fix.heading,
-                quality_str,
-                fix.satellites,
-                fix.hdop,
-            );
-        }
-
-        // Store in memory for rendering
-        self.coverage_points.push(CoveragePoint {
+        let row = CoveragePointRow {
             segment: self.current_segment,
+            timestamp_ms: fix.timestamp_ms,
             latitude: fix.latitude,
             longitude: fix.longitude,
             altitude: fix.altitude,
@@ -326,26 +300,17 @@ impl CoverageLogger {
             fix_quality: fix.fix_quality,
             satellites: fix.satellites,
             hdop: fix.hdop,
-            timestamp_ms: fix.timestamp_ms,
-        });
+        };
 
-        // Memory cap: if we exceed the limit, downsample the oldest half by
-        // dropping every second point. Preserves spatial coverage while halving
-        // memory. The CSV still has full fidelity.
-        if self.coverage_points.len() > self.max_display_points {
-            let half = self.coverage_points.len() / 2;
-            // Keep every 2nd point from the older half, keep all of the newer half
-            let mut thinned: Vec<CoveragePoint> = self.coverage_points[..half]
-                .iter()
-                .step_by(2)
-                .cloned()
-                .collect();
-            thinned.extend_from_slice(&self.coverage_points[half..]);
-            self.coverage_points = thinned;
-            tracing::info!(
-                "Coverage display thinned: {} points after downsample",
-                self.coverage_points.len()
-            );
+        // Add to render cache for immediate display
+        self.render_cache.push(CoveragePoint::from_row(&row));
+
+        // Add to write buffer
+        self.write_buffer.push(row);
+
+        // Flush to SQLite when buffer is full
+        if self.write_buffer.len() >= WRITE_BUFFER_SIZE {
+            self.flush_buffer(db);
         }
 
         // Update dedup state
@@ -357,47 +322,73 @@ impl CoverageLogger {
         self.segment_points += 1;
     }
 
-    /// End the current job (close file, reset state).
-    pub fn end_job(&mut self) {
+    /// Flush the write buffer to SQLite.
+    fn flush_buffer(&mut self, db: Option<&CoverageDb>) {
+        if self.write_buffer.is_empty() {
+            return;
+        }
+        if let (Some(db), Some(job_id)) = (db, self.current_job_id) {
+            if let Err(e) = db.insert_coverage_batch(job_id, &self.write_buffer) {
+                tracing::error!("Failed to flush coverage buffer: {}", e);
+                return; // Keep buffer for retry
+            }
+        }
+        self.write_buffer.clear();
+    }
+
+    /// End the current job (flush, update stats in DB, reset state).
+    pub fn end_job(&mut self, db: Option<&CoverageDb>) {
         if self.engaged {
-            self.disengage();
+            self.disengage(db);
         }
-        if let Some(ref mut file) = self.active_file {
-            let _ = file.flush();
+        // Update job stats in database
+        if let (Some(db), Some(job_id)) = (db, self.current_job_id) {
+            let _ = db.end_job(job_id, self.points_logged, self.current_segment);
         }
-        self.active_file = None;
+        self.current_job_id = None;
         tracing::info!(
-            "Coverage job ended - {} points logged to {:?}",
+            "Coverage job ended - {} points logged",
             self.points_logged,
-            self.active_file_path
         );
     }
 
     /// Get coverage points for rendering.
     pub fn points(&self) -> &[CoveragePoint] {
-        &self.coverage_points
+        &self.render_cache
     }
 
-    /// Clear all in-memory coverage points.
-    ///
+    /// Clear the render cache and end the current job.
     /// Use this when moving to a new task (e.g. switching from seeding to spraying).
-    /// The CSV files on disk are untouched — this only clears the display.
-    /// Also ends the current job so the next engage starts a fresh CSV file.
-    pub fn clear_coverage(&mut self) {
+    /// The SQLite data is untouched — this only clears the in-memory display
+    /// and ends the job so the next engage starts fresh.
+    pub fn clear_coverage(&mut self, db: Option<&CoverageDb>) {
         if self.engaged {
-            self.disengage();
+            self.disengage(db);
         }
-        if let Some(ref mut file) = self.active_file {
-            let _ = file.flush();
+        // End the current job in the database
+        if let (Some(db), Some(job_id)) = (db, self.current_job_id) {
+            let _ = db.end_job(job_id, self.points_logged, self.current_segment);
         }
-        self.active_file = None;
-        self.active_file_path = None;
-        self.coverage_points.clear();
+        self.current_job_id = None;
+        self.render_cache.clear();
         self.points_logged = 0;
         self.current_segment = 0;
         self.segment_points = 0;
         self.last_logged_timestamp_ms = 0;
-        tracing::info!("Coverage display cleared — CSV files on disk are untouched");
+        tracing::info!("Coverage display cleared — SQLite data is untouched");
+    }
+
+    /// Load coverage points from a previous job into the render cache.
+    pub fn load_job_coverage(&mut self, db: &CoverageDb, job_id: i64) {
+        match db.load_coverage_points(job_id) {
+            Ok(rows) => {
+                self.render_cache = rows.iter().map(CoveragePoint::from_row).collect();
+                tracing::info!("Loaded {} coverage points from job {}", self.render_cache.len(), job_id);
+            }
+            Err(e) => {
+                tracing::error!("Failed to load coverage for job {}: {}", job_id, e);
+            }
+        }
     }
 
     /// Get the total number of points logged this job.
@@ -418,53 +409,5 @@ impl CoverageLogger {
     /// Update implement width.
     pub fn set_implement_width(&mut self, width: f64) {
         self.implement_width_m = width;
-    }
-
-    /// Load a previous coverage CSV file back into memory for display.
-    pub fn load_from_file(path: &Path) -> Option<Vec<CoveragePoint>> {
-        let content = fs::read_to_string(path).ok()?;
-        let mut points = Vec::new();
-
-        for line in content.lines().skip(1) {
-            let fields: Vec<&str> = line.split(',').collect();
-            if fields.len() < 10 {
-                continue;
-            }
-
-            let fix_quality = match fields[7] {
-                "RTK" => FixQuality::Rtk,
-                "RtkFloat" => FixQuality::RtkFloat,
-                "DGPS" => FixQuality::Dgps,
-                "GPS" => FixQuality::Gps,
-                _ => FixQuality::NoFix,
-            };
-
-            if let (Ok(seg), Ok(ts), Ok(lat), Ok(lon), Ok(alt), Ok(spd), Ok(hdg), Ok(sats), Ok(hdop)) = (
-                fields[0].parse::<u32>(),
-                fields[1].parse::<u64>(),
-                fields[2].parse::<f64>(),
-                fields[3].parse::<f64>(),
-                fields[4].parse::<f64>(),
-                fields[5].parse::<f64>(),
-                fields[6].parse::<f64>(),
-                fields[8].parse::<u8>(),
-                fields[9].parse::<f64>(),
-            ) {
-                points.push(CoveragePoint {
-                    segment: seg,
-                    latitude: lat,
-                    longitude: lon,
-                    altitude: alt,
-                    speed: spd,
-                    heading: hdg,
-                    fix_quality,
-                    satellites: sats,
-                    hdop,
-                    timestamp_ms: ts,
-                });
-            }
-        }
-
-        Some(points)
     }
 }

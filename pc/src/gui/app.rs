@@ -77,6 +77,18 @@ pub struct GuidanceApp {
     /// Status message from motor test actions
     motor_test_msg: Option<(String, u32)>,
 
+    // --- WAS calibration ---
+    /// WAS ADC value at steering centre (wheels straight)
+    was_centre: Option<u16>,
+    /// WAS ADC value at full left steering lock
+    was_left_lock: Option<u16>,
+    /// WAS ADC value at full right steering lock
+    was_right_lock: Option<u16>,
+    /// Whether to invert the motor PWM sign (true = positive PWM steers left)
+    motor_invert: bool,
+    /// Status message for WAS calibration actions
+    was_cal_msg: Option<(String, u32)>,
+
     // --- AB line persistence ---
     /// SQLite database (opened once, held for the session)
     db: Option<CoverageDb>,
@@ -132,6 +144,21 @@ impl GuidanceApp {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(20.0);
 
+        // Load WAS calibration from database (None if not yet calibrated)
+        let was_centre = db.as_ref()
+            .and_then(|d| d.get_config("was_centre"))
+            .and_then(|v| v.parse::<u16>().ok());
+        let was_left_lock = db.as_ref()
+            .and_then(|d| d.get_config("was_left_lock"))
+            .and_then(|v| v.parse::<u16>().ok());
+        let was_right_lock = db.as_ref()
+            .and_then(|d| d.get_config("was_right_lock"))
+            .and_then(|v| v.parse::<u16>().ok());
+        let motor_invert = db.as_ref()
+            .and_then(|d| d.get_config("motor_invert"))
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
         // Auto-load last-used AB line on startup
         let mut guide = AbLineGuide::new(implement_width);
         guide.overlap_m = overlap;
@@ -157,7 +184,7 @@ impl GuidanceApp {
             position_trail: VecDeque::new(),
             max_trail: 50000,
             field_view: FieldView::new(),
-            coverage: CoverageLogger::new("coverage_logs", implement_width),
+            coverage: CoverageLogger::new(implement_width),
             auto_pass_notification: None,
             active_page: ActivePage::Working,
             lightbar_cm_per_seg,
@@ -168,6 +195,11 @@ impl GuidanceApp {
             motor_handle,
             test_pwm: 0,
             motor_test_msg: None,
+            was_centre,
+            was_left_lock,
+            was_right_lock,
+            motor_invert,
+            was_cal_msg: None,
             db,
             saved_fields,
             saved_ab_lines,
@@ -188,6 +220,48 @@ impl GuidanceApp {
             self.saved_fields = db.list_fields().unwrap_or_default();
             self.saved_ab_lines = db.list_ab_lines().unwrap_or_default();
         }
+    }
+
+    /// Compute a calibrated steering angle from a raw WAS ADC value.
+    ///
+    /// Uses piecewise linear mapping from the three calibration points:
+    ///   left_lock → -max_angle,  centre → 0,  right_lock → +max_angle
+    ///
+    /// Returns None if calibration is incomplete. The max angle is estimated
+    /// from the ADC range (we don't know the physical lock angle, so we
+    /// normalise to ±45° as a reasonable default — the PID only needs a
+    /// proportional signal, not true degrees).
+    fn was_calibrated_angle(&self, raw: u16) -> Option<f64> {
+        let centre = self.was_centre? as f64;
+        let left = self.was_left_lock? as f64;
+        let right = self.was_right_lock? as f64;
+        let raw = raw as f64;
+
+        // Normalised steering angle in degrees.
+        // Convention: negative = left, positive = right.
+        const MAX_ANGLE: f64 = 45.0;
+
+        let angle = if raw <= centre {
+            // Left half: map [left_lock .. centre] → [-MAX_ANGLE .. 0]
+            let range = centre - left;
+            if range.abs() < 1.0 { return Some(0.0); }
+            -MAX_ANGLE * (centre - raw) / range
+        } else {
+            // Right half: map [centre .. right_lock] → [0 .. MAX_ANGLE]
+            let range = right - centre;
+            if range.abs() < 1.0 { return Some(0.0); }
+            MAX_ANGLE * (raw - centre) / range
+        };
+
+        Some(angle.clamp(-MAX_ANGLE, MAX_ANGLE))
+    }
+
+    /// Apply the motor_invert setting to a PWM value for the PID controller.
+    /// When motor_invert is true, the sign is flipped so that positive always
+    /// means "steer right" from the PID's perspective.
+    #[allow(dead_code)]
+    fn apply_motor_direction(&self, pwm: i16) -> i16 {
+        if self.motor_invert { -pwm } else { pwm }
     }
 }
 
@@ -215,7 +289,7 @@ impl eframe::App for GuidanceApp {
             }
 
             // Log coverage if engaged (real fix only — distance filter needs true positions)
-            self.coverage.log_fix(&fix);
+            self.coverage.log_fix(&fix, self.db.as_ref());
 
             self.current_fix = Some(fix);
         }
@@ -269,6 +343,9 @@ impl eframe::App for GuidanceApp {
         }
         if let Some((_, ref mut frames)) = self.motor_test_msg {
             if *frames == 0 { self.motor_test_msg = None; } else { *frames -= 1; }
+        }
+        if let Some((_, ref mut frames)) = self.was_cal_msg {
+            if *frames == 0 { self.was_cal_msg = None; } else { *frames -= 1; }
         }
 
         // Request continuous repaints for real-time display
@@ -341,7 +418,7 @@ impl GuidanceApp {
                         egui::RichText::new(engage_text).size(20.0).strong().color(engage_colour)
                     ).min_size(egui::vec2(160.0, 40.0));
                     if ui.add(engage_btn).clicked() {
-                        self.coverage.toggle_engage();
+                        self.coverage.toggle_engage(self.db.as_ref());
                     }
 
                     // Auto-pass toggle
@@ -1161,7 +1238,7 @@ impl GuidanceApp {
                     if ui.add(egui::Button::new(
                         egui::RichText::new(engage_text).strong().color(engage_colour)
                     ).min_size(egui::vec2(150.0, 30.0))).clicked() {
-                        self.coverage.toggle_engage();
+                        self.coverage.toggle_engage(self.db.as_ref());
                     }
 
                     if self.coverage.is_engaged() {
@@ -1184,9 +1261,9 @@ impl GuidanceApp {
                     ).min_size(egui::vec2(150.0, 30.0));
                     let clear_resp = ui.add_enabled(can_clear && !self.coverage.is_engaged(), clear_btn);
                     if clear_resp.clicked() {
-                        self.coverage.clear_coverage();
+                        self.coverage.clear_coverage(self.db.as_ref());
                         self.ab_status_msg = Some((
-                            "Coverage cleared — CSVs on disk untouched".to_string(), 240
+                            "Coverage cleared — DB data untouched".to_string(), 240
                         ));
                     }
                     if self.coverage.is_engaged() && can_clear {
@@ -1206,14 +1283,14 @@ impl GuidanceApp {
                                 // Clone job data to avoid borrow conflict with self
                                 let job_data: Vec<(i64, String, String, i64, i32)> = jobs.iter()
                                     .take(10) // Show last 10 jobs
-                                    .map(|j| (j.id, j.csv_filename.clone(), j.started_at.clone(), j.total_points, j.total_segments))
+                                    .map(|j| (j.id, j.name.clone(), j.started_at.clone(), j.total_points, j.total_segments))
                                     .collect();
 
                                 egui::ScrollArea::vertical()
                                     .id_salt("job_history_list")
                                     .max_height(120.0)
                                     .show(ui, |ui| {
-                                        for (id, filename, started, points, segments) in &job_data {
+                                        for (id, name, started, points, segments) in &job_data {
                                             ui.horizontal(|ui| {
                                                 // Extract just date+time from the started_at string
                                                 let display_date = if started.len() >= 16 {
@@ -1225,7 +1302,7 @@ impl GuidanceApp {
                                                     format!("{} — {}pts, {}segs", display_date, points, segments)
                                                 ).size(11.0));
                                                 if ui.small_button("🗑").on_hover_text(
-                                                    format!("Delete job record\n{}", filename)
+                                                    format!("Delete job\n{}", name)
                                                 ).clicked() {
                                                     if let Some(db) = &self.db {
                                                         let _ = db.delete_job(*id);
@@ -1263,9 +1340,16 @@ impl GuidanceApp {
                     ui.label(egui::RichText::new("SENSORS").size(14.0).strong());
                     ui.add_space(4.0);
 
-                    // WAS
+                    // WAS — show raw + calibrated angle if calibrated
                     if let Some(was) = &self.latest_was {
                         ui.label(format!("WAS:  {} raw  ({} mV)", was.raw_value, was.voltage_mv));
+                        if let Some(angle) = self.was_calibrated_angle(was.raw_value) {
+                            let dir = if angle < -0.5 { "LEFT" } else if angle > 0.5 { "RIGHT" } else { "CENTRE" };
+                            ui.label(
+                                egui::RichText::new(format!("Angle: {:.1}° {}", angle, dir))
+                                    .size(14.0).strong()
+                            );
+                        }
                     } else {
                         ui.label(egui::RichText::new("WAS: no data").size(12.0).weak());
                     }
@@ -1302,6 +1386,169 @@ impl GuidanceApp {
                             egui::RichText::new(format!("ESP32 uptime: {}m {}s", mins, secs % 60))
                                 .size(11.0).weak()
                         );
+                    }
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+
+                    // === WAS Calibration Section ===
+                    // Three-point calibration: centre, left lock, right lock.
+                    // Stores raw ADC values in SQLite config table. The PC computes
+                    // the steering angle from raw ADC using piecewise linear mapping.
+                    ui.label(egui::RichText::new("WAS CALIBRATION").size(14.0).strong());
+                    ui.add_space(4.0);
+
+                    let has_was_data = self.latest_was.is_some();
+                    let is_calibrated = self.was_centre.is_some()
+                        && self.was_left_lock.is_some()
+                        && self.was_right_lock.is_some();
+
+                    // Status display
+                    if is_calibrated {
+                        ui.colored_label(egui::Color32::GREEN, "● Calibrated");
+                        ui.label(egui::RichText::new(format!(
+                            "L:{} C:{} R:{}",
+                            self.was_left_lock.unwrap(),
+                            self.was_centre.unwrap(),
+                            self.was_right_lock.unwrap(),
+                        )).size(11.0).weak());
+                    } else {
+                        ui.colored_label(egui::Color32::from_rgb(255, 200, 60), "● Not calibrated");
+                    }
+
+                    ui.add_space(4.0);
+
+                    // Live WAS readout for feedback during calibration
+                    if let Some(was) = &self.latest_was {
+                        ui.label(
+                            egui::RichText::new(format!("Current: {} raw", was.raw_value))
+                                .size(14.0).strong()
+                        );
+                    }
+
+                    ui.add_space(4.0);
+
+                    // Step 1: Set Centre
+                    ui.label(egui::RichText::new("1. Wheels straight:").size(12.0));
+                    let centre_btn = egui::Button::new(
+                        egui::RichText::new("Set Centre").size(13.0)
+                    ).min_size(egui::vec2(120.0, 30.0));
+                    if ui.add_enabled(has_was_data, centre_btn).clicked() {
+                        if let Some(was) = &self.latest_was {
+                            self.was_centre = Some(was.raw_value);
+                            if let Some(db) = &self.db {
+                                let _ = db.set_config("was_centre", &was.raw_value.to_string());
+                            }
+                            self.was_cal_msg = Some((
+                                format!("Centre set: {}", was.raw_value), 180
+                            ));
+                        }
+                    }
+
+                    ui.add_space(2.0);
+
+                    // Step 2: Set Left Lock
+                    ui.label(egui::RichText::new("2. Full LEFT lock:").size(12.0));
+                    let left_btn = egui::Button::new(
+                        egui::RichText::new("Set Left Lock").size(13.0)
+                    ).min_size(egui::vec2(120.0, 30.0));
+                    if ui.add_enabled(has_was_data, left_btn).clicked() {
+                        if let Some(was) = &self.latest_was {
+                            self.was_left_lock = Some(was.raw_value);
+                            if let Some(db) = &self.db {
+                                let _ = db.set_config("was_left_lock", &was.raw_value.to_string());
+                            }
+                            self.was_cal_msg = Some((
+                                format!("Left lock set: {}", was.raw_value), 180
+                            ));
+                        }
+                    }
+
+                    ui.add_space(2.0);
+
+                    // Step 3: Set Right Lock
+                    ui.label(egui::RichText::new("3. Full RIGHT lock:").size(12.0));
+                    let right_btn = egui::Button::new(
+                        egui::RichText::new("Set Right Lock").size(13.0)
+                    ).min_size(egui::vec2(120.0, 30.0));
+                    if ui.add_enabled(has_was_data, right_btn).clicked() {
+                        if let Some(was) = &self.latest_was {
+                            self.was_right_lock = Some(was.raw_value);
+                            if let Some(db) = &self.db {
+                                let _ = db.set_config("was_right_lock", &was.raw_value.to_string());
+                            }
+                            self.was_cal_msg = Some((
+                                format!("Right lock set: {}", was.raw_value), 180
+                            ));
+                        }
+                    }
+
+                    ui.add_space(4.0);
+
+                    // Recalibrate button — clears all three values
+                    if is_calibrated {
+                        if ui.add(egui::Button::new(
+                            egui::RichText::new("↻ Recalibrate").size(12.0)
+                        ).min_size(egui::vec2(120.0, 28.0))).clicked() {
+                            self.was_centre = None;
+                            self.was_left_lock = None;
+                            self.was_right_lock = None;
+                            if let Some(db) = &self.db {
+                                // Remove the config keys (set to empty to effectively clear)
+                                let _ = db.set_config("was_centre", "");
+                                let _ = db.set_config("was_left_lock", "");
+                                let _ = db.set_config("was_right_lock", "");
+                            }
+                            self.was_cal_msg = Some(("Calibration cleared".to_string(), 180));
+                        }
+                    }
+
+                    if !has_was_data {
+                        ui.label(egui::RichText::new("Waiting for WAS data...").size(11.0).weak());
+                    }
+
+                    if let Some((ref msg, _)) = self.was_cal_msg {
+                        ui.label(egui::RichText::new(msg).size(11.0)
+                            .color(egui::Color32::from_rgb(100, 220, 100)));
+                    }
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+
+                    // === Motor Direction Section ===
+                    ui.label(egui::RichText::new("MOTOR DIRECTION").size(14.0).strong());
+                    ui.add_space(4.0);
+
+                    let invert_label = if self.motor_invert {
+                        "+PWM = steer LEFT"
+                    } else {
+                        "+PWM = steer RIGHT"
+                    };
+                    let invert_colour = if self.motor_invert {
+                        egui::Color32::from_rgb(255, 200, 60)
+                    } else {
+                        egui::Color32::GREEN
+                    };
+                    ui.colored_label(invert_colour,
+                        egui::RichText::new(invert_label).size(14.0).strong()
+                    );
+                    ui.add_space(2.0);
+                    ui.label(egui::RichText::new(
+                        "Use MOTOR TEST to verify, then toggle if needed"
+                    ).size(11.0).weak());
+                    ui.add_space(4.0);
+
+                    if ui.add(egui::Button::new(
+                        egui::RichText::new("Invert Motor Direction").size(13.0)
+                    ).min_size(egui::vec2(160.0, 30.0))).clicked() {
+                        self.motor_invert = !self.motor_invert;
+                        if let Some(db) = &self.db {
+                            let _ = db.set_config("motor_invert",
+                                if self.motor_invert { "true" } else { "false" }
+                            );
+                        }
                     }
 
                     ui.add_space(10.0);

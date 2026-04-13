@@ -5,43 +5,48 @@
 > Updated at the end of each working session.
 
 ## Last updated
-Session 13 — 10 April 2026 (PC-side FINN parser + motor test UI + dual serial auto-detect)
+Session 14 — 13 April 2026 (Coverage storage migrated from CSV to SQLite)
 
 ## What we're working on
-**Phase 4 — PC-side integration complete, heading to field test.**
+**Phase 4 — Field tested, coverage rendering fix in progress.**
 
-All ESP32 firmware is flashed. All sensor data (WAS, IMU, GPS passthrough) now
-flows end-to-end through the Rust PC application. The motor ESP32 is connected
-on a second serial port with a MOTOR TEST panel for manual PWM control.
+First field test completed on Dell 7390 in tractor cab. Guidance display, lightbar,
+auto-pass all working well. Coverage rendering showed dashed strips (1m gaps between
+quads) due to the 1m distance filter — redesigned coverage storage from CSV to SQLite
+with 0.25m distance filter for gap-free rendering.
 
 **Completed this session:**
-- FINN sentence parser (`finn_parser.rs`) — parses `$FINNWAS`, `$FINNIMU`,
-  `$FINNHB`, `$FINNMTR` with checksum validation and unit tests
-- Updated `protocol.rs` — replaced old UDP-based types with actual serial protocol
-  (`FinnMessage` enum, `nmea_checksum()`, `format_steer_command()`)
-- Updated `types.rs` — added calibration fields to `ImuData`, `voltage_mv` to
-  `WasReading`, new `EspHeartbeat` and `MotorStatus` structs
-- Serial reader routes `$FINN*` sentences through new parser alongside NMEA
-- FINN channel (`crossbeam bounded:128`) carries WAS/IMU/heartbeat/motor data
-  from serial reader threads to GUI
-- SENSORS section in Setup page — live WAS raw/mV, IMU roll/pitch/heading with
-  colour-coded calibration status, ESP32 uptime
-- Motor ESP32 on separate serial port — auto-detected, `MotorHandle` with
-  `Arc<Mutex<...>>` for thread-safe steer command sending
-- MOTOR TEST section in Setup page — preset PWM buttons (-100 to +100), ±10
-  fine adjust, emergency STOP, live motor status and WAS feedback display
-- Dual-ESP32 auto-detect — sensor reader distinguishes sensor ESP32 (`$FINNWAS`,
-  `$FINNIMU`) from motor ESP32 (`$FINNMTR`), skips motor port. Reads 40 lines
-  to catch FINN sentences even when GPS NMEA arrives first.
-- ESP32-aware startup — skips `ensure_module_config()` (PAIR commands) when
-  connected to ESP32 sensor module (GPS is behind UART passthrough, not direct)
-- Port coordination — sensor reader reports claimed port via channel so motor
-  reader can exclude it during auto-detect
+- Coverage point storage migrated from CSV files to SQLite `coverage_points` table
+- Distance filter reduced from 1.0m to 0.25m for smooth coverage strip rendering
+- `logger.rs` fully rewritten: removed CSV file I/O, added 50-point write buffer
+  with batch SQLite inserts, removed in-memory downsample/100k cap
+- `db.rs`: new `coverage_points` table with `(job_id, segment)` index, batch insert,
+  load, count, clear, and CSV export methods
+- `jobs` table migrated from `csv_filename` to `name` column (auto-migration for
+  existing DBs)
+- All logger mutation methods (`toggle_engage`, `log_fix`, `clear_coverage`,
+  `end_job`) now accept `db: Option<&CoverageDb>` parameter
+- `app.rs` updated to pass DB reference through to all coverage logger calls
+- Added `load_job_coverage()` for reloading previous jobs into render cache
+- Added `export_coverage_csv()` on CoverageDb for CSV export from SQLite data
+- Decision #017 documented
+
+**⚠ NOT YET TESTED — requires `cargo build` and field verification.**
+
+**Previous session (Session 13) completed:**
+- FINN sentence parser (`finn_parser.rs`)
+- Dual serial auto-detect (sensor vs motor ESP32)
+- SENSORS and MOTOR TEST sections in Setup page
+- Motor ESP32 on separate serial port with MotorHandle
+- Port coordination between sensor and motor readers
 
 **Not yet done:**
+- `cargo build` verification of coverage SQLite changes
+- Field test to confirm gap-free coverage rendering at 0.25m
+- Wire up CSV export button in job history UI
 - WAS calibration routine (centre/left-lock/right-lock, store in SQLite)
 - PID controller (Phase 5) — depends on WAS calibration
-- Field test on Dell 7390 laptops (hardware being installed on tractor now)
+- Touch target improvements (lower priority, UI is useable)
 
 ## Current state of the code
 All features below are IMPLEMENTED and working:
@@ -60,10 +65,11 @@ All features below are IMPLEMENTED and working:
   align-grid-to-here. All persisted except nudge (session-specific by design).
 - **AB line persistence**: two-level field→line model, save/load/delete, JSON
   export/import for cross-PC transfer, last-loaded line auto-restored on startup
-- **Coverage**: engage/disengage, distance-based CSV logging (1m), in-memory points
-  for quad-strip rendering (colour-coded by fix quality), viewport culling,
-  zoom-dependent render thinning (step 1–4), 100k memory cap with downsample,
-  clear button for task transitions
+- **Coverage**: engage/disengage, distance-based logging (0.25m), SQLite storage
+  with batch inserts (50-point write buffer), in-memory render cache for field view,
+  colour-coded by fix quality, viewport culling, zoom-dependent render thinning
+  (step 1–4), CSV export from DB available. Clear button for task transitions.
+  **⚠ SQLite migration NOT YET BUILD-TESTED.**
 - **Job management**: JOB HISTORY list in Setup page (last 10, with delete)
 - **GUI**: working page (full-screen + overlaid lightbar/XTE/notifications) and
   setup page (scrollable panel with AB LINE, IMPLEMENT, NUDGE, GUIDANCE, COVERAGE,
@@ -95,6 +101,7 @@ All features below are IMPLEMENTED and working:
 - #014: Coverage data management (render thinning, memory cap, clear button)
 - #015: Arduino/PlatformIO for ESP32 firmware (replaced Rust/esp-idf-hal)
 - #016: Dual-ESP32 auto-detect (distinguish sensor vs motor by sentence type)
+- #017: Coverage data to SQLite, replacing CSV as primary store (0.25m filter)
 
 ## Phase 4 hardware inventory (as of 10 April 2026)
 - **ESP32 #1 (sensor node)**: reads WAS (ADC GPIO 34), BNO055 (I2C GPIO 21/22),
@@ -222,14 +229,14 @@ The 5V VIN pins back-feed 5V to the GPS and IBT-2 logic (bench-tested OK).
 
 ## Next session should
 1. Read this file and DECISIONS.md for context
-2. **Clone repo onto Dell 7390** — `git clone`, `cargo build --release`
-3. **Verify dual-port auto-detect** on the new PC (COM ports will be different)
-4. **Field test the full prototype** — run through the checklist above
-5. **WAS calibration** — with pot mounted on steering, implement the three-point
+2. **`cargo build --release`** — verify the coverage SQLite changes compile clean
+3. **Fix any build errors** from the CSV→SQLite migration
+4. **Field test coverage rendering** — confirm gap-free strips at 0.25m
+5. **Wire up CSV export button** in job history UI (export_coverage_csv is ready)
+6. **WAS calibration** — with pot mounted on steering, implement the three-point
    calibration routine (centre/left-lock/right-lock) and store in SQLite
-6. **Determine motor direction convention** — use MOTOR TEST to confirm which
+7. **Determine motor direction convention** — use MOTOR TEST to confirm which
    PWM sign corresponds to which steering direction on this tractor
-7. **Note any issues** for fix-up in the next development session
 
 ## File map (quick reference)
 ```
@@ -245,8 +252,8 @@ pc/src/gui/app.rs            — egui application, page split, lightbar, config 
                                SENSORS section, MOTOR TEST section
 pc/src/gui/field_view.rs     — 2D canvas rendering (grid, coverage strips, lines, trail, vehicle)
 pc/src/gui/field_projection.rs — lat/lon → local metres → screen pixels
-pc/src/coverage/logger.rs    — coverage CSV recording, 3-gate filtering, memory cap, clear
-pc/src/coverage/db.rs        — SQLite database (jobs, segments, AB lines, fields, config)
+pc/src/coverage/logger.rs    — coverage logger: filter, buffer, flush to SQLite, render cache
+pc/src/coverage/db.rs        — SQLite database (jobs, segments, coverage points, AB lines, fields, config)
 pc/src/position/tracker.rs   — position history and odometer
 pc/src/position/interpolator.rs — dead-reckoning between 1Hz GPS fixes for smooth GUI
 common/src/types.rs          — GpsFix, ImuData (with cal), WasReading (with mV),
@@ -268,7 +275,8 @@ docs/ACTIVE_CONTEXT.md       — this file
 - GPS receiver is a Quectel LC29H on ArduSimple board, connected via USB serial
 - GUI framework is egui 0.29 (eframe), rendering via Painter API
 - All coordinate math in `common/src/coords.rs`, types in `common/src/types.rs`
-- Coverage CSV format: `segment,timestamp_ms,lat,lon,alt,speed,heading,fix_quality,sats,hdop`
+- Coverage CSV format (for export): `segment,timestamp_ms,lat,lon,alt,speed,heading,fix_quality,sats,hdop`
+- Coverage primary store is SQLite `coverage_points` table (batch inserts, 0.25m distance filter)
 - Implement width defaults to 12.0m in `main.rs`, persisted in SQLite config table
 - Overlap defaults to 0cm, persisted. Pass spacing = width − overlap.
 - Lightbar sensitivity defaults to 20 cm/segment (3.0m full scale), persisted
@@ -276,3 +284,4 @@ docs/ACTIVE_CONTEXT.md       — this file
 - egui 0.29 uses `id_salt` (not `id_source`), `show_tooltip_text` takes 4 args
 - ESP32 firmware uses Arduino/PlatformIO (C++), built with `pio run --target upload`
 - Old `pc/src/comms/udp.rs` is dead code — can be deleted (replaced by `serial.rs`)
+- Old `coverage_logs/` CSV directory no longer written to (coverage now in SQLite)

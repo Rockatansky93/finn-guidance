@@ -1,11 +1,16 @@
-//! Coverage database - SQLite storage for job metadata, segments, AB lines, and fields.
+//! Coverage database - SQLite storage for coverage points, job metadata, AB lines, and fields.
 //!
-//! The database stores structured metadata alongside the CSV coverage files:
+//! The database stores all coverage data:
+//!   - Coverage points: GPS positions recorded while the implement is engaged
 //!   - Fields: named paddocks, each containing a set of AB lines
-//!   - Jobs: each recording session with start/end times, total area, filename
+//!   - Jobs: each recording session with start/end times, total area
 //!   - Segments: each engage/disengage cycle within a job
 //!   - AB Lines: saved guidance lines grouped by field, for reuse across sessions
 //!   - Config: persisted settings (implement width, log filters, etc.)
+//!
+//! Coverage points are the primary data store (replaces CSV files). Points are
+//! written in batches via transactions for performance. At 0.25m spacing and
+//! 10km/h, that's ~11k points/hour — SQLite handles this easily.
 //!
 //! AB line organisation:
 //!   Fields group related AB lines (e.g. a paddock typically has up to 4 lines:
@@ -14,6 +19,7 @@
 
 use std::path::Path;
 use serde::{Deserialize, Serialize};
+use finn_guidance_common::types::FixQuality;
 
 /// Coverage database backed by SQLite.
 pub struct CoverageDb {
@@ -48,7 +54,7 @@ impl CoverageDb {
 
             CREATE TABLE IF NOT EXISTS jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                csv_filename TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
                 started_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
                 ended_at TEXT,
                 implement_width_m REAL NOT NULL,
@@ -67,6 +73,24 @@ impl CoverageDb {
                 ab_line_id INTEGER REFERENCES ab_lines(id)
             );
 
+            CREATE TABLE IF NOT EXISTS coverage_points (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                segment INTEGER NOT NULL,
+                timestamp_ms INTEGER NOT NULL,
+                latitude REAL NOT NULL,
+                longitude REAL NOT NULL,
+                altitude REAL NOT NULL,
+                speed REAL NOT NULL,
+                heading REAL NOT NULL,
+                fix_quality TEXT NOT NULL,
+                satellites INTEGER NOT NULL,
+                hdop REAL NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_coverage_job_seg
+                ON coverage_points(job_id, segment);
+
             CREATE TABLE IF NOT EXISTS ab_lines (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 field_id INTEGER REFERENCES fields(id) ON DELETE SET NULL,
@@ -84,16 +108,22 @@ impl CoverageDb {
             );
         ").map_err(|e| format!("Failed to create tables: {}", e))?;
 
+        // Migration: add 'name' column to jobs if upgrading from old schema
+        // that had 'csv_filename'. Ignore errors (column already exists).
+        let _ = self.conn.execute(
+            "ALTER TABLE jobs ADD COLUMN name TEXT NOT NULL DEFAULT ''", []
+        );
+
         Ok(())
     }
 
     // === Job operations ===
 
     /// Create a new job and return its ID.
-    pub fn create_job(&self, csv_filename: &str, implement_width: f64) -> Result<i64, String> {
+    pub fn create_job(&self, name: &str, implement_width: f64) -> Result<i64, String> {
         self.conn.execute(
-            "INSERT INTO jobs (csv_filename, implement_width_m) VALUES (?1, ?2)",
-            rusqlite::params![csv_filename, implement_width],
+            "INSERT INTO jobs (name, implement_width_m) VALUES (?1, ?2)",
+            rusqlite::params![name, implement_width],
         ).map_err(|e| format!("Failed to create job: {}", e))?;
 
         Ok(self.conn.last_insert_rowid())
@@ -111,14 +141,14 @@ impl CoverageDb {
     /// List all jobs, most recent first.
     pub fn list_jobs(&self) -> Result<Vec<SavedJob>, String> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, csv_filename, started_at, ended_at, implement_width_m, total_points, total_segments, notes
+            "SELECT id, name, started_at, ended_at, implement_width_m, total_points, total_segments, notes
              FROM jobs ORDER BY started_at DESC"
         ).map_err(|e| format!("Failed to query jobs: {}", e))?;
 
         let jobs = stmt.query_map([], |row| {
             Ok(SavedJob {
                 id: row.get(0)?,
-                csv_filename: row.get(1)?,
+                name: row.get(1)?,
                 started_at: row.get(2)?,
                 ended_at: row.get(3)?,
                 implement_width_m: row.get(4)?,
@@ -133,8 +163,10 @@ impl CoverageDb {
         Ok(jobs)
     }
 
-    /// Delete a job and its segments by ID.
+    /// Delete a job, its segments, and its coverage points by ID.
     pub fn delete_job(&self, id: i64) -> Result<(), String> {
+        self.conn.execute("DELETE FROM coverage_points WHERE job_id = ?1", rusqlite::params![id])
+            .map_err(|e| format!("Failed to delete coverage points: {}", e))?;
         self.conn.execute("DELETE FROM segments WHERE job_id = ?1", rusqlite::params![id])
             .map_err(|e| format!("Failed to delete segments: {}", e))?;
         self.conn.execute("DELETE FROM jobs WHERE id = ?1", rusqlite::params![id])
@@ -353,6 +385,124 @@ impl CoverageDb {
         ).map_err(|e| format!("Failed to set config: {}", e))?;
         Ok(())
     }
+
+    // === Coverage point operations ===
+
+    /// Insert a batch of coverage points in a single transaction.
+    /// Call this periodically (e.g. every 50 points) for good throughput
+    /// without blocking the GPS thread.
+    pub fn insert_coverage_batch(&self, job_id: i64, points: &[CoveragePointRow]) -> Result<(), String> {
+        if points.is_empty() {
+            return Ok(());
+        }
+
+        self.conn.execute("BEGIN", [])
+            .map_err(|e| format!("Failed to begin transaction: {}", e))?;
+
+        {
+            let mut stmt = self.conn.prepare_cached(
+                "INSERT INTO coverage_points (job_id, segment, timestamp_ms, latitude, longitude,
+                 altitude, speed, heading, fix_quality, satellites, hdop)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+            ).map_err(|e| format!("Failed to prepare insert: {}", e))?;
+
+            for pt in points {
+                let quality_str = fix_quality_to_str(pt.fix_quality);
+                stmt.execute(rusqlite::params![
+                    job_id,
+                    pt.segment,
+                    pt.timestamp_ms as i64,
+                    pt.latitude,
+                    pt.longitude,
+                    pt.altitude,
+                    pt.speed,
+                    pt.heading,
+                    quality_str,
+                    pt.satellites as i32,
+                    pt.hdop,
+                ]).map_err(|e| format!("Failed to insert coverage point: {}", e))?;
+            }
+        }
+
+        self.conn.execute("COMMIT", [])
+            .map_err(|e| format!("Failed to commit transaction: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Load all coverage points for a job, ordered by segment then timestamp.
+    pub fn load_coverage_points(&self, job_id: i64) -> Result<Vec<CoveragePointRow>, String> {
+        let mut stmt = self.conn.prepare(
+            "SELECT segment, timestamp_ms, latitude, longitude, altitude,
+                    speed, heading, fix_quality, satellites, hdop
+             FROM coverage_points
+             WHERE job_id = ?1
+             ORDER BY segment ASC, timestamp_ms ASC"
+        ).map_err(|e| format!("Failed to query coverage points: {}", e))?;
+
+        let points = stmt.query_map(rusqlite::params![job_id], |row| {
+            let quality_str: String = row.get(7)?;
+            Ok(CoveragePointRow {
+                segment: row.get(0)?,
+                timestamp_ms: row.get::<_, i64>(1)? as u64,
+                latitude: row.get(2)?,
+                longitude: row.get(3)?,
+                altitude: row.get(4)?,
+                speed: row.get(5)?,
+                heading: row.get(6)?,
+                fix_quality: str_to_fix_quality(&quality_str),
+                satellites: row.get::<_, i32>(8)? as u8,
+                hdop: row.get(9)?,
+            })
+        }).map_err(|e| format!("Failed to read coverage points: {}", e))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+        Ok(points)
+    }
+
+    /// Count coverage points for a job.
+    pub fn count_coverage_points(&self, job_id: i64) -> Result<u64, String> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM coverage_points WHERE job_id = ?1",
+            rusqlite::params![job_id],
+            |row| row.get::<_, i64>(0),
+        ).map(|c| c as u64)
+        .map_err(|e| format!("Failed to count coverage points: {}", e))
+    }
+
+    /// Delete all coverage points for a job (without deleting the job itself).
+    pub fn clear_coverage_points(&self, job_id: i64) -> Result<(), String> {
+        self.conn.execute(
+            "DELETE FROM coverage_points WHERE job_id = ?1",
+            rusqlite::params![job_id],
+        ).map_err(|e| format!("Failed to clear coverage points: {}", e))?;
+        Ok(())
+    }
+
+    /// Export coverage points for a job to CSV format string.
+    pub fn export_coverage_csv(&self, job_id: i64) -> Result<String, String> {
+        let points = self.load_coverage_points(job_id)?;
+        let mut csv = String::from(
+            "segment,timestamp_ms,latitude,longitude,altitude,speed,heading,fix_quality,satellites,hdop\n"
+        );
+        for pt in &points {
+            csv.push_str(&format!(
+                "{},{},{:.8},{:.8},{:.2},{:.3},{:.2},{},{},{}\n",
+                pt.segment,
+                pt.timestamp_ms,
+                pt.latitude,
+                pt.longitude,
+                pt.altitude,
+                pt.speed,
+                pt.heading,
+                fix_quality_to_str(pt.fix_quality),
+                pt.satellites,
+                pt.hdop,
+            ));
+        }
+        Ok(csv)
+    }
 }
 
 /// A saved field (paddock) from the database.
@@ -367,7 +517,7 @@ pub struct SavedField {
 #[derive(Debug, Clone)]
 pub struct SavedJob {
     pub id: i64,
-    pub csv_filename: String,
+    pub name: String,
     pub started_at: String,
     pub ended_at: Option<String>,
     pub implement_width_m: f64,
@@ -404,4 +554,42 @@ pub struct ImportStats {
     pub fields_added: u32,
     pub lines_added: u32,
     pub lines_skipped: u32,
+}
+
+/// A coverage point row for database read/write.
+/// Used for batch inserts and query results.
+#[derive(Debug, Clone)]
+pub struct CoveragePointRow {
+    pub segment: u32,
+    pub timestamp_ms: u64,
+    pub latitude: f64,
+    pub longitude: f64,
+    pub altitude: f64,
+    pub speed: f64,
+    pub heading: f64,
+    pub fix_quality: FixQuality,
+    pub satellites: u8,
+    pub hdop: f64,
+}
+
+/// Convert FixQuality to its database string representation.
+fn fix_quality_to_str(q: FixQuality) -> &'static str {
+    match q {
+        FixQuality::NoFix => "NoFix",
+        FixQuality::Gps => "GPS",
+        FixQuality::Dgps => "DGPS",
+        FixQuality::Rtk => "RTK",
+        FixQuality::RtkFloat => "RtkFloat",
+    }
+}
+
+/// Parse a database string back to FixQuality.
+fn str_to_fix_quality(s: &str) -> FixQuality {
+    match s {
+        "RTK" => FixQuality::Rtk,
+        "RtkFloat" => FixQuality::RtkFloat,
+        "DGPS" => FixQuality::Dgps,
+        "GPS" => FixQuality::Gps,
+        _ => FixQuality::NoFix,
+    }
 }
