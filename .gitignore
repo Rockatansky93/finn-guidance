@@ -20,3 +20,15 @@ Thumbs.db
 
 # Field data (local)
 field_data/
+
+# SQLite database (machine-specific config, coverage data)
+data/coverage.db
+data/coverage.db-journal
+data/coverage.db-wal
+data/coverage.db-shm
+
+# Exported AB line JSON (transient, for cross-PC transfer)
+data/finn_ab_lines.json
+
+# Old CSV coverage logs (deprecated, replaced by SQLite)
+coverage_logs/

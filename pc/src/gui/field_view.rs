@@ -282,6 +282,8 @@ impl FieldView {
     /// Zoom-dependent thinning: when zoomed out, individual metre-resolution strips
     /// overlap into a solid mass — we skip points to reduce draw calls without any
     /// visible difference. At close zoom, every point is drawn for full fidelity.
+    /// When thinning, quads bridge directly from point[i] to point[i+step] so the
+    /// coverage remains a continuous band with no gaps.
     fn draw_coverage(
         &self,
         painter: &egui::Painter,
@@ -328,9 +330,10 @@ impl FieldView {
                 continue;
             }
 
-            // Build a strip segment between this point and the next point.
-            // For the last point (or isolated points), draw a short rectangle
-            // using the point's own heading.
+            // Build a strip segment between this point and the next rendered point.
+            // When step > 1 (zoomed out), we bridge directly to point[i+step] so
+            // the coverage band stays continuous — no gaps from skipping intermediate
+            // points. Within the same segment only.
             let (lx, ly) = self.projection.world_to_local(pt.latitude, pt.longitude);
 
             let heading_rad = pt.heading * std::f64::consts::PI / 180.0;
@@ -343,9 +346,20 @@ impl FieldView {
             // Note: heading 0° = north, so forward = (sin(h), cos(h)) in local coords
             // and perpendicular (to the right) = (cos(h), -sin(h))
 
-            if i + 1 < points.len() && points[i + 1].segment == pt.segment {
-                // Draw a quad from this point to the next
-                let next = &points[i + 1];
+            // Find the next point to bridge to: step ahead, but must be same segment
+            let next_idx = i + step;
+            let bridge_target = if next_idx < points.len() && points[next_idx].segment == pt.segment {
+                Some(next_idx)
+            } else if i + 1 < points.len() && points[i + 1].segment == pt.segment {
+                // Step landed outside segment or past end — fall back to i+1
+                Some(i + 1)
+            } else {
+                None
+            };
+
+            if let Some(ni) = bridge_target {
+                // Draw a quad from this point to the bridge target
+                let next = &points[ni];
                 let (nlx, nly) = self.projection.world_to_local(next.latitude, next.longitude);
 
                 // Four corners: left/right of current point, left/right of next point
