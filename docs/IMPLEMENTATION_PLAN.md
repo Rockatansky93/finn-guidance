@@ -147,63 +147,84 @@ ESP-IDF toolchain was abandoned after multiple blocking toolchain issues.
    - Status output at 5Hz: `$FINNMTR,<pwm>,<enabled>,<uptime>*<checksum>`
    - Flashed and running ✅
 
-4. **PC-side FINN sentence parser** 🔲
-   - Extend `pc/src/gps/parser.rs` (or new `pc/src/serial/` module) to parse
-     `$FINNWAS`, `$FINNIMU`, `$FINNHB`, `$FINNMTR` alongside existing NMEA
+4. **PC-side FINN sentence parser** ✅
+   - Created `finn_parser.rs` to parse $FINNWAS, $FINNIMU, $FINNHB, $FINNMTR
+     with NMEA checksum validation. Unit tested.
    - Route sensor data to GUI (WAS readout, IMU heading/calibration status)
    - Route motor status to GUI (PWM, enabled state)
-   - Separate serial port for motor controller (second USB)
+   - Separate serial port for motor controller (second USB, auto-detected)
 
-5. **WAS calibration** 🔲
-   - Calibration routine: record centre, left-lock, right-lock ADC counts
-   - Store calibration in SQLite config table
-   - Convert raw ADC to steering angle (degrees)
-   - "Recalibrate WAS" button in Setup page
+5. **WAS calibration** ✅
+   - Three-point calibration wizard (centre, left-lock, right-lock)
+   - Stored in SQLite config table (was_centre, was_left_lock, was_right_lock)
+   - Piecewise linear mapping: raw ADC → ±45° normalised angle
+   - "Recalibrate" button clears all three values
+   - Field-tested: L:1617 C:1832 R:2031 (angle sign correct)
 
-6. **Bench testing** 🔲
-   - Sensor ESP32: verify WAS ADC responds to pot, BNO055 heading changes,
-     GPS passthrough works (needs sky view or confirms empty-position sentences)
-   - Motor ESP32: verify motor responds to `$FINNSTEER` commands, watchdog
-     stops motor within 500ms, status messages at 5Hz
+6. **Bench testing** ✅
+   - Sensor ESP32: WAS pot sweep, BNO055 movement, GPS passthrough
+   - Motor ESP32: PWM response, watchdog timeout, status messages
+   - Full system: dual auto-detect, sensor data pipeline to GUI
 
-### Done when
-- ESP32 sensor module reads WAS, IMU, and GPS, sends data to PC over USB ✅ (firmware done)
-- ESP32 motor controller drives motor in response to PC commands ✅ (firmware done)
-- Motor stops automatically if communication lost ✅ (watchdog implemented)
-- PC application parses FINN sentences and displays sensor data 🔲
-- WAS calibration routine stores and applies calibration values 🔲
-- All sensors bench-tested and verified 🔲
+### Done when ✅ (all criteria met)
+- ESP32 sensor module reads WAS, IMU, and GPS, sends data to PC over USB ✅
+- ESP32 motor controller drives motor in response to PC commands ✅
+- Motor stops automatically if communication lost ✅
+- PC application parses FINN sentences and displays sensor data ✅
+- WAS calibration routine stores and applies calibration values ✅
+- All sensors bench-tested and verified ✅
+- Field-tested in tractor cab on Dell 7390 ✅
 
 ### Estimated effort: 4-5 sessions (firmware done in 1, PC integration remaining)
 
 ---
 
 ## Phase 5: Closed-Loop Auto-Steer
-**Goal:** Full auto-steer with PID controller.
+**Goal:** Full auto-steer with closed-loop steering controller.
 
 ### Tasks
-1. **PID controller on PC**
-   - Use `pid` crate
-   - Input: cross-track error + heading error
-   - Output: steer command (-255 to 255)
-   - Tuneable P, I, D gains
-   - GUI controls for tuning
+1. **Steering controller on PC** ✅
+   - Two-loop architecture in `guidance/steering.rs` (Decision #020)
+   - Outer loop: XTE → desired steering angle (Kp, degrees per metre)
+   - Inner loop: desired angle vs WAS actual angle → motor PWM (Kp_angle, PWM per degree)
+   - WAS feedback closes the inner loop — wheels return to straight automatically
+   - Configurable: Kp (outer), Kp_angle (inner), max_pwm, deadband, min speed
+   - GUI sliders for all parameters in Setup page AUTO-STEER section
 
-2. **Steer integration**
-   - Send PID output to ESP32 as `$FINNSTEER` command over USB serial
-   - ESP32 applies PWM to motor via IBT-2
-   - WAS feedback closes the inner loop
+2. **Steer integration** ✅
+   - Controller runs in GUI update loop (~60fps), sends PWM every frame
+   - Motor direction inversion applied after controller output
+   - WAS angle from `was_calibrated_angle()` fed into inner loop
+   - Working page: ⊕ AUTO-STEER / ⊗ STEER OFF button on toolbar
+   - Working page overlay: live PWM, target angle (T:), actual angle (A:)
+
+3. **Safety systems** ✅
+   - GPS fix timeout: auto-disengage after 2 seconds without fix
+   - WAS data tiered response: warning after 2s, disengage after 5s
+   - Speed gate: no steering below 0.5 m/s
+   - Max PWM clamp (configurable, default 180)
+   - Engage preconditions: AB line + motor + WAS calibrated
+   - ESP32 watchdog: motor stops within 500ms if serial commands stop
+   - Manual disengage always available
+
+4. **Field testing and tuning** — IN PROGRESS
+   - [x] First field test: motor responds, safety systems work
+   - [x] Identified open-loop bug (no WAS feedback) — fixed with two-loop architecture
+   - [x] Identified WAS timeout too aggressive — fixed with tiered timeout
+   - [ ] Second field test with two-loop controller
+   - [ ] Tune Kp, Kp_angle, deadband for standalone GPS
+   - [ ] Document tuning procedure (STEERING_TUNING_GUIDE.md created)
+
+5. **Future improvements** 🔲
+   - Add derivative term (Kd) to outer loop if oscillation persists after tuning
+   - Add heading error feedforward for better curve tracking
    - IMU roll compensation (adjust for hillside)
-
-3. **Safety systems**
-   - Maximum steer rate limiting
-   - Maximum wheel angle limiting
-   - GPS fix quality gate (disable steer if fix degrades)
    - Speed-dependent gain adjustment
    - Physical disengage switch input on ESP32
-   - Watchdog: motor off if any sensor times out (already implemented in firmware)
+   - Real-time plots: steer command vs actual angle vs XTE
+   - Save tuning profiles per vehicle
 
-4. **Auto-turn at headland** 🔲
+6. **Auto-turn at headland** 🔲
    - Detect end of run (approaching field boundary or user-defined headland line)
    - Generate turn path to the next pass line
    - Configurable skip factor determines which pass to target: skip factor 2 means
@@ -222,11 +243,12 @@ ESP-IDF toolchain was abandoned after multiple blocking toolchain issues.
    - Save tuning profiles per vehicle
 
 ### Done when
-- Tractor steers itself along AB line with centimetre accuracy
-- Safety systems prevent dangerous behaviour
-- Can tune PID without reflashing firmware
+- Tractor steers itself along AB line with acceptable accuracy ✅ (controller implemented)
+- Safety systems prevent dangerous behaviour ✅
+- Can tune controller gains without reflashing firmware ✅
+- Two-loop controller field-tested and tuned 🔲
 
-### Estimated effort: 4-6 sessions
+### Estimated effort: 4-6 sessions (controller done, field tuning remaining)
 
 ---
 
@@ -302,7 +324,7 @@ ESP-IDF toolchain was abandoned after multiple blocking toolchain issues.
 - [x] Job management UI (JOB HISTORY list with delete)
 - [x] Configuration persistence (implement width, overlap, lightbar sensitivity, last AB line)
 
-**Phase 4: IN PROGRESS** (firmware complete, PC integration remaining)
+**Phase 4: COMPLETE**
 - [x] PlatformIO development environment installed
 - [x] Sensor module firmware written and flashed (firmware-sensor-pio/)
 - [x] Motor controller firmware written and flashed (firmware-motor-pio/)
@@ -313,16 +335,32 @@ ESP-IDF toolchain was abandoned after multiple blocking toolchain issues.
 - [x] PC-side motor command sender (second serial port, MotorHandle, MOTOR TEST UI)
 - [x] Dual-ESP32 auto-detect (sensor vs motor by sentence type, Decision #016)
 - [x] Bench testing (WAS pot sweep, BNO055 movement, GPS passthrough, motor status)
-- [ ] WAS calibration routine and UI
-- [ ] Full field test on tractor (hardware being installed)
+- [x] WAS calibration wizard (three-point, PC-side piecewise linear, Decision #018)
+- [x] Motor direction toggle with SQLite persistence
+- [x] Field test on tractor (Dell 7390, coverage rendering, WAS calibration confirmed)
 
-### Next up: Field test on Dell 7390
-- Install all hardware on tractor (GPS, BNO055, WAS, IBT-2, motor, ESP32s)
-- Clone repo onto Dell 7390 laptop, build and run
-- Verify dual-port auto-detect on new PC
-- Run through field test checklist
-- Determine motor direction convention
-- Implement WAS calibration after mounting confirmed
+**Phase 5: IN PROGRESS** (controller implemented, field tuning remaining)
+- [x] Steering controller implemented (guidance/steering.rs)
+- [x] Two-loop architecture: outer (XTE→angle) + inner (angle error→PWM)
+- [x] WAS feedback integrated into inner control loop
+- [x] Safety systems: GPS timeout, tiered WAS timeout, speed gate, max PWM
+- [x] Auto-steer engage/disengage button on working page toolbar
+- [x] Working page overlay: live PWM, target angle, actual angle
+- [x] Setup page: Kp (°/m), Kp_angle (PWM/°), max PWM, deadband sliders
+- [x] Kp and Kp_angle persisted to SQLite config
+- [x] First field test: motor responds, safety works, identified open-loop bug
+- [x] Fixed: two-loop controller with WAS feedback (wheels return to straight)
+- [x] Fixed: WAS timeout tiered (warn 2s, disengage 5s instead of hard 1s)
+- [x] Steering tuning guide written (docs/STEERING_TUNING_GUIDE.md)
+- [ ] Second field test with two-loop controller
+- [ ] Tune Kp, Kp_angle, deadband for standalone GPS
+
+### Next up: Field test two-loop controller
+- Follow AUTO-STEER field test checklist in ACTIVE_CONTEXT.md
+- Verify motor direction convention (critical first step)
+- Start with Kp=30, Kp_angle=4, max_pwm=180, deadband=3cm
+- Tune using live sliders in Setup page
+- Refer to STEERING_TUNING_GUIDE.md for tuning procedure
 
 ---
 
@@ -458,6 +496,46 @@ ESP-IDF toolchain was abandoned after multiple blocking toolchain issues.
   complete pipeline to GUI. Motor test panel connected and responsive.
 - **Hardware being installed on tractor for first full prototype field test.**
 
+### Session 14 (13 Apr 2026) — Coverage SQLite migration
+- Migrated coverage point storage from CSV to SQLite (Decision #017)
+- Distance filter reduced from 1.0m to 0.25m for gap-free rendering
+- `coverage_points` table with batch inserts (50-point write buffer)
+- Removed all CSV file handling from logger.rs
+- Export function preserved for CSV output from database
+
+### Session 15 (15 Apr 2026) — WAS calibration, coverage fix, motor direction, field test
+- WAS three-point calibration wizard implemented (Set Centre / Left Lock / Right Lock)
+- WAS calibration values stored in SQLite config, loaded on startup
+- `was_calibrated_angle()` piecewise linear mapping: raw ADC → ±45°
+- Motor direction toggle (`motor_invert` config key) with Setup page UI
+- `apply_motor_direction()` helper ready for steering controller
+- Coverage render thinning bridging fix (Decision #019): quads span i→i+step
+- Field-tested in tractor cab on Dell 7390 — coverage rendering solid
+- IBT-2 motor controller did not respond — suspected hardware failure
+- Decisions #018, #019 documented
+
+### Session 16 (15 Apr 2026) — Auto-steer controller, two-loop architecture, field test
+- Created `guidance/steering.rs` — initial P-only controller (pwm = -kp × xte)
+- Auto-steer button on working page toolbar, Kp slider in Setup page
+- Safety: GPS timeout (2s disengage), WAS timeout (1s disengage), speed gate
+- Engage preconditions: AB line + motor connected + WAS calibrated
+- Working page overlay: green "AUTO-STEER PWM N" indicator
+- **First field test**: motor responds to auto-steer, safety systems functional
+- **Bug identified**: P-only controller had no WAS feedback — motor steered toward
+  line but didn't straighten wheels on arrival, causing overshoot
+- **Bug identified**: WAS 1-second timeout too aggressive — brief serial hiccups
+  triggered disengage during normal operation
+- **Fix**: rewrote controller with two-loop architecture (Decision #020 revised):
+  - Outer loop: XTE → desired steering angle (Kp = 30 °/m)
+  - Inner loop: desired angle vs WAS actual angle → PWM (Kp_angle = 4 PWM/°)
+  - Wheels now return to straight when line is reached (inner loop drives to 0°)
+- **Fix**: WAS timeout tiered — warn at 2s (amber indicator), disengage at 5s
+- Setup page: two sliders (Kp outer, Kp_angle inner), both persisted to SQLite
+- Working page overlay: shows target angle (T:) and actual angle (A:) for field tuning
+- Steering tuning guide written (docs/STEERING_TUNING_GUIDE.md)
+- Decision #020 documented
+- **Phase 4 marked COMPLETE. Phase 5 in progress — awaiting second field test.**
+
 ---
 
 ## Hardware Shopping List
@@ -487,7 +565,6 @@ Still needed:
 | serialport      | 4.0     | Serial port for GPS + ESP32s     |
 | eframe/egui     | 0.29    | GUI framework                    |
 | rusqlite        | 0.31    | Coverage database (bundled SQLite)|
-| pid             | 4.0     | PID controller (Phase 5)         |
 | serde           | 1.0     | Serialisation for JSON export    |
 | crossbeam       | 0.5     | Thread-safe channels             |
 | chrono          | 0.4     | Timestamps                       |

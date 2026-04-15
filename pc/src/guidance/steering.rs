@@ -32,13 +32,15 @@
 //! ## Safety
 //!
 //! The ESP32 motor firmware has a 500ms watchdog — if it doesn't receive a
-//! `$FINNSTEER` command within 500ms, it kills the motor. The GUI loop
-//! sends a command every frame (~16ms at 60fps), keeping the watchdog fed.
+//! `$FINNSTEER` command within 500ms, it kills the motor. The GUI sends
+//! commands at ~20Hz (throttled in app.rs), keeping the watchdog fed.
 //!
 //! PC-side safety:
 //! - Auto-disengage if GPS fix age exceeds `max_fix_age_secs`
 //! - WAS data loss: warning after `was_warn_secs`, disengage after `was_disengage_secs`
 //! - PWM clamped to `max_pwm` (never sends full 255 unless configured to)
+//! - Motor deadzone: output boosted to `min_pwm` (default 80) if non-zero,
+//!   because the Trimble EZ-Steer doesn't spin below ~80 PWM
 //! - Speed gate: no steering below minimum speed
 
 use std::time::Instant;
@@ -65,6 +67,13 @@ pub struct SteeringController {
 
     /// Maximum PWM magnitude the controller will output.
     pub max_pwm: i16,
+
+    /// Minimum PWM to actually move the motor. Below this the Trimble
+    /// EZ-Steer motor doesn't spin — the controller was computing PWM
+    /// values in the 0–79 dead zone where nothing happened, causing
+    /// delayed corrections and lurching. Any non-zero output is boosted
+    /// to at least this value.
+    pub min_pwm: i16,
 
     /// Deadband in metres. XTE below this produces zero desired angle.
     /// Prevents the motor from hunting when already on the line.
@@ -120,6 +129,7 @@ impl SteeringController {
             max_steer_angle: 25.0,
             kp_angle: 4.0,
             max_pwm: 180,
+            min_pwm: 80,
             deadband_m: 0.03,
             engaged: false,
             min_speed: 0.5,
@@ -243,7 +253,20 @@ impl SteeringController {
         let raw_pwm = self.kp_angle * angle_error;
         let clamped = (raw_pwm.round() as i16).clamp(-self.max_pwm, self.max_pwm);
 
-        self.last_output_pwm = clamped;
-        (clamped, false)
+        // Motor deadzone compensation: the Trimble EZ-Steer doesn't spin below
+        // ~80 PWM. If the controller wants any non-zero output, boost it to at
+        // least min_pwm so the motor actually moves. Without this, small
+        // corrections sit in the 0–79 dead zone doing nothing until the error
+        // grows large enough to produce PWM ≥ 80, causing delayed lurching.
+        let output = if clamped == 0 {
+            0
+        } else if clamped > 0 {
+            clamped.max(self.min_pwm)
+        } else {
+            clamped.min(-self.min_pwm)
+        };
+
+        self.last_output_pwm = output;
+        (output, false)
     }
 }

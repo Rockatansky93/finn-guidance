@@ -369,7 +369,36 @@ The motor re-enables automatically when valid commands resume.
 1. Plug both ESP32s into the laptop
 2. Run the PC guidance application: `cargo run --release`
 3. Verify GPS fix appears in the status bar
-4. Verify WAS and IMU readings appear (once PC-side parser is implemented)
+4. Verify WAS and IMU readings appear in the SENSORS section (Setup page)
+5. Verify motor status shows "Motor ESP32 connected" in MOTOR TEST section
+
+### 6.4 WAS calibration
+
+1. With both ESP32s connected and the app running, go to Setup page
+2. Scroll to WAS CALIBRATION section
+3. Turn the steering wheel so wheels are straight → press "Set Centre"
+4. Turn to full left lock → press "Set Left Lock"
+5. Turn to full right lock → press "Set Right Lock"
+6. Status should show "Calibrated" with L/C/R values (e.g. L:1617 C:1832 R:2031)
+7. Verify the calibrated angle in the SENSORS section reads ~0° when straight
+
+### 6.5 Motor direction
+
+1. Go to Setup → MOTOR TEST section
+2. Press the +50 preset button
+3. Observe which way the wheels turn
+4. If wheels turn RIGHT: direction is correct (no change needed)
+5. If wheels turn LEFT: go to MOTOR DIRECTION and press "Invert Motor Direction"
+6. Re-test to confirm +50 PWM now steers RIGHT
+
+### 6.6 Auto-steer
+
+After WAS calibration and motor direction are confirmed:
+
+1. Load or create an AB line
+2. Drive onto the line at working speed (>2 km/h)
+3. Tap ⊕ AUTO-STEER on the working page
+4. For tuning guidance, see `docs/STEERING_TUNING_GUIDE.md`
 
 ---
 
@@ -406,6 +435,28 @@ command parsing is failing — check for correct `$` prefix and `*XX` suffix.
 **Motor runs but immediately stops:**
 The 500ms watchdog requires continuous commands. For manual testing, send
 commands in a loop or increase `WATCHDOG_TIMEOUT_MS` temporarily in the firmware.
+
+**Auto-steer disengages with "WAS data lost":**
+The WAS timeout triggers after 5 seconds without a `$FINNWAS` reading. Check
+the USB cable from the sensor ESP32 — vibration in the tractor cab can cause
+intermittent connections. Try a shorter cable or secure the connection with tape.
+Brief dropouts (under 2 seconds) are tolerated with a warning (amber indicator).
+
+**Auto-steer disengages with "GPS fix lost":**
+The GPS fix timeout is 2 seconds. Check the GPS antenna connection and ensure
+clear sky view. Passing under trees or near large metal structures can cause
+momentary fix loss.
+
+**Wheels don't straighten when returning to line:**
+Ensure the WAS calibration is correct (check SENSORS section — the calibrated
+angle should read 0° ±2° when wheels are straight). The inner loop uses WAS
+feedback to drive wheels back to the target angle. If the WAS reading is wrong,
+the inner loop can't straighten the wheels.
+
+**AUTO-STEER button is greyed out:**
+All four preconditions must be met: (1) AB line loaded, (2) Motor ESP32
+connected, (3) WAS centre calibrated, (4) WAS left and right lock calibrated.
+Check each in the Setup page.
 
 **Multiple serial devices causing auto-detect issues:**
 Use `--upload-port COMx` (Windows) or `--upload-port /dev/ttyUSBx` (Linux) to

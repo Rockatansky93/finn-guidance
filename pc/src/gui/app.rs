@@ -9,6 +9,7 @@
 //! The GPS status bar is always visible on both pages (safety-critical).
 
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 use eframe::egui;
 use crossbeam_channel::Receiver;
 use finn_guidance_common::types::{GpsFix, CrossTrackError, FixQuality, ImuData, WasReading, MotorStatus};
@@ -20,6 +21,15 @@ use crate::coverage::logger::CoverageLogger;
 use crate::coverage::db::{CoverageDb, SavedField, SavedAbLine};
 use crate::position::interpolator::PositionInterpolator;
 use super::field_view::FieldView;
+
+/// Target frame interval — 30fps is smooth for guidance display while
+/// keeping CPU load low on field laptops (Dell 7390 etc).
+const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+
+/// Minimum interval between motor serial writes. The ESP32 watchdog is
+/// 500ms, so 50ms (20Hz) keeps it well fed without flooding the serial
+/// bus. Matches the WAS update rate so we react to every new reading.
+const STEER_SEND_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Which page is currently displayed
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -83,6 +93,9 @@ pub struct GuidanceApp {
     steering: SteeringController,
     /// Status message for auto-steer events (shown on working page)
     steer_status_msg: Option<(String, u32)>,
+    /// Last time a steer command was sent to the motor ESP32.
+    /// Throttles serial writes to ~20Hz instead of every frame.
+    last_steer_send: Instant,
 
     // --- WAS calibration ---
     /// WAS ADC value at steering centre (wheels straight)
@@ -200,7 +213,7 @@ impl GuidanceApp {
             guide,
             current_error: None,
             position_trail: VecDeque::new(),
-            max_trail: 50000,
+            max_trail: 5000,
             field_view: FieldView::new(),
             coverage: CoverageLogger::new(implement_width),
             auto_pass_notification: None,
@@ -220,6 +233,7 @@ impl GuidanceApp {
                 s
             },
             steer_status_msg: None,
+            last_steer_send: Instant::now(),
             was_centre,
             was_left_lock,
             was_right_lock,
@@ -342,7 +356,7 @@ impl eframe::App for GuidanceApp {
             }
         }
 
-        // === Interpolate position for smooth display (every frame, ~60fps) ===
+        // === Interpolate position for smooth display (every frame, ~30fps) ===
         // Between 1Hz real fixes, the interpolator dead-reckons the position
         // using speed × heading. This makes the vehicle triangle, trail, lightbar,
         // and XTE readout update smoothly instead of jumping once per second.
@@ -353,7 +367,12 @@ impl eframe::App for GuidanceApp {
             self.current_error = self.guide.calculate_error(&interp_fix);
 
             // === Auto-steer: compute and send motor command ===
+            // Throttled to ~20Hz — matches WAS update rate and avoids flooding
+            // the serial bus. The ESP32 watchdog is 500ms so 50ms is well within.
             if self.steering.engaged {
+                let now = Instant::now();
+                let should_send = now.duration_since(self.last_steer_send) >= STEER_SEND_INTERVAL;
+
                 if let Some(error) = &self.current_error {
                     // Get current steering angle from WAS (if calibrated and available)
                     let actual_angle = self.latest_was.as_ref()
@@ -365,21 +384,26 @@ impl eframe::App for GuidanceApp {
                         actual_angle,
                     );
                     if disengaged {
-                        // Safety disengage — send stop and notify
+                        // Safety disengage — send stop immediately (bypass throttle)
                         let _ = self.motor_handle.send_steer(0);
+                        self.last_steer_send = now;
                         let reason = self.steering.disengage_reason.clone()
                             .unwrap_or_else(|| "Unknown".to_string());
                         self.steer_status_msg = Some((
                             format!("Auto-steer OFF: {}", reason),
-                            300, // ~5 seconds
+                            300, // ~10 seconds at 30fps
                         ));
-                    } else {
+                    } else if should_send {
                         let pwm = self.apply_motor_direction(raw_pwm);
                         let _ = self.motor_handle.send_steer(pwm);
+                        self.last_steer_send = now;
                     }
                 } else {
-                    // No guidance error (no AB line?) — send zero
-                    let _ = self.motor_handle.send_steer(0);
+                    // No guidance error (no AB line?) — send zero (throttled)
+                    if should_send {
+                        let _ = self.motor_handle.send_steer(0);
+                        self.last_steer_send = now;
+                    }
                 }
             }
 
@@ -410,8 +434,12 @@ impl eframe::App for GuidanceApp {
             if *frames == 0 { self.steer_status_msg = None; } else { *frames -= 1; }
         }
 
-        // Request continuous repaints for real-time display
-        ctx.request_repaint();
+        // Request repaint at ~30fps — smooth for guidance display while
+        // keeping CPU/GPU load manageable on field laptops (Dell 7390).
+        // Previously this was uncapped (request_repaint()) which pegged
+        // the CPU at 100% running 200+ fps of serial writes and coverage
+        // polygon rendering.
+        ctx.request_repaint_after(FRAME_INTERVAL);
 
         // === Top panel: GPS status bar (always visible on both pages) ===
         self.draw_status_bar(ctx);
@@ -1789,6 +1817,19 @@ impl GuidanceApp {
                         .step_by(5.0)
                     );
                     self.steering.max_pwm = max_pwm_f as i16;
+
+                    ui.add_space(4.0);
+
+                    // Min PWM slider (motor deadzone compensation)
+                    ui.label(egui::RichText::new("Min PWM (motor deadzone):").size(12.0));
+                    let mut min_pwm_f = self.steering.min_pwm as f64;
+                    ui.add(egui::Slider::new(&mut min_pwm_f, 0.0..=120.0)
+                        .step_by(5.0)
+                    );
+                    self.steering.min_pwm = min_pwm_f as i16;
+                    ui.label(egui::RichText::new(
+                        "Motor won't spin below this — set to lowest PWM that moves"
+                    ).size(11.0).weak());
 
                     ui.add_space(4.0);
 

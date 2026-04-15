@@ -5,53 +5,48 @@
 > Updated at the end of each working session.
 
 ## Last updated
-Session 16 — 15 April 2026 (Auto-steer controller, steering.rs, working page button)
+Session 17 — 15 April 2026 (Performance fixes: framerate cap, steer throttle, trail cap)
 
 ## What we're working on
-**Phase 5 — Auto-steer controller implemented. Ready for field test.**
+**Phase 5 — Two-loop auto-steer controller. Second field test done, performance issues found and fixed.**
 
-Steering controller module created (`steering.rs`) with proportional control.
-Auto-steer button added to the working page toolbar. Kp/max PWM/deadband sliders
-in Setup page AUTO-STEER section. Full safety system: GPS fix timeout, WAS data
-timeout, minimum speed gate. Motor direction inversion applied after controller
-output. WAS calibration updated with new field values (L:1617 C:1832 R:2031) —
-angle sign is now correct (left lock ADC < centre < right lock ADC, so negative
-angle = left steering as expected).
+Second field test with two-loop controller revealed severe lag on Dell 7390
+field laptops, making the app unusable for guidance. Root cause: uncapped
+framerate (`ctx.request_repaint()`) running the GUI at 200+ fps, with every
+frame performing serial writes to the motor ESP32 (`send_steer`), coverage
+polygon rendering, and interpolation math. The low-power U-series CPU in the
+Dells couldn't keep up. Also, ESP32s not being recognised on the field laptops
+(missing USB-serial drivers — CP2102 or CH340).
 
 **Completed this session:**
-- New `pc/src/guidance/steering.rs` — `SteeringController` struct with proportional
-  control: `pwm = -kp × xte`, clamped to `±max_pwm`, with deadband and speed gate
-- Steering controller wired into `app.rs` update loop: computes PWM from
-  interpolated XTE every frame (~60fps), sends via `motor_handle.send_steer()`
-- `apply_motor_direction()` applied after controller output (removes `#[allow(dead_code)]`)
-- Safety: `notify_gps_fix()` called on each real fix, `notify_was_reading()` on
-  each WAS message. Auto-disengage if GPS fix age > 2s or WAS data age > 1s.
-- Working page: `⊕ AUTO-STEER` / `⊗ STEER OFF` button in bottom toolbar, greyed
-  out until AB line loaded + motor connected + WAS calibrated
-- Working page overlay: green "AUTO-STEER PWM N" indicator (top-left, below
-  lightbar) when engaged; amber status messages for engage/disengage/safety events
-- Setup page: AUTO-STEER section between MOTOR DIRECTION and MOTOR TEST, with:
-  - Kp slider (20–300 PWM/m, 5-step, persisted to SQLite `steer_kp`)
-  - Max PWM slider (50–255, 5-step)
-  - Deadband slider (0–20 cm, 1-step)
-  - Live status showing engaged/disengaged + last PWM + disengage reason
-- WAS calibration values confirmed correct: L:1617 C:1832 R:2031 (left < centre
-  < right, so `was_calibrated_angle()` produces correct sign without modification)
-- Decision #020 documented
+- **Framerate cap**: `ctx.request_repaint()` → `ctx.request_repaint_after(33ms)` for
+  ~30fps. Smooth for guidance display, massive CPU reduction on field laptops.
+- **Steer command throttle**: Motor serial writes throttled to ~20Hz (50ms interval)
+  via `last_steer_send` timestamp. Matches WAS update rate, avoids flooding serial
+  bus. Safety disengages bypass throttle for immediate stop.
+- **Trail cap reduction**: `max_trail` reduced from 50,000 to 5,000. At 1Hz GPS,
+  50K points = ~14 hours of trail drawing every frame — way more than needed.
+- **ESP32 driver issue identified**: Dell 7390 field laptops missing CP2102/CH340
+  USB-serial drivers. Need to install Silicon Labs CP210x or WCH CH340 driver
+  (check which chip is on the ESP32 boards).
+- **Motor deadzone compensation**: Trimble EZ-Steer doesn't spin below ~80 PWM.
+  Added `min_pwm` field (default 80) — any non-zero controller output is boosted
+  to at least `min_pwm`, preserving sign. Without this, small corrections sat in
+  the 0–79 dead zone doing nothing until error grew large enough, causing delayed
+  lurching. Min PWM slider added to AUTO-STEER section in Setup page (0–120 range).
 
-**Previous session (Session 15) completed:**
-- WAS three-point calibration wizard in Setup page
-- Motor direction toggle with SQLite persistence
-- Coverage rendering bridging fix (gap-free at all zoom levels)
-- Field-tested in tractor cab on Dell 7390
+**Previous session (Session 16) completed:**
+- Two-loop auto-steer controller (outer: XTE→angle, inner: angle→PWM via WAS)
+- Steering tuning guide, safety timeouts, Setup page sliders
+- See session 16 notes below for full detail
 
 **Not yet done:**
-- **Field test auto-steer** — first test with conservative Kp (start at 100)
-- Determine motor direction convention (positive PWM = which steering direction)
-  and set motor_invert accordingly — critical before first auto-steer test
-- Tune Kp, max_pwm, deadband in the field
-- Add derivative term (Kd) if P-only control oscillates
-- Add heading error feedforward if P-only tracks poorly on curves
+- **Third field test** — verify performance fixes resolve lag on Dell 7390s,
+  then proceed with steering tuning
+- **Install ESP32 drivers on Dell 7390s** — CP2102 or CH340 (check chip on boards)
+- Tune Kp, Kp_angle, deadband in the field (use STEERING_TUNING_GUIDE.md)
+- Add derivative term (Kd) to outer loop if oscillation persists after tuning
+- Add heading error feedforward if tracking is poor on curves
 - Wire up CSV export button in job history UI
 - Touch target improvements (lower priority, UI is useable)
 
@@ -60,7 +55,7 @@ All features below are IMPLEMENTED and working:
 
 - **GPS reading**: auto-detect COM port, PAIR module config (1Hz LC29H DA), NMEA
   parsing (GGA + VTG, epoch-based), crossbeam channel to GUI thread
-- **Position interpolation**: dead-reckoning between 1Hz fixes at ~60fps for smooth
+- **Position interpolation**: dead-reckoning between 1Hz fixes at ~30fps for smooth
   display. Real fixes for coverage/auto-pass, interpolated for GUI.
 - **Field view canvas**: heading-up/north-up, zoom, adaptive grid, scale bar,
   vehicle triangle with fix-quality ring, age-faded trail
@@ -82,10 +77,12 @@ All features below are IMPLEMENTED and working:
   indicator) and setup page (scrollable panel with AB LINE, IMPLEMENT, NUDGE,
   GUIDANCE, COVERAGE, POSITION, SENSORS, WAS CALIBRATION, MOTOR DIRECTION,
   AUTO-STEER, MOTOR TEST, VIEW, LIGHTBAR sections). GPS status bar shared across
-  both pages.
+  both pages. **Framerate capped at ~30fps** via `request_repaint_after(33ms)` to
+  keep CPU manageable on field laptops.
 - **Configuration persistence**: implement width, overlap, lightbar sensitivity,
   last AB line ID, WAS calibration (centre/left/right lock ADC), motor invert,
-  steer Kp — all via SQLite config table, saved on change, loaded on startup
+  steer Kp, steer Kp_angle — all via SQLite config table, saved on change, loaded
+  on startup
 - **ESP32 firmware (Arduino/PlatformIO)**: both sensor and motor modules flashed and
   running. Identical serial protocol to the original Rust design.
 - **FINN sentence parser**: PC-side parser for `$FINNWAS`, `$FINNIMU`, `$FINNHB`,
@@ -103,12 +100,18 @@ All features below are IMPLEMENTED and working:
 - **Motor direction**: `motor_invert` toggle in MOTOR DIRECTION section, persisted
   to SQLite. `apply_motor_direction()` applied after steering controller output.
 - **Auto-steer controller**: `SteeringController` in `guidance/steering.rs`.
-  Proportional control: `pwm = -kp × xte`, clamped to `±max_pwm`, with deadband
-  and minimum speed gate. Safety auto-disengage on GPS fix timeout (2s) or WAS
-  data timeout (1s). Engage button on working page toolbar (requires AB line +
-  motor + WAS calibrated). Kp/max_pwm/deadband adjustable in Setup page AUTO-STEER
-  section. Kp persisted to SQLite. Default tuning: Kp=100, max_pwm=180,
-  deadband=3cm, min_speed=0.5m/s.
+  Two-loop architecture:
+  - Outer loop: XTE → desired steering angle (Kp = 30 °/m default)
+  - Inner loop: desired angle vs WAS actual angle → PWM (Kp_angle = 4 PWM/° default)
+  WAS feedback closes the inner loop — wheels return to straight when on-line.
+  Safety: GPS fix timeout (2s disengage), WAS timeout tiered (2s warning, 5s
+  disengage), speed gate (0.5 m/s), max PWM clamp (180 default), motor deadzone
+  compensation (min_pwm 80 — any non-zero output boosted to at least this value).
+  Engage button on working page toolbar (requires AB line + motor + WAS calibrated).
+  Kp and Kp_angle adjustable via sliders in Setup page, persisted to SQLite.
+  Working page overlay shows live PWM, target angle (T:), actual angle (A:).
+  **Steer commands throttled to ~20Hz** (50ms interval) to avoid flooding serial.
+  See `docs/STEERING_TUNING_GUIDE.md` for tuning procedure.
 
 ## Key decisions (see DECISIONS.md for full detail)
 - #001–#004: Auto-pass priority, skip factor, display thinning, GUI page split
@@ -198,39 +201,43 @@ The 5V VIN pins back-feed 5V to the GPS and IBT-2 logic (bench-tested OK).
 - **RTK**: no base station or NTRIP subscription yet. Running standalone GPS
   (HDOP 0.4 with 42–50 sats — usable for guidance display, not centimetre-accurate)
 
-## Auto-steer field test checklist (FIRST TEST)
+## Auto-steer field test checklist (SECOND TEST — two-loop controller)
 **Pre-flight (before engaging auto-steer):**
-- [ ] Motor responds to MOTOR TEST preset buttons (verified last session)
-- [ ] Determine motor direction: hit +50 PWM, observe wheel direction
-- [ ] If +50 PWM steers LEFT, toggle motor_invert in MOTOR DIRECTION section
-- [ ] Confirm: +50 PWM now steers RIGHT (matches controller convention)
+- [ ] Motor responds to MOTOR TEST preset buttons
+- [ ] Motor direction verified: +50 PWM steers RIGHT (toggle motor_invert if not)
 - [ ] WAS calibration values loaded (L:1617 C:1832 R:2031)
+- [ ] WAS angle reads ~0° when wheels are straight (check SENSORS section)
 - [ ] AB line set and loaded
-- [ ] Start with Kp = 100 (conservative), max_pwm = 180, deadband = 3cm
+- [ ] Start with Kp = 30 °/m, Kp_angle = 4 PWM/°, max_pwm = 180, deadband = 3cm
 
 **First engagement:**
-- [ ] Drive onto AB line at walking speed (~5 km/h)
+- [ ] Drive onto AB line at working speed (~5 km/h)
 - [ ] Tap ⊕ AUTO-STEER on working page
-- [ ] Green "AUTO-STEER PWM N" overlay should appear
-- [ ] Observe: does the motor respond? Does it steer toward the line?
+- [ ] Green overlay should show: `AUTO-STEER  PWM N  T:-X° A:-Y°`
+- [ ] Observe: does the motor steer toward the line? Do T: and A: values make sense?
+- [ ] **Key test**: when tractor reaches the line, do the wheels straighten? (A: → 0°)
 - [ ] If motor steers AWAY from line: immediately tap ⊗ STEER OFF, toggle motor_invert
-- [ ] If oscillating: reduce Kp (try 50)
-- [ ] If too sluggish: increase Kp (try 150–200)
+- [ ] If oscillating/weaving: reduce outer Kp (try 20, then 15)
+- [ ] If too sluggish: increase outer Kp (try 40, then 50)
+- [ ] If wheels are slow to reach target: increase inner Kp_angle (try 5, then 6)
+- [ ] If wheels jerk/buzz: decrease inner Kp_angle (try 3, then 2)
 
 **Safety verification:**
 - [ ] Tap ⊗ STEER OFF → motor stops immediately
 - [ ] Close app → motor stops within 500ms (watchdog)
 - [ ] Unplug motor USB → motor stops, auto-steer disengages
 - [ ] Stop tractor (speed < 0.5 m/s) → PWM goes to zero (speed gate)
+- [ ] WAS amber warning appears briefly during normal driving (not full disengage)
 
 ## Next session should
 1. Read this file and DECISIONS.md for context
-2. **Field test auto-steer** following the checklist above
-3. **Determine motor direction** — the FIRST thing to verify before engaging
-4. Tune Kp/max_pwm/deadband based on field behaviour
-5. If P-only oscillates, add derivative term (Kd) to `steering.rs`
+2. **Install ESP32 USB-serial drivers on Dell 7390s** — check chip (CP2102 or CH340),
+   download driver from Silicon Labs or WCH, verify COM ports appear in Device Manager
+3. **Third field test** — verify performance fixes (should feel dramatically smoother),
+   then proceed with steering tuning using checklist below
+4. Tune Kp/Kp_angle/deadband — refer to STEERING_TUNING_GUIDE.md
+5. If oscillation persists after tuning, add derivative term (Kd) to outer loop
 6. Wire up CSV export button in job history UI
-7. Consider adding heading error as feedforward term for better curve tracking
 
 ## File map (quick reference)
 ```
@@ -242,7 +249,7 @@ pc/src/gps/mod.rs            — GPS + serial module declarations
 pc/src/comms/serial.rs       — Motor ESP32 serial (auto-detect, MotorHandle, steer commands)
 pc/src/comms/mod.rs          — Comms module declarations
 pc/src/guidance/ab_line.rs   — AB line guidance, cross-track error, auto-pass, overlap, nudge
-pc/src/guidance/steering.rs  — Auto-steer controller (P-control, safety, engage/disengage)
+pc/src/guidance/steering.rs  — Auto-steer controller (two-loop, WAS feedback, safety)
 pc/src/gui/app.rs            — egui application, page split, lightbar, config persistence,
                                SENSORS, WAS CALIBRATION, MOTOR DIRECTION, AUTO-STEER,
                                MOTOR TEST sections. Auto-steer button on working page.
@@ -262,6 +269,8 @@ firmware-sensor/              — ESP32 #1 Rust crate (ARCHIVED — replaced by 
 firmware-motor/               — ESP32 #2 Rust crate (ARCHIVED — replaced by PlatformIO)
 docs/IMPLEMENTATION_PLAN.md  — full phase plan, task tracking, session log
 docs/DECISIONS.md            — architectural decision log (#001–#020)
+docs/INSTALLATION_GUIDE.md   — hardware wiring, PC setup, ESP32 flashing, troubleshooting
+docs/STEERING_TUNING_GUIDE.md — auto-steer setup, tuning procedure, troubleshooting
 docs/ACTIVE_CONTEXT.md       — this file
 ```
 
@@ -280,5 +289,11 @@ docs/ACTIVE_CONTEXT.md       — this file
 - ESP32 firmware uses Arduino/PlatformIO (C++), built with `pio run --target upload`
 - Old `pc/src/comms/udp.rs` is dead code — can be deleted (replaced by `serial.rs`)
 - Old `coverage_logs/` CSV directory no longer written to (coverage now in SQLite)
-- Auto-steer sign convention: positive XTE = right of line → negative PWM (steer left)
+- Auto-steer sign convention: positive XTE = right of line → negative desired angle (steer left)
+- Two-loop controller: outer (XTE→angle, Kp °/m), inner (angle error→PWM, Kp_angle PWM/°)
 - `apply_motor_direction()` is applied AFTER the steering controller, not inside it
+- WAS timeout is tiered: warn at 2s (amber), disengage at 5s (not hard 1s)
+- GUI framerate capped at ~30fps (FRAME_INTERVAL = 33ms) — do NOT use uncapped `request_repaint()`
+- Motor serial writes throttled to ~20Hz (STEER_SEND_INTERVAL = 50ms) — safety disengages bypass throttle
+- Motor deadzone: min_pwm = 80 (Trimble EZ-Steer won't spin below this). Non-zero output boosted to ±min_pwm.
+- Trail capped at 5,000 points (was 50K) — ~83 minutes at 1Hz, plenty for a working session
