@@ -15,6 +15,7 @@ use finn_guidance_common::types::{GpsFix, CrossTrackError, FixQuality, ImuData, 
 use finn_guidance_common::protocol::FinnMessage;
 use crate::comms::serial::MotorHandle;
 use crate::guidance::ab_line::AbLineGuide;
+use crate::guidance::steering::SteeringController;
 use crate::coverage::logger::CoverageLogger;
 use crate::coverage::db::{CoverageDb, SavedField, SavedAbLine};
 use crate::position::interpolator::PositionInterpolator;
@@ -76,6 +77,12 @@ pub struct GuidanceApp {
     test_pwm: i16,
     /// Status message from motor test actions
     motor_test_msg: Option<(String, u32)>,
+
+    // --- Auto-steer ---
+    /// Steering controller (PID / proportional control)
+    steering: SteeringController,
+    /// Status message for auto-steer events (shown on working page)
+    steer_status_msg: Option<(String, u32)>,
 
     // --- WAS calibration ---
     /// WAS ADC value at steering centre (wheels straight)
@@ -159,6 +166,12 @@ impl GuidanceApp {
             .map(|v| v == "true")
             .unwrap_or(false);
 
+        // Load steering controller gain from database
+        let steer_kp = db.as_ref()
+            .and_then(|d| d.get_config("steer_kp"))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(100.0);
+
         // Auto-load last-used AB line on startup
         let mut guide = AbLineGuide::new(implement_width);
         guide.overlap_m = overlap;
@@ -195,6 +208,12 @@ impl GuidanceApp {
             motor_handle,
             test_pwm: 0,
             motor_test_msg: None,
+            steering: {
+                let mut s = SteeringController::new();
+                s.kp = steer_kp;
+                s
+            },
+            steer_status_msg: None,
             was_centre,
             was_left_lock,
             was_right_lock,
@@ -259,7 +278,6 @@ impl GuidanceApp {
     /// Apply the motor_invert setting to a PWM value for the PID controller.
     /// When motor_invert is true, the sign is flipped so that positive always
     /// means "steer right" from the PID's perspective.
-    #[allow(dead_code)]
     fn apply_motor_direction(&self, pwm: i16) -> i16 {
         if self.motor_invert { -pwm } else { pwm }
     }
@@ -291,6 +309,9 @@ impl eframe::App for GuidanceApp {
             // Log coverage if engaged (real fix only — distance filter needs true positions)
             self.coverage.log_fix(&fix, self.db.as_ref());
 
+            // Notify steering controller of fresh GPS data (for safety timeout)
+            self.steering.notify_gps_fix();
+
             self.current_fix = Some(fix);
         }
 
@@ -301,6 +322,7 @@ impl eframe::App for GuidanceApp {
             match msg {
                 FinnMessage::Was(was) => {
                     self.latest_was = Some(was);
+                    self.steering.notify_was_reading();
                 }
                 FinnMessage::Imu(imu) => {
                     self.latest_imu = Some(imu);
@@ -324,6 +346,32 @@ impl eframe::App for GuidanceApp {
             // Recalculate guidance error with interpolated position (smooth lightbar/XTE)
             self.current_error = self.guide.calculate_error(&interp_fix);
 
+            // === Auto-steer: compute and send motor command ===
+            if self.steering.engaged {
+                if let Some(error) = &self.current_error {
+                    let (raw_pwm, disengaged) = self.steering.compute(
+                        error.distance_m,
+                        interp_fix.speed,
+                    );
+                    if disengaged {
+                        // Safety disengage — send stop and notify
+                        let _ = self.motor_handle.send_steer(0);
+                        let reason = self.steering.disengage_reason.clone()
+                            .unwrap_or_else(|| "Unknown".to_string());
+                        self.steer_status_msg = Some((
+                            format!("Auto-steer OFF: {}", reason),
+                            300, // ~5 seconds
+                        ));
+                    } else {
+                        let pwm = self.apply_motor_direction(raw_pwm);
+                        let _ = self.motor_handle.send_steer(pwm);
+                    }
+                } else {
+                    // No guidance error (no AB line?) — send zero
+                    let _ = self.motor_handle.send_steer(0);
+                }
+            }
+
             self.display_fix = Some(interp_fix);
         }
 
@@ -346,6 +394,9 @@ impl eframe::App for GuidanceApp {
         }
         if let Some((_, ref mut frames)) = self.was_cal_msg {
             if *frames == 0 { self.was_cal_msg = None; } else { *frames -= 1; }
+        }
+        if let Some((_, ref mut frames)) = self.steer_status_msg {
+            if *frames == 0 { self.steer_status_msg = None; } else { *frames -= 1; }
         }
 
         // Request continuous repaints for real-time display
@@ -419,6 +470,36 @@ impl GuidanceApp {
                     ).min_size(egui::vec2(160.0, 40.0));
                     if ui.add(engage_btn).clicked() {
                         self.coverage.toggle_engage(self.db.as_ref());
+                    }
+
+                    // Auto-steer engage/disengage button
+                    let can_auto_steer = self.guide.has_complete_line()
+                        && self.motor_handle.is_connected()
+                        && self.was_centre.is_some()
+                        && self.was_left_lock.is_some()
+                        && self.was_right_lock.is_some();
+
+                    let (steer_text, steer_colour) = if self.steering.engaged {
+                        ("⊗ STEER OFF", egui::Color32::from_rgb(255, 60, 60))
+                    } else {
+                        ("⊕ AUTO-STEER", egui::Color32::from_rgb(100, 200, 255))
+                    };
+                    let steer_btn = egui::Button::new(
+                        egui::RichText::new(steer_text).size(18.0).strong().color(steer_colour)
+                    ).min_size(egui::vec2(140.0, 40.0));
+                    let steer_resp = ui.add_enabled(
+                        can_auto_steer || self.steering.engaged,
+                        steer_btn,
+                    );
+                    if steer_resp.clicked() {
+                        if self.steering.engaged {
+                            self.steering.disengage(Some("Manual disengage".to_string()));
+                            let _ = self.motor_handle.send_steer(0);
+                            self.steer_status_msg = Some(("Auto-steer OFF".to_string(), 180));
+                        } else {
+                            self.steering.engage();
+                            self.steer_status_msg = Some(("Auto-steer ON".to_string(), 180));
+                        }
                     }
 
                     // Auto-pass toggle
@@ -564,6 +645,58 @@ impl GuidanceApp {
                         egui::pos2(notif_rect.left() + 10.0, notif_rect.top() + 5.0),
                         notif_galley,
                         egui::Color32::from_rgb(100, 200, 255),
+                    );
+                }
+
+                // Auto-steer status indicator (top-left, below lightbar)
+                if self.steering.engaged {
+                    let steer_text = format!("AUTO-STEER  PWM {}", self.steering.last_output_pwm);
+                    let steer_pos = egui::pos2(overlay_rect.left() + 20.0, overlay_rect.top() + 55.0);
+                    let steer_galley = painter.layout_no_wrap(
+                        steer_text,
+                        egui::FontId::proportional(18.0),
+                        egui::Color32::from_rgb(100, 255, 100),
+                    );
+                    let pill_rect = egui::Rect::from_min_size(
+                        egui::pos2(steer_pos.x - 8.0, steer_pos.y),
+                        egui::vec2(steer_galley.size().x + 16.0, steer_galley.size().y + 8.0),
+                    );
+                    painter.rect_filled(
+                        pill_rect,
+                        6.0,
+                        egui::Color32::from_rgba_premultiplied(0, 60, 0, 180),
+                    );
+                    painter.galley(
+                        egui::pos2(pill_rect.left() + 8.0, pill_rect.top() + 4.0),
+                        steer_galley,
+                        egui::Color32::from_rgb(100, 255, 100),
+                    );
+                }
+
+                // Auto-steer status message (e.g. "Auto-steer OFF: GPS fix lost")
+                if let Some((ref msg, _)) = self.steer_status_msg {
+                    let msg_pos = egui::pos2(overlay_rect.center().x, overlay_rect.top() + 90.0);
+                    let msg_galley = painter.layout_no_wrap(
+                        msg.clone(),
+                        egui::FontId::proportional(20.0),
+                        egui::Color32::from_rgb(255, 200, 100),
+                    );
+                    let msg_rect = egui::Rect::from_min_size(
+                        egui::pos2(
+                            msg_pos.x - msg_galley.size().x / 2.0 - 10.0,
+                            msg_pos.y,
+                        ),
+                        egui::vec2(msg_galley.size().x + 20.0, msg_galley.size().y + 10.0),
+                    );
+                    painter.rect_filled(
+                        msg_rect,
+                        6.0,
+                        egui::Color32::from_rgba_premultiplied(0, 0, 0, 160),
+                    );
+                    painter.galley(
+                        egui::pos2(msg_rect.left() + 10.0, msg_rect.top() + 5.0),
+                        msg_galley,
+                        egui::Color32::from_rgb(255, 200, 100),
                     );
                 }
             });
@@ -1550,6 +1683,66 @@ impl GuidanceApp {
                             );
                         }
                     }
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+
+                    // === Auto-Steer Settings Section ===
+                    ui.label(egui::RichText::new("AUTO-STEER").size(14.0).strong());
+                    ui.add_space(4.0);
+
+                    // Status
+                    if self.steering.engaged {
+                        ui.colored_label(egui::Color32::GREEN,
+                            egui::RichText::new(format!("● ENGAGED  PWM {}", self.steering.last_output_pwm))
+                                .size(14.0).strong()
+                        );
+                    } else {
+                        ui.colored_label(egui::Color32::GRAY, "● Disengaged");
+                        if let Some(ref reason) = self.steering.disengage_reason {
+                            ui.label(egui::RichText::new(format!("Last: {}", reason)).size(11.0).weak());
+                        }
+                    }
+
+                    ui.add_space(6.0);
+
+                    // Kp slider
+                    ui.label(egui::RichText::new("Steering gain (Kp):").size(12.0));
+                    let old_kp = self.steering.kp;
+                    ui.add(egui::Slider::new(&mut self.steering.kp, 20.0..=300.0)
+                        .step_by(5.0)
+                        .suffix(" PWM/m")
+                    );
+                    if (self.steering.kp - old_kp).abs() > 0.1 {
+                        if let Some(db) = &self.db {
+                            let _ = db.set_config("steer_kp", &format!("{:.0}", self.steering.kp));
+                        }
+                    }
+                    ui.label(egui::RichText::new(
+                        format!("1m off-line → {} PWM", self.steering.kp as i32)
+                    ).size(11.0).weak());
+
+                    ui.add_space(4.0);
+
+                    // Max PWM slider
+                    ui.label(egui::RichText::new("Max PWM:").size(12.0));
+                    let mut max_pwm_f = self.steering.max_pwm as f64;
+                    ui.add(egui::Slider::new(&mut max_pwm_f, 50.0..=255.0)
+                        .step_by(5.0)
+                    );
+                    self.steering.max_pwm = max_pwm_f as i16;
+
+                    ui.add_space(4.0);
+
+                    // Deadband slider
+                    let mut deadband_cm = self.steering.deadband_m * 100.0;
+                    ui.label(egui::RichText::new("Deadband:").size(12.0));
+                    ui.add(egui::Slider::new(&mut deadband_cm, 0.0..=20.0)
+                        .step_by(1.0)
+                        .suffix(" cm")
+                    );
+                    self.steering.deadband_m = deadband_cm / 100.0;
 
                     ui.add_space(10.0);
                     ui.separator();

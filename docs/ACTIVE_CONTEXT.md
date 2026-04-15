@@ -5,47 +5,54 @@
 > Updated at the end of each working session.
 
 ## Last updated
-Session 14 — 13 April 2026 (Coverage storage migrated from CSV to SQLite)
+Session 16 — 15 April 2026 (Auto-steer controller, steering.rs, working page button)
 
 ## What we're working on
-**Phase 4 — Field tested, coverage rendering fix in progress.**
+**Phase 5 — Auto-steer controller implemented. Ready for field test.**
 
-First field test completed on Dell 7390 in tractor cab. Guidance display, lightbar,
-auto-pass all working well. Coverage rendering showed dashed strips (1m gaps between
-quads) due to the 1m distance filter — redesigned coverage storage from CSV to SQLite
-with 0.25m distance filter for gap-free rendering.
+Steering controller module created (`steering.rs`) with proportional control.
+Auto-steer button added to the working page toolbar. Kp/max PWM/deadband sliders
+in Setup page AUTO-STEER section. Full safety system: GPS fix timeout, WAS data
+timeout, minimum speed gate. Motor direction inversion applied after controller
+output. WAS calibration updated with new field values (L:1617 C:1832 R:2031) —
+angle sign is now correct (left lock ADC < centre < right lock ADC, so negative
+angle = left steering as expected).
 
 **Completed this session:**
-- Coverage point storage migrated from CSV files to SQLite `coverage_points` table
-- Distance filter reduced from 1.0m to 0.25m for smooth coverage strip rendering
-- `logger.rs` fully rewritten: removed CSV file I/O, added 50-point write buffer
-  with batch SQLite inserts, removed in-memory downsample/100k cap
-- `db.rs`: new `coverage_points` table with `(job_id, segment)` index, batch insert,
-  load, count, clear, and CSV export methods
-- `jobs` table migrated from `csv_filename` to `name` column (auto-migration for
-  existing DBs)
-- All logger mutation methods (`toggle_engage`, `log_fix`, `clear_coverage`,
-  `end_job`) now accept `db: Option<&CoverageDb>` parameter
-- `app.rs` updated to pass DB reference through to all coverage logger calls
-- Added `load_job_coverage()` for reloading previous jobs into render cache
-- Added `export_coverage_csv()` on CoverageDb for CSV export from SQLite data
-- Decision #017 documented
+- New `pc/src/guidance/steering.rs` — `SteeringController` struct with proportional
+  control: `pwm = -kp × xte`, clamped to `±max_pwm`, with deadband and speed gate
+- Steering controller wired into `app.rs` update loop: computes PWM from
+  interpolated XTE every frame (~60fps), sends via `motor_handle.send_steer()`
+- `apply_motor_direction()` applied after controller output (removes `#[allow(dead_code)]`)
+- Safety: `notify_gps_fix()` called on each real fix, `notify_was_reading()` on
+  each WAS message. Auto-disengage if GPS fix age > 2s or WAS data age > 1s.
+- Working page: `⊕ AUTO-STEER` / `⊗ STEER OFF` button in bottom toolbar, greyed
+  out until AB line loaded + motor connected + WAS calibrated
+- Working page overlay: green "AUTO-STEER PWM N" indicator (top-left, below
+  lightbar) when engaged; amber status messages for engage/disengage/safety events
+- Setup page: AUTO-STEER section between MOTOR DIRECTION and MOTOR TEST, with:
+  - Kp slider (20–300 PWM/m, 5-step, persisted to SQLite `steer_kp`)
+  - Max PWM slider (50–255, 5-step)
+  - Deadband slider (0–20 cm, 1-step)
+  - Live status showing engaged/disengaged + last PWM + disengage reason
+- WAS calibration values confirmed correct: L:1617 C:1832 R:2031 (left < centre
+  < right, so `was_calibrated_angle()` produces correct sign without modification)
+- Decision #020 documented
 
-**⚠ NOT YET TESTED — requires `cargo build` and field verification.**
-
-**Previous session (Session 13) completed:**
-- FINN sentence parser (`finn_parser.rs`)
-- Dual serial auto-detect (sensor vs motor ESP32)
-- SENSORS and MOTOR TEST sections in Setup page
-- Motor ESP32 on separate serial port with MotorHandle
-- Port coordination between sensor and motor readers
+**Previous session (Session 15) completed:**
+- WAS three-point calibration wizard in Setup page
+- Motor direction toggle with SQLite persistence
+- Coverage rendering bridging fix (gap-free at all zoom levels)
+- Field-tested in tractor cab on Dell 7390
 
 **Not yet done:**
-- `cargo build` verification of coverage SQLite changes
-- Field test to confirm gap-free coverage rendering at 0.25m
+- **Field test auto-steer** — first test with conservative Kp (start at 100)
+- Determine motor direction convention (positive PWM = which steering direction)
+  and set motor_invert accordingly — critical before first auto-steer test
+- Tune Kp, max_pwm, deadband in the field
+- Add derivative term (Kd) if P-only control oscillates
+- Add heading error feedforward if P-only tracks poorly on curves
 - Wire up CSV export button in job history UI
-- WAS calibration routine (centre/left-lock/right-lock, store in SQLite)
-- PID controller (Phase 5) — depends on WAS calibration
 - Touch target improvements (lower priority, UI is useable)
 
 ## Current state of the code
@@ -68,15 +75,17 @@ All features below are IMPLEMENTED and working:
 - **Coverage**: engage/disengage, distance-based logging (0.25m), SQLite storage
   with batch inserts (50-point write buffer), in-memory render cache for field view,
   colour-coded by fix quality, viewport culling, zoom-dependent render thinning
-  (step 1–4), CSV export from DB available. Clear button for task transitions.
-  **⚠ SQLite migration NOT YET BUILD-TESTED.**
+  (step 1–4 with bridging quads for gap-free display), CSV export from DB available.
+  Clear button for task transitions. **Field-tested, rendering confirmed solid.**
 - **Job management**: JOB HISTORY list in Setup page (last 10, with delete)
-- **GUI**: working page (full-screen + overlaid lightbar/XTE/notifications) and
-  setup page (scrollable panel with AB LINE, IMPLEMENT, NUDGE, GUIDANCE, COVERAGE,
-  POSITION, SENSORS, MOTOR TEST, VIEW, LIGHTBAR sections). GPS status bar shared
-  across both pages.
+- **GUI**: working page (full-screen + overlaid lightbar/XTE/notifications/auto-steer
+  indicator) and setup page (scrollable panel with AB LINE, IMPLEMENT, NUDGE,
+  GUIDANCE, COVERAGE, POSITION, SENSORS, WAS CALIBRATION, MOTOR DIRECTION,
+  AUTO-STEER, MOTOR TEST, VIEW, LIGHTBAR sections). GPS status bar shared across
+  both pages.
 - **Configuration persistence**: implement width, overlap, lightbar sensitivity,
-  last AB line ID — all via SQLite config table, saved on change, loaded on startup
+  last AB line ID, WAS calibration (centre/left/right lock ADC), motor invert,
+  steer Kp — all via SQLite config table, saved on change, loaded on startup
 - **ESP32 firmware (Arduino/PlatformIO)**: both sensor and motor modules flashed and
   running. Identical serial protocol to the original Rust design.
 - **FINN sentence parser**: PC-side parser for `$FINNWAS`, `$FINNIMU`, `$FINNHB`,
@@ -86,6 +95,20 @@ All features below are IMPLEMENTED and working:
   motor status + steer commands.
 - **Motor test UI**: Setup page MOTOR TEST section with preset PWM buttons, fine
   adjust, emergency stop, live motor status and WAS feedback.
+- **WAS calibration**: three-point wizard (centre/left-lock/right-lock) storing raw
+  ADC values in SQLite config. PC-side `was_calibrated_angle()` maps ADC to ±45°
+  via piecewise linear interpolation. Calibrated angle shown in SENSORS section.
+  Latest field values: centre=1832, left lock=1617, right lock=2031. Angle sign
+  is correct (left < centre < right → negative angle for left steering).
+- **Motor direction**: `motor_invert` toggle in MOTOR DIRECTION section, persisted
+  to SQLite. `apply_motor_direction()` applied after steering controller output.
+- **Auto-steer controller**: `SteeringController` in `guidance/steering.rs`.
+  Proportional control: `pwm = -kp × xte`, clamped to `±max_pwm`, with deadband
+  and minimum speed gate. Safety auto-disengage on GPS fix timeout (2s) or WAS
+  data timeout (1s). Engage button on working page toolbar (requires AB line +
+  motor + WAS calibrated). Kp/max_pwm/deadband adjustable in Setup page AUTO-STEER
+  section. Kp persisted to SQLite. Default tuning: Kp=100, max_pwm=180,
+  deadband=3cm, min_speed=0.5m/s.
 
 ## Key decisions (see DECISIONS.md for full detail)
 - #001–#004: Auto-pass priority, skip factor, display thinning, GUI page split
@@ -102,22 +125,24 @@ All features below are IMPLEMENTED and working:
 - #015: Arduino/PlatformIO for ESP32 firmware (replaced Rust/esp-idf-hal)
 - #016: Dual-ESP32 auto-detect (distinguish sensor vs motor by sentence type)
 - #017: Coverage data to SQLite, replacing CSV as primary store (0.25m filter)
+- #018: WAS calibration as PC-side three-point mapping, not ESP32-side
+- #019: Coverage render thinning bridging fix (quads span i→i+step, not i→i+1)
+- #020: Auto-steer as P-control in GUI loop with safety auto-disengage
 
-## Phase 4 hardware inventory (as of 10 April 2026)
+## Phase 4 hardware inventory (as of 15 April 2026)
 - **ESP32 #1 (sensor node)**: reads WAS (ADC GPIO 34), BNO055 (I2C GPIO 21/22),
   forwards GPS NMEA via UART2 passthrough (GPIO 16/17). USB A to laptop. FLASHED.
 - **ESP32 #2 (controller node)**: drives IBT-2 via PWM (GPIO 25/26) and enable
   lines (GPIO 27/14). USB B to laptop. FLASHED.
 - **BNO055**: 3.3V I2C, connects direct to sensor ESP32, no level shifting needed.
-- **WAS**: RQH100030 replaced with a 10kΩ potentiometer. Wiper → GPIO 34 direct
-  (no voltage divider needed — pot powered from ESP32 3.3V rail, output 0–3.3V).
-  Calibration (centre, left lock, right lock ADC counts) to be stored in SQLite
-  config table. A "recalibrate WAS" button needed in Setup page.
+- **WAS**: 10kΩ potentiometer. Wiper → GPIO 34 direct (no voltage divider needed —
+  pot powered from ESP32 3.3V rail, output 0–3.3V). **Calibrated:** centre=1832,
+  left lock=1617, right lock=2031. Angle sign correct.
 - **IBT-2**: RPWM/LPWM from ESP32 PWM pins. R_EN/L_EN on GPIO 27/14 for hard stop.
   Logic powered from ESP32 #2 VIN (5V). Motor supply 12V direct from battery.
+  **Motor confirmed working — responds to MOTOR TEST buttons in tractor.**
 - **GPS**: Quectel LC29H DA on ArduSimple board, UART to sensor ESP32 GPIO 16/17.
-  Powered from ESP32 #1 VIN (5V). Check ArduSimple header voltage (3.3V serial
-  header, not 5V) before wiring UART lines.
+  Powered from ESP32 #1 VIN (5V).
 - **No buck converter**: ESP32s powered via USB from laptop. IBT-2 logic and GPS
   draw 5V from the VIN pins of their respective ESP32s (bench-tested OK).
 
@@ -173,70 +198,39 @@ The 5V VIN pins back-feed 5V to the GPS and IBT-2 logic (bench-tested OK).
 - **RTK**: no base station or NTRIP subscription yet. Running standalone GPS
   (HDOP 0.4 with 42–50 sats — usable for guidance display, not centimetre-accurate)
 
-## Field test checklist (tractor cab — Dell 7390 2-in-1)
-**Hardware installation on tractor:**
-- [ ] Mount GPS antenna with clear sky view
-- [ ] Mount BNO055 aligned with tractor centreline
-- [ ] Mount WAS pot linked to steering column
-- [ ] Mount IBT-2 + motor on steering mechanism
-- [ ] Route USB cables from ESP32s to laptop mounting position
-- [ ] Connect 12V battery supply to IBT-2 motor terminals
-- [ ] Secure all cables and connections for vibration
+## Auto-steer field test checklist (FIRST TEST)
+**Pre-flight (before engaging auto-steer):**
+- [ ] Motor responds to MOTOR TEST preset buttons (verified last session)
+- [ ] Determine motor direction: hit +50 PWM, observe wheel direction
+- [ ] If +50 PWM steers LEFT, toggle motor_invert in MOTOR DIRECTION section
+- [ ] Confirm: +50 PWM now steers RIGHT (matches controller convention)
+- [ ] WAS calibration values loaded (L:1617 C:1832 R:2031)
+- [ ] AB line set and loaded
+- [ ] Start with Kp = 100 (conservative), max_pwm = 180, deadband = 3cm
 
-**Build / startup on Dell 7390:**
-- [ ] Clone repo from git
-- [ ] `cargo build --release` completes clean on the Dell
-- [ ] GPS auto-detect finds sensor ESP32 on correct COM port
-- [ ] Motor ESP32 auto-detected on second COM port
-- [ ] App opens, GPS status bar shows sats/HDOP
-- [ ] SENSORS section shows live WAS/IMU data
-- [ ] MOTOR TEST section shows "Motor ESP32 connected"
+**First engagement:**
+- [ ] Drive onto AB line at walking speed (~5 km/h)
+- [ ] Tap ⊕ AUTO-STEER on working page
+- [ ] Green "AUTO-STEER PWM N" overlay should appear
+- [ ] Observe: does the motor respond? Does it steer toward the line?
+- [ ] If motor steers AWAY from line: immediately tap ⊗ STEER OFF, toggle motor_invert
+- [ ] If oscillating: reduce Kp (try 50)
+- [ ] If too sluggish: increase Kp (try 150–200)
 
-**Touch targets:**
-- [ ] ENGAGE button easy to hit with fingers while bouncing
-- [ ] ⚙ Setup and ◄ Working View buttons work with touch
-- [ ] +/- buttons for implement width, overlap, lightbar all usable
-- [ ] Save Line / Load dialogs operable without keyboard
-
-**Guidance display:**
-- [ ] Lightbar readable in sunlight / tractor cab lighting conditions
-- [ ] XTE readout visible from driving position
-- [ ] Vehicle triangle moves smoothly (interpolation working)
-- [ ] Auto-pass notification visible when triggered
-
-**AB line workflow:**
-- [ ] Set A → drive to B → Set B → line appears correct
-- [ ] Save line to a field, load it back
-- [ ] Auto-pass snaps correctly at headland turns
-- [ ] Nudge ±5cm step feels right for inter-row alignment
-
-**Coverage:**
-- [ ] Coverage strips painting correctly on field view
-- [ ] No slowdown or lag after extended working period
-
-**Motor test (bench verified, confirm on tractor):**
-- [ ] Motor responds to MOTOR TEST preset buttons
-- [ ] Motor direction matches expected (positive PWM = steer right)
-- [ ] WAS value changes when motor moves steering
-- [ ] Watchdog stops motor within 500ms when app closed
-- [ ] Emergency STOP button works
-
-**Sensor verification on tractor:**
-- [ ] WAS reads full range across steering lock-to-lock
-- [ ] BNO055 heading tracks tractor orientation
-- [ ] BNO055 calibration reaches 3/3/x/x after driving
-- [ ] GPS passthrough provides position fixes
+**Safety verification:**
+- [ ] Tap ⊗ STEER OFF → motor stops immediately
+- [ ] Close app → motor stops within 500ms (watchdog)
+- [ ] Unplug motor USB → motor stops, auto-steer disengages
+- [ ] Stop tractor (speed < 0.5 m/s) → PWM goes to zero (speed gate)
 
 ## Next session should
 1. Read this file and DECISIONS.md for context
-2. **`cargo build --release`** — verify the coverage SQLite changes compile clean
-3. **Fix any build errors** from the CSV→SQLite migration
-4. **Field test coverage rendering** — confirm gap-free strips at 0.25m
-5. **Wire up CSV export button** in job history UI (export_coverage_csv is ready)
-6. **WAS calibration** — with pot mounted on steering, implement the three-point
-   calibration routine (centre/left-lock/right-lock) and store in SQLite
-7. **Determine motor direction convention** — use MOTOR TEST to confirm which
-   PWM sign corresponds to which steering direction on this tractor
+2. **Field test auto-steer** following the checklist above
+3. **Determine motor direction** — the FIRST thing to verify before engaging
+4. Tune Kp/max_pwm/deadband based on field behaviour
+5. If P-only oscillates, add derivative term (Kd) to `steering.rs`
+6. Wire up CSV export button in job history UI
+7. Consider adding heading error as feedforward term for better curve tracking
 
 ## File map (quick reference)
 ```
@@ -248,8 +242,10 @@ pc/src/gps/mod.rs            — GPS + serial module declarations
 pc/src/comms/serial.rs       — Motor ESP32 serial (auto-detect, MotorHandle, steer commands)
 pc/src/comms/mod.rs          — Comms module declarations
 pc/src/guidance/ab_line.rs   — AB line guidance, cross-track error, auto-pass, overlap, nudge
+pc/src/guidance/steering.rs  — Auto-steer controller (P-control, safety, engage/disengage)
 pc/src/gui/app.rs            — egui application, page split, lightbar, config persistence,
-                               SENSORS section, MOTOR TEST section
+                               SENSORS, WAS CALIBRATION, MOTOR DIRECTION, AUTO-STEER,
+                               MOTOR TEST sections. Auto-steer button on working page.
 pc/src/gui/field_view.rs     — 2D canvas rendering (grid, coverage strips, lines, trail, vehicle)
 pc/src/gui/field_projection.rs — lat/lon → local metres → screen pixels
 pc/src/coverage/logger.rs    — coverage logger: filter, buffer, flush to SQLite, render cache
@@ -265,8 +261,7 @@ firmware-motor-pio/           — ESP32 #2 Arduino/PlatformIO project (ACTIVE)
 firmware-sensor/              — ESP32 #1 Rust crate (ARCHIVED — replaced by PlatformIO)
 firmware-motor/               — ESP32 #2 Rust crate (ARCHIVED — replaced by PlatformIO)
 docs/IMPLEMENTATION_PLAN.md  — full phase plan, task tracking, session log
-docs/DECISIONS.md            — architectural decision log (#001–#016)
-docs/INSTALLATION_GUIDE.md   — hardware wiring, PC setup, ESP32 flashing, troubleshooting
+docs/DECISIONS.md            — architectural decision log (#001–#020)
 docs/ACTIVE_CONTEXT.md       — this file
 ```
 
@@ -285,3 +280,5 @@ docs/ACTIVE_CONTEXT.md       — this file
 - ESP32 firmware uses Arduino/PlatformIO (C++), built with `pio run --target upload`
 - Old `pc/src/comms/udp.rs` is dead code — can be deleted (replaced by `serial.rs`)
 - Old `coverage_logs/` CSV directory no longer written to (coverage now in SQLite)
+- Auto-steer sign convention: positive XTE = right of line → negative PWM (steer left)
+- `apply_motor_direction()` is applied AFTER the steering controller, not inside it

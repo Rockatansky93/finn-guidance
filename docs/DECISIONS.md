@@ -555,3 +555,167 @@ and field test to confirm gap-free coverage rendering at 0.25m.
 the can on the structural issues), spatial database / R-tree (rejected:
 over-engineering for sequential coverage data — the access pattern is always
 "load all points for job X", not spatial range queries).
+
+---
+
+## #018 — WAS calibration as PC-side three-point mapping, not ESP32-side
+**Date:** 15 April 2026
+**Context:** The wheel angle sensor (10kΩ pot replacing the RQH100030) outputs a
+raw ADC value (0–4095) via the sensor ESP32. To use this for PID steering control,
+the raw value needs to be mapped to a meaningful steering angle. The question was
+whether to perform calibration on the ESP32 (sending calibrated angles over serial)
+or on the PC (sending raw ADC and calibrating in software).
+
+**Decision:** Calibration is performed entirely on the PC side. The ESP32 sends raw
+ADC values in `$FINNWAS` sentences. The PC stores three calibration points in the
+SQLite config table (`was_centre`, `was_left_lock`, `was_right_lock` as raw ADC
+counts) and computes the steering angle via `was_calibrated_angle()` — a piecewise
+linear mapping from [left_lock, centre, right_lock] to [-45°, 0°, +45°].
+
+**UI:** WAS CALIBRATION section in Setup page with a three-step wizard:
+1. Turn wheels straight → press "Set Centre"
+2. Turn to full left lock → press "Set Left Lock"
+3. Turn to full right lock → press "Set Right Lock"
+Each press saves the current `latest_was.raw_value` to SQLite immediately. A live
+ADC readout provides feedback during calibration. Status shows "Calibrated" (green)
+with L/C/R values, or "Not calibrated" (amber). "Recalibrate" button clears all
+three values. The SENSORS section shows the calibrated angle alongside raw values
+when calibration is complete.
+
+**Field test result:** centre=1800, left lock=1950, right lock=1650. The pot's ADC
+range is ~300 counts across the full steering range. **Known issue:** left lock ADC
+(1950) is higher than centre (1800), which means the piecewise mapping produces a
+positive angle for left steering — the sign is inverted. Fix deferred to next session.
+
+**Why ±45° default:** We don't know the actual lock-to-lock angle of this tractor's
+steering. 45° is a reasonable placeholder — the PID controller only needs a
+proportional signal (raw ADC → normalised position), not true degrees. If the actual
+angle matters later, the MAX_ANGLE constant can be updated.
+
+**Motor direction:** A separate `motor_invert` boolean config key was added alongside
+WAS calibration. When true, `apply_motor_direction()` flips the PWM sign so that
+positive always means "steer right" from the PID's perspective. Toggled via a
+"MOTOR DIRECTION" section in Setup page. Not yet field-verified (IBT-2 suspected
+hardware failure).
+
+**Alternatives considered:** ESP32-side calibration (rejected: would require
+reflashing to recalibrate, and the ESP32 doesn't have persistent storage for
+calibration values without adding EEPROM/NVS code), sending calibrated angles
+over serial (rejected: raw values are more flexible — the PC can recalibrate
+without touching firmware), single-point calibration with assumed linearity
+(rejected: pot response may not be perfectly linear across the range —
+three points handles asymmetric steering geometry).
+
+---
+
+## #019 — Coverage render thinning bridging fix (revises #014)
+**Date:** 15 April 2026
+**Context:** After the SQLite migration (#017), coverage rendering still showed
+dashed strips in the field. The 0.25m distance filter and SQLite storage were
+working correctly — the problem was in the rendering layer.
+
+**Root cause:** The zoom-dependent render thinning from Decision #014 used a `step`
+variable (1–4) to skip points when zoomed out. The renderer drew a quad from
+point[i] to point[i+1], then advanced the loop counter by `step`. When step > 1,
+this meant the quad only covered the distance from i to i+1, but the loop then
+jumped to i+step — leaving the gap from i+1 to i+step undrawn. The result was a
+regular dashed pattern: one quad drawn, (step-1) quads missing, repeat.
+
+**Decision:** Change the quad bridging target from `i+1` to `i+step`. Each rendered
+quad now spans directly from point[i] to point[i+step], covering the full distance
+to the next rendered point. At step=1 (close zoom), behaviour is identical to before.
+At step=4 (zoomed out), each quad is ~4x longer but there are 4x fewer of them —
+the coverage band remains continuous with no visible gaps.
+
+**Segment boundary handling:** If i+step crosses into a different segment (or past
+the end of the array), the renderer falls back to i+1 within the same segment. If
+neither i+step nor i+1 are in the same segment, the point is drawn as a small
+isolated square (existing fallback behaviour).
+
+**Field test result:** Coverage now renders as solid continuous strips at all zoom
+levels. Confirmed in tractor cab on Dell 7390.
+
+**Alternatives considered:** Disabling render thinning entirely (rejected: would
+cause performance issues when zoomed out with thousands of points), drawing all
+intermediate quads even when thinning (rejected: defeats the purpose of thinning
+for performance).
+
+---
+
+## #020 — Auto-steer as P-control in GUI loop with safety auto-disengage
+**Date:** 15 April 2026
+**Context:** The motor controller hardware is confirmed working (IBT-2 replaced,
+motor responds to MOTOR TEST buttons in the tractor cab). WAS calibration values
+updated (L:1617, C:1832, R:2031 — angle sign now correct). The next step is
+closing the loop: XTE → motor PWM → physical steering correction.
+
+**Decision:** Implement a `SteeringController` in `pc/src/guidance/steering.rs`
+using proportional control as the initial strategy. The controller runs in the
+GUI update loop (~60fps), computing `pwm = -kp × xte` from the interpolated
+cross-track error and sending the result via `motor_handle.send_steer()`.
+
+**Control architecture:**
+- Input: `CrossTrackError.distance_m` from `AbLineGuide::calculate_error()`,
+  computed from the interpolated GPS position (same source as lightbar/XTE display).
+- Output: PWM value (-255 to +255), sent every frame to keep the ESP32 watchdog fed.
+- Sign convention: positive XTE = vehicle right of line → negative PWM = steer left
+  to correct. `apply_motor_direction()` (motor_invert toggle) is applied by the
+  caller after the controller returns, keeping the controller sign-agnostic.
+- Deadband: XTE < 3cm → zero output (prevents motor hunting when on-line).
+- Speed gate: speed < 0.5 m/s → zero output (prevents GPS-drift steering at standstill).
+- Clamp: output clamped to ±max_pwm (default 180, configurable 50–255).
+
+**Safety system:**
+- GPS fix timeout: if no real GPS fix received for >2 seconds, auto-disengage and
+  send PWM 0. Prevents runaway steering if GPS cable is disconnected or module fails.
+- WAS data timeout: if no `$FINNWAS` received for >1 second, auto-disengage.
+  Prevents steering without position feedback from the wheel angle sensor.
+- ESP32 watchdog (firmware-side): motor ESP32 kills motor if no `$FINNSTEER` received
+  within 500ms. This is the ultimate safety net — if the PC app crashes, freezes, or
+  loses USB connection, the motor stops within half a second.
+- Manual disengage: ⊗ STEER OFF button on working page immediately sends PWM 0 and
+  disengages. The button is always clickable when engaged (no precondition checks).
+- Engage preconditions: AB line loaded + motor ESP32 connected + WAS calibrated (all
+  three centre/left/right values set). Button greyed out if any precondition is unmet.
+
+**UI placement:**
+- Working page toolbar: ⊕ AUTO-STEER / ⊗ STEER OFF button, sized for touch, next
+  to the coverage ENGAGE button. Blue when available, red when engaged.
+- Working page overlay: green "AUTO-STEER PWM N" pill (top-left below lightbar)
+  showing live output when engaged. Amber status messages for state changes.
+- Setup page: AUTO-STEER section with Kp slider (20–300, persisted to SQLite),
+  max PWM slider (50–255), deadband slider (0–20cm). Live status display.
+
+**Why P-only to start:** The system is running standalone GPS (no RTK), so position
+accuracy is ±1–2m. A proportional controller is the simplest thing that could
+possibly work, and its behaviour is easy to reason about in the field. Adding
+derivative (Kd) or integral (Ki) terms before understanding the basic system
+response would risk masking fundamental issues (wrong motor direction, WAS sign
+error, GPS latency). P-only will either work acceptably or reveal clearly what
+additional terms are needed (oscillation → add Kd, steady-state offset → add Ki).
+
+**Default tuning rationale:**
+- Kp = 100: at 1m off-line, outputs 100 PWM (~39% of 255). Conservative enough
+  that the motor won't slam the steering, aggressive enough to see a response.
+- max_pwm = 180: leaves headroom below 255. The Trimble EZ-Steer motor doesn't
+  need full power for normal corrections.
+- deadband = 3cm: larger than GPS noise at standstill, small enough that the
+  controller engages before the operator notices drift. Will likely need to increase
+  to 10–20cm for standalone GPS due to position wander.
+
+**Why run in the GUI loop (not a separate thread):** The GUI loop already has
+access to the interpolated position, the guidance error, the motor handle, and
+all configuration state. Running the controller in a separate thread would require
+shared state synchronisation (Arc<Mutex>) for all of these, adding complexity for
+no benefit — the GUI loop runs at 60fps which is more than fast enough for tractor
+steering dynamics. The ESP32 watchdog timeout (500ms) is 30× longer than the
+frame interval (~16ms), so there's ample margin even if frames are occasionally
+slow.
+
+**Alternatives considered:** PID from the start (rejected: unnecessary complexity
+before basic P behaviour is validated), separate control thread at fixed rate
+(rejected: adds synchronisation overhead without improving control quality — 60fps
+is already faster than the GPS update rate), Stanley controller or pure pursuit
+(rejected: these are path-following algorithms that require heading + look-ahead
+distance — overkill for straight AB line following where cross-track error alone
+is sufficient; reconsider for curved guidance lines in future phases).
