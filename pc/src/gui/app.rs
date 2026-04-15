@@ -166,11 +166,16 @@ impl GuidanceApp {
             .map(|v| v == "true")
             .unwrap_or(false);
 
-        // Load steering controller gain from database
+        // Load steering controller gains from database
         let steer_kp = db.as_ref()
             .and_then(|d| d.get_config("steer_kp"))
             .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(100.0);
+            .and_then(|v| if v > 50.0 { None } else { Some(v) }) // ignore old PWM/m values
+            .unwrap_or(30.0);
+        let steer_kp_angle = db.as_ref()
+            .and_then(|d| d.get_config("steer_kp_angle"))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(4.0);
 
         // Auto-load last-used AB line on startup
         let mut guide = AbLineGuide::new(implement_width);
@@ -211,6 +216,7 @@ impl GuidanceApp {
             steering: {
                 let mut s = SteeringController::new();
                 s.kp = steer_kp;
+                s.kp_angle = steer_kp_angle;
                 s
             },
             steer_status_msg: None,
@@ -349,9 +355,14 @@ impl eframe::App for GuidanceApp {
             // === Auto-steer: compute and send motor command ===
             if self.steering.engaged {
                 if let Some(error) = &self.current_error {
+                    // Get current steering angle from WAS (if calibrated and available)
+                    let actual_angle = self.latest_was.as_ref()
+                        .and_then(|was| self.was_calibrated_angle(was.raw_value));
+
                     let (raw_pwm, disengaged) = self.steering.compute(
                         error.distance_m,
                         interp_fix.speed,
+                        actual_angle,
                     );
                     if disengaged {
                         // Safety disengage — send stop and notify
@@ -650,12 +661,22 @@ impl GuidanceApp {
 
                 // Auto-steer status indicator (top-left, below lightbar)
                 if self.steering.engaged {
-                    let steer_text = format!("AUTO-STEER  PWM {}", self.steering.last_output_pwm);
+                    let steer_text = format!(
+                        "AUTO-STEER  PWM {}  T:{:.0}° A:{:.0}°",
+                        self.steering.last_output_pwm,
+                        self.steering.last_desired_angle,
+                        self.steering.last_actual_angle,
+                    );
                     let steer_pos = egui::pos2(overlay_rect.left() + 20.0, overlay_rect.top() + 55.0);
+                    let indicator_colour = if self.steering.was_stale {
+                        egui::Color32::from_rgb(255, 200, 60) // amber when WAS stale
+                    } else {
+                        egui::Color32::from_rgb(100, 255, 100) // green normally
+                    };
                     let steer_galley = painter.layout_no_wrap(
                         steer_text,
-                        egui::FontId::proportional(18.0),
-                        egui::Color32::from_rgb(100, 255, 100),
+                        egui::FontId::proportional(16.0),
+                        indicator_colour,
                     );
                     let pill_rect = egui::Rect::from_min_size(
                         egui::pos2(steer_pos.x - 8.0, steer_pos.y),
@@ -669,7 +690,7 @@ impl GuidanceApp {
                     painter.galley(
                         egui::pos2(pill_rect.left() + 8.0, pill_rect.top() + 4.0),
                         steer_galley,
-                        egui::Color32::from_rgb(100, 255, 100),
+                        indicator_colour,
                     );
                 }
 
@@ -1698,6 +1719,20 @@ impl GuidanceApp {
                             egui::RichText::new(format!("● ENGAGED  PWM {}", self.steering.last_output_pwm))
                                 .size(14.0).strong()
                         );
+                        // Show inner loop debug: desired vs actual angle
+                        ui.label(egui::RichText::new(format!(
+                            "Target: {:.1}°  Actual: {:.1}°",
+                            self.steering.last_desired_angle,
+                            self.steering.last_actual_angle,
+                        )).size(12.0));
+
+                        // WAS stale warning
+                        if self.steering.was_stale {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(255, 200, 60),
+                                egui::RichText::new("⚠ WAS data stale — using last known angle").size(11.0)
+                            );
+                        }
                     } else {
                         ui.colored_label(egui::Color32::GRAY, "● Disengaged");
                         if let Some(ref reason) = self.steering.disengage_reason {
@@ -1707,12 +1742,14 @@ impl GuidanceApp {
 
                     ui.add_space(6.0);
 
-                    // Kp slider
-                    ui.label(egui::RichText::new("Steering gain (Kp):").size(12.0));
+                    // Outer loop: Kp (XTE → desired angle)
+                    ui.label(egui::RichText::new("Outer loop — line seeking:").size(12.0).strong());
+                    ui.add_space(2.0);
+                    ui.label(egui::RichText::new("Kp (°/m):").size(12.0));
                     let old_kp = self.steering.kp;
-                    ui.add(egui::Slider::new(&mut self.steering.kp, 20.0..=300.0)
-                        .step_by(5.0)
-                        .suffix(" PWM/m")
+                    ui.add(egui::Slider::new(&mut self.steering.kp, 5.0..=60.0)
+                        .step_by(1.0)
+                        .suffix(" °/m")
                     );
                     if (self.steering.kp - old_kp).abs() > 0.1 {
                         if let Some(db) = &self.db {
@@ -1720,7 +1757,27 @@ impl GuidanceApp {
                         }
                     }
                     ui.label(egui::RichText::new(
-                        format!("1m off-line → {} PWM", self.steering.kp as i32)
+                        format!("1m off-line → {:.0}° desired turn", self.steering.kp)
+                    ).size(11.0).weak());
+
+                    ui.add_space(6.0);
+
+                    // Inner loop: Kp_angle (angle error → PWM)
+                    ui.label(egui::RichText::new("Inner loop — wheel position:").size(12.0).strong());
+                    ui.add_space(2.0);
+                    ui.label(egui::RichText::new("Kp angle (PWM/°):").size(12.0));
+                    let old_kp_angle = self.steering.kp_angle;
+                    ui.add(egui::Slider::new(&mut self.steering.kp_angle, 1.0..=15.0)
+                        .step_by(0.5)
+                        .suffix(" PWM/°")
+                    );
+                    if (self.steering.kp_angle - old_kp_angle).abs() > 0.1 {
+                        if let Some(db) = &self.db {
+                            let _ = db.set_config("steer_kp_angle", &format!("{:.1}", self.steering.kp_angle));
+                        }
+                    }
+                    ui.label(egui::RichText::new(
+                        format!("10° error → {} PWM", (self.steering.kp_angle * 10.0) as i32)
                     ).size(11.0).weak());
 
                     ui.add_space(4.0);

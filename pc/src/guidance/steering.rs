@@ -1,80 +1,113 @@
-//! Steering controller — converts cross-track error into motor PWM commands.
+//! Steering controller — two-loop architecture for auto-steer.
 //!
-//! This is the auto-steer loop. It takes the XTE from the AB line guidance
-//! and outputs a PWM value to send to the motor ESP32 via `$FINNSTEER`.
+//! ## Architecture
 //!
-//! ## Control strategy
+//! Two nested control loops:
 //!
-//! Phase 1 (current): Pure proportional control.
-//!   pwm = kp × xte_m
+//! **Outer loop (GPS → desired steering angle):**
+//!   desired_angle = clamp(-kp_xte × xte_m, ±max_steer_angle)
 //!
-//! The sign convention is:
+//!   This converts cross-track error (how far off the line we are) into
+//!   a desired wheel angle. Large XTE → large desired angle to get back.
+//!   As the tractor approaches the line, the desired angle reduces toward
+//!   zero, naturally commanding "straighten up" before reaching the line.
+//!
+//! **Inner loop (desired angle vs actual WAS → motor PWM):**
+//!   angle_error = desired_angle - actual_angle
+//!   pwm = clamp(kp_angle × angle_error, ±max_pwm)
+//!
+//!   This drives the motor to achieve the desired wheel position. It uses
+//!   the WAS (wheel angle sensor) as feedback, so it knows when the wheels
+//!   have reached the target angle and stops driving. This is what makes
+//!   the wheels return to straight — when XTE is zero, desired_angle is
+//!   zero, and if the wheels are still turned, the inner loop corrects.
+//!
+//! ## Sign convention
+//!
 //!   - Positive XTE = vehicle is RIGHT of the line
-//!   - Positive PWM = steer RIGHT (before motor_invert is applied)
-//!   - So positive XTE should produce NEGATIVE PWM (steer left to correct)
-//!   - The controller outputs: pwm = -kp × xte
-//!
-//! Motor direction inversion (`apply_motor_direction`) is applied by the
-//! caller (app.rs) AFTER this controller returns, so this module always
-//! uses the "positive PWM = steer right" convention.
+//!   - Positive angle = wheels turned RIGHT
+//!   - Positive PWM = motor steers RIGHT (before motor_invert)
+//!   - So: positive XTE → negative desired angle (steer LEFT to correct)
 //!
 //! ## Safety
 //!
 //! The ESP32 motor firmware has a 500ms watchdog — if it doesn't receive a
 //! `$FINNSTEER` command within 500ms, it kills the motor. The GUI loop
 //! sends a command every frame (~16ms at 60fps), keeping the watchdog fed.
-//! If the app freezes or exits, the watchdog fires and the motor stops.
 //!
-//! Additional PC-side safety:
+//! PC-side safety:
 //! - Auto-disengage if GPS fix age exceeds `max_fix_age_secs`
-//! - Auto-disengage if WAS data stops arriving (sensor ESP32 disconnected)
+//! - WAS data loss: warning after `was_warn_secs`, disengage after `was_disengage_secs`
 //! - PWM clamped to `max_pwm` (never sends full 255 unless configured to)
-//! - Deadband prevents hunting when already close to the line
+//! - Speed gate: no steering below minimum speed
 
 use std::time::Instant;
 
 /// Steering controller state.
 pub struct SteeringController {
-    /// Proportional gain: PWM per metre of cross-track error.
-    /// Higher = more aggressive correction.
-    /// Starting value: 100 (1m off-line → 100 PWM ≈ 40% power).
+    // === Outer loop: XTE → desired steering angle ===
+
+    /// Outer loop gain: degrees of desired steering angle per metre of XTE.
+    /// Higher = more aggressive line-seeking.
+    /// 30.0 means 1m off-line → command 30° of steering.
     pub kp: f64,
 
+    /// Maximum desired steering angle (degrees). Caps how hard the outer
+    /// loop can command a turn, even when far off-line.
+    pub max_steer_angle: f64,
+
+    // === Inner loop: angle error → motor PWM ===
+
+    /// Inner loop gain: PWM per degree of angle error.
+    /// Controls how aggressively the motor drives to reach the desired angle.
+    /// 4.0 means 10° error → 40 PWM.
+    pub kp_angle: f64,
+
     /// Maximum PWM magnitude the controller will output.
-    /// Provides a hard ceiling below the absolute 255 limit.
     pub max_pwm: i16,
 
-    /// Deadband in metres. XTE below this produces zero output.
-    /// Prevents the motor from hunting/buzzing when on-line.
-    /// 0.03 = 3cm deadband (reasonable for standalone GPS).
+    /// Deadband in metres. XTE below this produces zero desired angle.
+    /// Prevents the motor from hunting when already on the line.
     pub deadband_m: f64,
 
     /// Whether auto-steer is currently engaged.
     pub engaged: bool,
 
     /// Minimum speed (m/s) for auto-steer to produce output.
-    /// Below this, the controller outputs zero to avoid steering
-    /// at standstill based on GPS drift.
     pub min_speed: f64,
 
+    // === Safety ===
+
     /// Maximum GPS fix age (seconds) before auto-disengage.
-    /// If we haven't received a real fix in this long, GPS is
-    /// probably disconnected — stop steering.
     pub max_fix_age_secs: f64,
 
     /// Timestamp of the last real GPS fix received.
-    /// Used for the fix-age safety check.
     last_fix_time: Option<Instant>,
 
     /// Timestamp of the last WAS reading received.
-    /// Used for sensor-health safety check.
     last_was_time: Option<Instant>,
 
-    /// Maximum WAS data age (seconds) before auto-disengage.
-    pub max_was_age_secs: f64,
+    /// WAS age (seconds) that triggers a warning (but keeps steering).
+    /// Uses the last known angle — the inner loop still works.
+    pub was_warn_secs: f64,
 
-    /// The last PWM value computed (for display/debug).
+    /// WAS age (seconds) that triggers full disengage.
+    /// If we truly lose the sensor for this long, stop steering.
+    pub was_disengage_secs: f64,
+
+    /// Whether WAS data is currently stale (for UI warning display).
+    pub was_stale: bool,
+
+    // === Debug/display ===
+
+    /// The last PWM value computed (for display).
     pub last_output_pwm: i16,
+
+    /// The last desired steering angle (for display).
+    pub last_desired_angle: f64,
+
+    /// The last actual steering angle from WAS (for display).
+    pub last_actual_angle: f64,
 
     /// Reason for last disengage (for UI display).
     pub disengage_reason: Option<String>,
@@ -83,24 +116,32 @@ pub struct SteeringController {
 impl SteeringController {
     pub fn new() -> Self {
         Self {
-            kp: 100.0,
+            kp: 30.0,
+            max_steer_angle: 25.0,
+            kp_angle: 4.0,
             max_pwm: 180,
             deadband_m: 0.03,
             engaged: false,
-            min_speed: 0.5, // ~1.8 km/h
+            min_speed: 0.5,
             max_fix_age_secs: 2.0,
             last_fix_time: None,
             last_was_time: None,
-            max_was_age_secs: 1.0,
+            was_warn_secs: 2.0,
+            was_disengage_secs: 5.0,
+            was_stale: false,
             last_output_pwm: 0,
+            last_desired_angle: 0.0,
+            last_actual_angle: 0.0,
             disengage_reason: None,
         }
     }
 
-    /// Engage auto-steer. Returns false if preconditions aren't met.
+    /// Engage auto-steer.
     pub fn engage(&mut self) -> bool {
         self.disengage_reason = None;
         self.last_output_pwm = 0;
+        self.last_desired_angle = 0.0;
+        self.was_stale = false;
         self.engaged = true;
         true
     }
@@ -109,24 +150,24 @@ impl SteeringController {
     pub fn disengage(&mut self, reason: Option<String>) {
         self.engaged = false;
         self.last_output_pwm = 0;
+        self.last_desired_angle = 0.0;
         self.disengage_reason = reason;
     }
 
     /// Notify the controller that a real GPS fix was received.
-    /// Call this from the GPS fix processing loop (not the interpolated path).
     pub fn notify_gps_fix(&mut self) {
         self.last_fix_time = Some(Instant::now());
     }
 
     /// Notify the controller that a WAS reading was received.
-    /// Call this when processing FINN WAS messages.
     pub fn notify_was_reading(&mut self) {
         self.last_was_time = Some(Instant::now());
+        self.was_stale = false;
     }
 
     /// Run safety checks. Returns Some(reason) if auto-steer should disengage.
-    fn check_safety(&self) -> Option<String> {
-        // Check GPS fix age
+    fn check_safety(&mut self) -> Option<String> {
+        // Check GPS fix age — hard disengage
         if let Some(fix_time) = self.last_fix_time {
             if fix_time.elapsed().as_secs_f64() > self.max_fix_age_secs {
                 return Some("GPS fix lost".to_string());
@@ -135,10 +176,15 @@ impl SteeringController {
             return Some("No GPS fix received".to_string());
         }
 
-        // Check WAS data age
+        // Check WAS data age — tiered response
         if let Some(was_time) = self.last_was_time {
-            if was_time.elapsed().as_secs_f64() > self.max_was_age_secs {
+            let was_age = was_time.elapsed().as_secs_f64();
+            if was_age > self.was_disengage_secs {
+                // Truly lost — disengage
                 return Some("WAS data lost".to_string());
+            } else if was_age > self.was_warn_secs {
+                // Stale but not lost — flag warning, keep steering with last known angle
+                self.was_stale = true;
             }
         } else {
             return Some("No WAS data received".to_string());
@@ -147,47 +193,55 @@ impl SteeringController {
         None
     }
 
-    /// Compute the steering PWM output from cross-track error.
+    /// Compute the steering PWM output using two-loop control.
     ///
-    /// Call this every GUI frame. Returns the PWM value to send (before
-    /// motor_invert is applied), or 0 if disengaged or safety-tripped.
+    /// Call this every GUI frame.
     ///
     /// `xte_m`: cross-track error in metres (positive = right of line)
     /// `speed_mps`: current vehicle speed in m/s
+    /// `actual_angle_deg`: current steering angle from WAS (negative = left, positive = right).
+    ///                     Pass None if WAS is not calibrated (shouldn't happen if engage
+    ///                     preconditions are met, but handled gracefully).
     ///
     /// Returns (pwm, disengaged_this_frame)
-    pub fn compute(&mut self, xte_m: f64, speed_mps: f64) -> (i16, bool) {
+    pub fn compute(&mut self, xte_m: f64, speed_mps: f64, actual_angle_deg: Option<f64>) -> (i16, bool) {
         if !self.engaged {
             self.last_output_pwm = 0;
             return (0, false);
         }
 
-        // Safety checks — auto-disengage if something is wrong
+        // Safety checks
         if let Some(reason) = self.check_safety() {
             self.disengage(Some(reason));
             return (0, true);
         }
 
-        // Don't steer at standstill (GPS drift would cause random steering)
+        // Speed gate
         if speed_mps < self.min_speed {
             self.last_output_pwm = 0;
             return (0, false);
         }
 
-        // Deadband — if we're close enough, don't steer
-        if xte_m.abs() < self.deadband_m {
-            self.last_output_pwm = 0;
-            return (0, false);
-        }
+        // === Outer loop: XTE → desired steering angle ===
+        let desired_angle = if xte_m.abs() < self.deadband_m {
+            // Within deadband — target straight ahead
+            0.0
+        } else {
+            // Positive XTE (right of line) → negative desired angle (steer left)
+            let raw = -self.kp * xte_m;
+            raw.clamp(-self.max_steer_angle, self.max_steer_angle)
+        };
 
-        // Proportional control:
-        // Positive XTE = vehicle is right of line → need to steer LEFT → negative PWM
-        // So: pwm = -kp * xte
-        let raw_pwm = -self.kp * xte_m;
+        self.last_desired_angle = desired_angle;
 
-        // Clamp to max_pwm
-        let clamped = raw_pwm.round() as i16;
-        let clamped = clamped.clamp(-self.max_pwm, self.max_pwm);
+        // === Inner loop: angle error → motor PWM ===
+        let actual = actual_angle_deg.unwrap_or(0.0);
+        self.last_actual_angle = actual;
+
+        let angle_error = desired_angle - actual;
+
+        let raw_pwm = self.kp_angle * angle_error;
+        let clamped = (raw_pwm.round() as i16).clamp(-self.max_pwm, self.max_pwm);
 
         self.last_output_pwm = clamped;
         (clamped, false)
