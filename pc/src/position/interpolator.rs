@@ -8,11 +8,13 @@
 //!
 //! 1. When a real GPS fix arrives, call `update_fix()` — this resets the
 //!    interpolator with the true position, speed, and heading.
-//! 2. On every GUI frame, call `interpolate()` — this extrapolates the position
-//!    forward by `speed × dt` along `heading` since the last real fix.
+//! 2. On every GUI frame, call `interpolate(override_heading)` — this
+//!    extrapolates the position forward by `speed × dt` along the heading.
+//!    When an override heading is supplied (typically the IMU-fused heading),
+//!    it's used instead of the stale VTG heading baked into the last real fix.
 //! 3. The returned `GpsFix` is a synthetic fix suitable for display and guidance
-//!    calculations. It carries the same metadata (sats, HDOP, fix quality) as the
-//!    last real fix.
+//!    calculations. It carries the same metadata (sats, HDOP, fix quality) as
+//!    the last real fix, but with updated position and (optionally) heading.
 //!
 //! ## What uses interpolated vs real positions
 //!
@@ -24,7 +26,9 @@
 //!
 //! At tractor speeds (10-15 km/h ≈ 3-4 m/s), one second of dead reckoning with
 //! GPS heading accumulates roughly 10-20cm of error before the next real fix
-//! corrects it. This is well within the visual tolerance for the GUI.
+//! corrects it. With a fused IMU heading as the `override_heading`, this
+//! improves further because the projection direction stays correct through
+//! turns instead of lagging by up to 1s.
 
 use std::time::Instant;
 use finn_guidance_common::types::GpsFix;
@@ -71,11 +75,18 @@ impl PositionInterpolator {
     /// Between real fixes, extrapolates the position using dead reckoning.
     /// When a new real fix arrives (via `update_fix`), the position snaps
     /// back to truth.
-    pub fn interpolate(&mut self) -> Option<&GpsFix> {
+    ///
+    /// If `override_heading` is provided, it replaces `fix.heading` for both
+    /// the dead-reckon projection AND as the `heading` field of the returned
+    /// fix. This lets the IMU-fused heading flow through to everything
+    /// downstream (field view, guidance error, steering).
+    pub fn interpolate(&mut self, override_heading: Option<f64>) -> Option<&GpsFix> {
         let fix = self.last_fix.as_ref()?;
         let fix_time = self.last_fix_time?;
 
         let elapsed = fix_time.elapsed().as_secs_f64();
+
+        let heading_for_projection = override_heading.unwrap_or(fix.heading);
 
         // Don't extrapolate if:
         // - No time has passed (we're on the same frame as the fix)
@@ -85,7 +96,11 @@ impl PositionInterpolator {
             || fix.speed < self.min_speed_for_interpolation
             || elapsed > self.max_extrapolation_secs
         {
-            self.current_interpolated = Some(fix.clone());
+            let mut held = fix.clone();
+            if let Some(h) = override_heading {
+                held.heading = h;
+            }
+            self.current_interpolated = Some(held);
             return self.current_interpolated.as_ref();
         }
 
@@ -94,15 +109,18 @@ impl PositionInterpolator {
         let (new_lat, new_lon) = destination_point(
             fix.latitude,
             fix.longitude,
-            fix.heading,
+            heading_for_projection,
             distance_m,
         );
 
         // Build the interpolated fix — same metadata as the real fix,
-        // just with an updated position
+        // just with an updated position and (optionally) a fresher heading
         let mut interp = fix.clone();
         interp.latitude = new_lat;
         interp.longitude = new_lon;
+        if let Some(h) = override_heading {
+            interp.heading = h;
+        }
 
         self.current_interpolated = Some(interp);
         self.current_interpolated.as_ref()

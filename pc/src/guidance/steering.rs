@@ -1,119 +1,151 @@
-//! Steering controller — two-loop architecture for auto-steer.
+//! Steering controller — pure pursuit outer loop, WAS-feedback inner loop.
 //!
 //! ## Architecture
 //!
 //! Two nested control loops:
 //!
-//! **Outer loop (GPS → desired steering angle):**
-//!   desired_angle = clamp(-kp_xte × xte_m + kh × heading_error, ±max_steer_angle)
+//! **Outer loop — pure pursuit geometry (cross-track + heading → desired angle):**
 //!
-//!   This converts cross-track error (how far off the line we are) AND
-//!   heading error (how far off the line bearing we're pointed) into a
-//!   desired wheel angle. The XTE term drives toward the line; the heading
-//!   term ensures the tractor arrives *aligned* with it, not at an angle.
+//! Pure pursuit picks a "lookahead point" on the AB line some distance `L`
+//! ahead of the tractor, then commands the wheel angle that would curve the
+//! tractor through that point. The bicycle model gives:
 //!
-//!   Without heading error: as XTE→0 the controller commands "straighten
-//!   up", but if the tractor approached at an angle it's still pointed
-//!   diagonally. The wheels straighten, the tractor drives through the
-//!   line and keeps going — potentially overshooting into the next pass.
-//!   Traditional systems with this bug produce a weaving wave pattern;
-//!   ours was overshooting so far it grabbed the next AB line and drove
-//!   perpendicular.
+//! ```text
+//!   desired_angle = atan2(2 · wheelbase · sin(alpha), L)
+//! ```
 //!
-//!   With heading error: the controller keeps the wheels turned until the
-//!   tractor is both close to the line AND pointed along it. This is
-//!   standard in commercial guidance systems.
+//! where `alpha` is the angle from the tractor's current heading to the
+//! lookahead point. Here we compute `alpha` in closed form from the current
+//! cross-track error (XTE) and heading error — no need to project to
+//! lat/lon and back. For an AB line with local XTE `y` and heading error
+//! `psi` (both signed), the lookahead point at distance `L` along the line
+//! from the tractor's projection onto it sits at a bearing:
+//!
+//! ```text
+//!   alpha = atan2(-y, L) - psi
+//! ```
+//!
+//! (derivation: the point `L` ahead on the line is at (L, 0) in a frame
+//! aligned with the line; the tractor is at (0, y) with its nose pointing
+//! at heading psi relative to the line. The vector from tractor to
+//! lookahead is (L, -y), so its bearing in the line frame is `atan2(-y, L)`.
+//! Subtract psi to get the bearing in the tractor frame.)
+//!
+//! The single tunable quantity is `L` — the lookahead distance. We scale it
+//! with speed so that at working speed the tractor looks far ahead (smooth
+//! approach), while at low speed it looks close (crisp corrections):
+//!
+//! ```text
+//!   L = lookahead_base + lookahead_speed_factor × speed
+//! ```
+//!
+//! clamped to a sane range (2 m floor, 15 m ceiling).
+//!
+//! **Why this replaces the old Kp/Kh PD controller:**
+//! The old `-Kp·XTE - Kh·heading_error` weighted two terms against each
+//! other. The Kp and Kh balance was delicate: too much Kp and the tractor
+//! hunted (XTE term dominated, snapped to zero, then heading error was
+//! ignored as it unwound); too little and it drifted on. Pure pursuit
+//! captures both XTE and heading in one geometric quantity (`alpha`) with
+//! no term-balancing. One knob (lookahead distance) sets the approach
+//! aggression; it can't fight itself.
 //!
 //! **Inner loop (desired angle vs actual WAS → motor PWM):**
-//!   angle_error = desired_angle - actual_angle
-//!   pwm = clamp(kp_angle × angle_error, ±max_pwm)
+//! Unchanged from the previous design. The inner loop takes whatever
+//! desired angle the outer loop commands and drives the motor to hit it:
 //!
-//!   This drives the motor to achieve the desired wheel position. It uses
-//!   the WAS (wheel angle sensor) as feedback, so it knows when the wheels
-//!   have reached the target angle and stops driving. This is what makes
-//!   the wheels return to straight — when XTE is zero AND heading error
-//!   is zero, desired_angle is zero, and the inner loop straightens up.
+//! ```text
+//!   angle_error = desired_angle - actual_angle
+//!   pwm = clamp(Kp_angle × angle_error, ±max_pwm)
+//!   if |pwm| > 0: pwm = sign(pwm) × max(|pwm|, min_pwm)  // stall-torque boost
+//! ```
+//!
+//! An angle deadband (default 2°) prevents hunting around the target. The
+//! min_pwm floor (default 100) is there because the Trimble EZ-Steer
+//! direct-drive motor stalls below that PWM against hydraulic steering
+//! resistance. The deadband makes sure the floor doesn't produce bang-bang.
 //!
 //! ## Sign convention
 //!
 //!   - Positive XTE = vehicle is RIGHT of the line
+//!   - Positive heading_error = nose pointed RIGHT of line bearing
 //!   - Positive angle = wheels turned RIGHT
 //!   - Positive PWM = motor steers RIGHT (before motor_invert)
-//!   - So: positive XTE → negative desired angle (steer LEFT to correct)
 //!
 //! ## Safety
 //!
-//! The ESP32 motor firmware has a 500ms watchdog — if it doesn't receive a
-//! `$FINNSTEER` command within 500ms, it kills the motor. The GUI sends
-//! commands at ~20Hz (throttled in app.rs), keeping the watchdog fed.
-//!
-//! PC-side safety:
+//! PC-side:
 //! - Auto-disengage if GPS fix age exceeds `max_fix_age_secs`
 //! - WAS data loss: warning after `was_warn_secs`, disengage after `was_disengage_secs`
-//! - PWM clamped to `max_pwm` (never sends full 255 unless configured to)
-//! - Motor stall compensation: output boosted to `min_pwm` (default 100) if non-zero,
-//!   because the Trimble EZ-Steer direct-drive motor stalls below ~100 PWM against
-//!   hydraulic steering resistance. Inner loop angle deadband prevents bang-bang.
-//! - Speed gate: no steering below minimum speed
+//! - Speed gate: no steering below `min_speed`
+//! - Max steering angle clamp (`max_steer_angle`)
+//! - Motor stall compensation floor + deadband (prevents bang-bang)
+//!
+//! Firmware-side: 500 ms motor watchdog — PC must send $FINNSTEER at >= 2 Hz.
 
 use std::time::Instant;
 
 /// Steering controller state.
 pub struct SteeringController {
-    // === Outer loop: XTE → desired steering angle ===
+    // === Outer loop: pure pursuit ===
 
-    /// Outer loop gain: degrees of desired steering angle per metre of XTE.
-    /// Higher = more aggressive line-seeking.
-    /// 30.0 means 1m off-line → command 30° of steering.
-    pub kp: f64,
+    /// Base lookahead distance (metres). This is the floor of the lookahead
+    /// distance — what the controller uses at standstill or very low speed.
+    /// Smaller values make the controller look closer, producing sharper
+    /// corrections when already near the line. Larger values smooth out
+    /// corrections but slow line acquisition.
+    ///
+    /// This maps to the UI's "Online Aggression" slider — a smaller
+    /// `lookahead_base` = higher online aggression.
+    pub lookahead_base: f64,
 
-    /// Heading error gain: degrees of desired steering angle per degree of
-    /// heading error. This is the key term that prevents diagonal approach.
-    /// Without it, the controller straightens the wheels when XTE→0 but
-    /// the tractor is still pointed at an angle to the line, causing it to
-    /// drive through and overshoot. With it, the controller keeps turning
-    /// until the tractor is both on the line AND pointed along it.
-    /// 0.5 means 10° off the line bearing → add 5° of desired steering.
-    /// Range: 0.0 (disabled, pure XTE) to ~1.5 (very heading-aggressive).
-    pub kh: f64,
+    /// Speed-scaled lookahead coefficient (seconds). At working speed, the
+    /// controller adds `speed × lookahead_speed_factor` metres to the base
+    /// lookahead distance. Physically, this is the time-horizon the
+    /// controller aims at: at `lookahead_speed_factor = 1.0` and 3 m/s
+    /// speed, the lookahead reaches 3 m further ahead than at standstill.
+    ///
+    /// Smaller values keep the controller aggressive even at speed (short
+    /// lookahead while moving fast). Larger values make the controller
+    /// gentler at speed. Maps to the UI's "Approach Aggression" slider —
+    /// a smaller `lookahead_speed_factor` = higher approach aggression.
+    pub lookahead_speed_factor: f64,
+
+    /// Tractor wheelbase in metres. Used in the pure-pursuit bicycle-model
+    /// curvature calculation. Not a tuning knob — measure your tractor.
+    /// Default 2.8 m is typical for a mid-size utility tractor.
+    pub wheelbase_m: f64,
 
     /// Maximum desired steering angle (degrees). Caps how hard the outer
-    /// loop can command a turn, even when far off-line.
+    /// loop can command a turn, even when far off-line or badly misaligned.
     pub max_steer_angle: f64,
 
     // === Inner loop: angle error → motor PWM ===
 
     /// Inner loop gain: PWM per degree of angle error.
-    /// Controls how aggressively the motor drives to reach the desired angle.
     /// Must be high enough that realistic angle errors (5-15°) produce PWM
-    /// above min_pwm (80), otherwise the motor won't move for small corrections.
-    /// At 10.0: 8° error → 80 PWM (motor starts moving).
-    /// At 4.0: 20° error needed → motor basically never moves for fine corrections.
+    /// above min_pwm, otherwise the motor won't move for small corrections.
+    /// At 10.0: 8° error → 80 PWM; 10° error → 100 PWM.
     pub kp_angle: f64,
 
     /// Maximum PWM magnitude the controller will output.
     pub max_pwm: i16,
 
-    /// Minimum PWM to overcome steering resistance. The Trimble EZ-Steer
-    /// is a direct-drive motor on the steering column — no gears, no
-    /// backlash. The hydraulic steering resistance stalls the motor below
-    /// this PWM. Any non-zero output is boosted to at least this value so
-    /// the motor actually moves. Hysteresis on the inner loop angle error
-    /// prevents bang-bang oscillation (see `angle_deadband_deg`).
+    /// Minimum PWM to overcome steering resistance. The Trimble EZ-Steer is
+    /// direct-drive; hydraulic steering resistance stalls the motor below
+    /// this value. Any non-zero output is boosted to at least this so the
+    /// motor actually moves.
     pub min_pwm: i16,
 
     /// Inner loop angle deadband in degrees. When the angle error is below
-    /// this threshold, the motor outputs zero — the wheels are "close enough"
-    /// to the desired angle. This prevents the motor from hunting back and
-    /// forth when near the target. Without this, the min_pwm boost creates
-    /// a bang-bang controller: any tiny angle error gets boosted to ±min_pwm,
-    /// the motor overshoots, the error flips sign, and it slams the other way.
-    /// With a 2° deadband, the motor only fires when the wheels are genuinely
-    /// off-target, and stops when they're within 2° of where they should be.
+    /// this threshold, the motor outputs zero. Prevents the min_pwm boost
+    /// from creating bang-bang oscillation near the target.
     pub angle_deadband_deg: f64,
 
-    /// Deadband in metres. XTE below this produces zero desired angle.
-    /// Prevents the motor from hunting when already on the line.
+    /// XTE deadband in metres. When the tractor is within this of the line
+    /// AND heading error is small, the outer loop commands straight wheels
+    /// instead of trying to correct micro-offsets (which GPS noise would
+    /// drive the motor to chase).
     pub deadband_m: f64,
 
     /// Whether auto-steer is currently engaged.
@@ -134,11 +166,9 @@ pub struct SteeringController {
     last_was_time: Option<Instant>,
 
     /// WAS age (seconds) that triggers a warning (but keeps steering).
-    /// Uses the last known angle — the inner loop still works.
     pub was_warn_secs: f64,
 
     /// WAS age (seconds) that triggers full disengage.
-    /// If we truly lose the sensor for this long, stop steering.
     pub was_disengage_secs: f64,
 
     /// Whether WAS data is currently stale (for UI warning display).
@@ -158,6 +188,9 @@ pub struct SteeringController {
     /// The last heading error in degrees (for display).
     pub last_heading_error: f64,
 
+    /// The last lookahead distance used (for display).
+    pub last_lookahead_m: f64,
+
     /// Reason for last disengage (for UI display).
     pub disengage_reason: Option<String>,
 }
@@ -165,14 +198,24 @@ pub struct SteeringController {
 impl SteeringController {
     pub fn new() -> Self {
         Self {
-            kp: 30.0,
-            kh: 0.5,
+            // Pure pursuit defaults.
+            // lookahead_base = 3.0 m: moderately aggressive when on the line.
+            // lookahead_speed_factor = 1.0 s: at 3 m/s speed, L = 6 m (gentle).
+            // Operator-facing sliders expose these as "Online Aggression"
+            // and "Approach Aggression" with inverted scales (higher number
+            // on slider = more aggressive = shorter lookahead).
+            lookahead_base: 3.0,
+            lookahead_speed_factor: 1.0,
+            wheelbase_m: 2.8,
             max_steer_angle: 15.0,
+
+            // Inner loop unchanged from previous controller.
             kp_angle: 10.0,
             max_pwm: 180,
             min_pwm: 100,
             angle_deadband_deg: 2.0,
             deadband_m: 0.03,
+
             engaged: false,
             min_speed: 0.5,
             max_fix_age_secs: 2.0,
@@ -185,6 +228,7 @@ impl SteeringController {
             last_desired_angle: 0.0,
             last_actual_angle: 0.0,
             last_heading_error: 0.0,
+            last_lookahead_m: 0.0,
             disengage_reason: None,
         }
     }
@@ -233,10 +277,8 @@ impl SteeringController {
         if let Some(was_time) = self.last_was_time {
             let was_age = was_time.elapsed().as_secs_f64();
             if was_age > self.was_disengage_secs {
-                // Truly lost — disengage
                 return Some("WAS data lost".to_string());
             } else if was_age > self.was_warn_secs {
-                // Stale but not lost — flag warning, keep steering with last known angle
                 self.was_stale = true;
             }
         } else {
@@ -246,19 +288,23 @@ impl SteeringController {
         None
     }
 
-    /// Compute the steering PWM output using two-loop control.
+    /// Compute the steering PWM output using pure pursuit + WAS-feedback control.
     ///
     /// Call this every GUI frame.
     ///
-    /// `xte_m`: cross-track error in metres (positive = right of line)
-    /// `heading_error_deg`: heading error in degrees (positive = pointed right of line bearing)
-    /// `speed_mps`: current vehicle speed in m/s
-    /// `actual_angle_deg`: current steering angle from WAS (negative = left, positive = right).
-    ///                     Pass None if WAS is not calibrated (shouldn't happen if engage
-    ///                     preconditions are met, but handled gracefully).
+    /// - `xte_m`: cross-track error in metres (positive = right of line)
+    /// - `heading_error_deg`: heading error in degrees (positive = pointed right of line bearing)
+    /// - `speed_mps`: current vehicle speed in m/s
+    /// - `actual_angle_deg`: current steering angle from WAS
     ///
-    /// Returns (pwm, disengaged_this_frame)
-    pub fn compute(&mut self, xte_m: f64, heading_error_deg: f64, speed_mps: f64, actual_angle_deg: Option<f64>) -> (i16, bool) {
+    /// Returns (pwm, disengaged_this_frame).
+    pub fn compute(
+        &mut self,
+        xte_m: f64,
+        heading_error_deg: f64,
+        speed_mps: f64,
+        actual_angle_deg: Option<f64>,
+    ) -> (i16, bool) {
         if !self.engaged {
             self.last_output_pwm = 0;
             return (0, false);
@@ -276,37 +322,44 @@ impl SteeringController {
             return (0, false);
         }
 
-        // === Outer loop: XTE + heading error → desired steering angle ===
-        //
-        // Two terms work together:
-        //   -kp * xte: drives toward the line (proportional to distance off)
-        //   kh * heading_error: aligns with the line bearing
-        //
-        // Without kh: as XTE→0 the controller commands "straighten up", but
-        // if the tractor approached at an angle (say 15°), "straight wheels"
-        // means driving a straight line AT 15° TO THE AB LINE. The tractor
-        // punches through and overshoots. This was causing our tractor to
-        // grab the next AB line and drive perpendicular.
-        //
-        // With kh: the controller keeps turning until BOTH errors are small.
-        // The heading term naturally damps the approach — as the tractor
-        // aligns with the line, both terms go to zero together.
-        //
-        // Sign: positive heading_error = pointed right of line bearing.
-        // kh * positive_heading_error = positive desired angle = steer right.
-        // But we want to steer LEFT to correct rightward heading error, so
-        // we SUBTRACT: -kh * heading_error (same sign logic as XTE term).
         self.last_heading_error = heading_error_deg;
 
-        let desired_angle = if xte_m.abs() < self.deadband_m && heading_error_deg.abs() < 2.0 {
-            // Within deadband for both XTE and heading — target straight ahead.
-            // Heading threshold of 2° prevents hunting when well-aligned.
+        // === Outer loop: pure pursuit geometry ===
+        //
+        // Lookahead distance scales with speed. At standstill the controller
+        // looks `lookahead_base` ahead; at speed it looks further. Clamped to
+        // [2, 15] m to keep the geometry sane in all conditions.
+        let lookahead_m = (self.lookahead_base
+            + self.lookahead_speed_factor * speed_mps)
+            .clamp(2.0, 15.0);
+        self.last_lookahead_m = lookahead_m;
+
+        // Pure-pursuit target bearing (`alpha`) relative to the tractor's
+        // current heading. Closed-form derivation from XTE + heading error,
+        // as described in the module docstring.
+        //
+        // Sign: XTE positive = right of line. To pull back to the line, the
+        // lookahead point must be to the LEFT of the tractor (bearing < 0).
+        // We use -xte_m in the atan2 so positive XTE yields negative alpha.
+        let psi_rad = heading_error_deg.to_radians();
+        let alpha_line_frame = (-xte_m).atan2(lookahead_m);
+        let alpha_rad = alpha_line_frame - psi_rad;
+
+        // Deadband: if both XTE and heading are inside the deadband, command
+        // straight wheels. Prevents GPS-noise-driven micro-corrections from
+        // chasing the motor when we're already on the line.
+        let desired_angle = if xte_m.abs() < self.deadband_m
+            && heading_error_deg.abs() < 2.0
+        {
             0.0
         } else {
-            // XTE term: positive XTE (right of line) → negative desired angle (steer left)
-            // Heading term: positive heading error (pointed right) → negative desired angle (steer left)
-            let raw = -self.kp * xte_m - self.kh * heading_error_deg;
-            raw.clamp(-self.max_steer_angle, self.max_steer_angle)
+            // Bicycle model: wheel angle that curves the vehicle through
+            // the lookahead point.
+            //   delta = atan2(2 · L_w · sin(alpha), L)
+            let delta_rad = (2.0 * self.wheelbase_m * alpha_rad.sin())
+                .atan2(lookahead_m);
+            let delta_deg = delta_rad.to_degrees();
+            delta_deg.clamp(-self.max_steer_angle, self.max_steer_angle)
         };
 
         self.last_desired_angle = desired_angle;
@@ -317,12 +370,7 @@ impl SteeringController {
 
         let angle_error = desired_angle - actual;
 
-        // Inner loop angle deadband: if the wheels are within angle_deadband_deg
-        // of the target, output zero. This prevents hunting — without it, the
-        // min_pwm boost turns any tiny angle error into a ±100 PWM slam, the
-        // motor overshoots by a degree, the error flips sign, and it slams
-        // back. The deadband gives the motor a "close enough" zone where it
-        // stops and lets the tractor settle.
+        // Angle deadband — prevents bang-bang hunting around the target.
         if angle_error.abs() < self.angle_deadband_deg {
             self.last_output_pwm = 0;
             return (0, false);
@@ -331,13 +379,9 @@ impl SteeringController {
         let raw_pwm = self.kp_angle * angle_error;
         let clamped = (raw_pwm.round() as i16).clamp(-self.max_pwm, self.max_pwm);
 
-        // Motor stall torque compensation: the Trimble EZ-Steer is direct-drive
-        // on the steering column with no gears. The hydraulic steering resistance
-        // stalls the motor below ~100 PWM. Any non-zero output is boosted to at
-        // least min_pwm so the motor can overcome the resistance and actually
-        // turn the wheels. The angle deadband above prevents this boost from
-        // creating bang-bang oscillation — the motor only fires when the wheels
-        // are genuinely off-target (>2°), and stops when close enough.
+        // Motor stall torque compensation: non-zero output gets boosted to
+        // at least min_pwm so the direct-drive motor actually moves against
+        // hydraulic steering resistance.
         let output = if clamped == 0 {
             0
         } else if clamped > 0 {
@@ -348,5 +392,91 @@ impl SteeringController {
 
         self.last_output_pwm = output;
         (output, false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn engaged_controller() -> SteeringController {
+        let mut c = SteeringController::new();
+        // Bypass the safety gates by forging recent fix/WAS timestamps.
+        c.last_fix_time = Some(Instant::now());
+        c.last_was_time = Some(Instant::now());
+        c.engaged = true;
+        c
+    }
+
+    #[test]
+    fn test_on_line_aligned_commands_straight() {
+        // XTE = 0, heading error = 0 → desired angle = 0 → no motor output.
+        let mut c = engaged_controller();
+        c.angle_deadband_deg = 2.0;
+        let (pwm, dis) = c.compute(0.0, 0.0, 2.0, Some(0.0));
+        assert!(!dis);
+        assert_eq!(pwm, 0);
+        assert!(c.last_desired_angle.abs() < 0.01);
+    }
+
+    #[test]
+    fn test_right_of_line_steers_left() {
+        // Positive XTE (right of line), aligned heading → should command
+        // a negative wheel angle (steer left).
+        let mut c = engaged_controller();
+        let (_pwm, _dis) = c.compute(1.0, 0.0, 2.0, Some(0.0));
+        assert!(c.last_desired_angle < 0.0,
+            "Right of line should command left steering, got {}",
+            c.last_desired_angle);
+    }
+
+    #[test]
+    fn test_left_of_line_steers_right() {
+        let mut c = engaged_controller();
+        let (_pwm, _dis) = c.compute(-1.0, 0.0, 2.0, Some(0.0));
+        assert!(c.last_desired_angle > 0.0,
+            "Left of line should command right steering, got {}",
+            c.last_desired_angle);
+    }
+
+    #[test]
+    fn test_heading_error_alone_commands_correction() {
+        // On the line but pointed right of the bearing → should steer left.
+        let mut c = engaged_controller();
+        let (_pwm, _dis) = c.compute(0.0, 10.0, 2.0, Some(0.0));
+        assert!(c.last_desired_angle < 0.0,
+            "Pointed right of line should command left steer, got {}",
+            c.last_desired_angle);
+    }
+
+    #[test]
+    fn test_max_steer_clamp() {
+        // Huge XTE should clamp to max_steer_angle, not exceed it.
+        let mut c = engaged_controller();
+        c.max_steer_angle = 15.0;
+        let (_pwm, _dis) = c.compute(50.0, 0.0, 2.0, Some(0.0));
+        assert!(c.last_desired_angle.abs() <= 15.0 + 0.01,
+            "Desired angle {} exceeds max", c.last_desired_angle);
+    }
+
+    #[test]
+    fn test_lookahead_scales_with_speed() {
+        let mut c = engaged_controller();
+        c.lookahead_base = 3.0;
+        c.lookahead_speed_factor = 1.0;
+        c.compute(1.0, 0.0, 0.0, Some(0.0));
+        let l_slow = c.last_lookahead_m;
+        c.compute(1.0, 0.0, 5.0, Some(0.0));
+        let l_fast = c.last_lookahead_m;
+        assert!(l_fast > l_slow,
+            "Lookahead should grow with speed: {} vs {}", l_slow, l_fast);
+    }
+
+    #[test]
+    fn test_speed_gate_kills_output() {
+        let mut c = engaged_controller();
+        c.min_speed = 0.5;
+        let (pwm, _dis) = c.compute(2.0, 10.0, 0.1, Some(0.0));
+        assert_eq!(pwm, 0, "Below min speed should output 0");
     }
 }

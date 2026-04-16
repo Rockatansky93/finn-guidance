@@ -26,6 +26,7 @@ data/coverage.db
 data/coverage.db-journal
 data/coverage.db-wal
 data/coverage.db-shm
+pc/data/coverage.db
 
 # Exported AB line JSON (transient, for cross-PC transfer)
 data/finn_ab_lines.json

@@ -856,3 +856,184 @@ on steering activity (rejected: complexity without clear benefit — fixed 10Hz 
 simple and adequate), moving serial I/O to a separate thread (rejected: the serial
 read is already on its own thread; the lag was from message volume overwhelming the
 GUI frame budget, which is fixed by sending less).
+
+---
+
+## #023 — Pure pursuit outer loop (replaces XTE+heading PD controller)
+**Date:** 16 April 2026
+**Context:** Fourth field test with the two-loop PD controller (#020, #021, #022)
+revealed that the tractor was hunting the line rather than tracking parallel to it.
+As XTE approached zero, the motor was increasing its turn rather than decreasing —
+the classic oscillation pattern of a position-error controller regulating through
+two integrators (wheel angle → heading → lateral position) with insufficient
+damping.
+
+**Root cause:** The `-Kp·XTE - Kh·heading_error` formulation weighted two competing
+terms against each other. At the defaults (Kp=30, Kh=0.5), 1 m of XTE had the same
+control authority as 60° of heading error — but realistic driving produces XTEs
+of 0.1–0.5 m and heading errors of 3–10°. The XTE term dominated by ~36×, so the
+heading term couldn't provide meaningful damping as XTE crossed zero. Result:
+tractor arrives at the line with substantial heading error, XTE term winds down,
+heading term is too weak to counter-steer, tractor sails through, develops
+negative XTE, hunt cycle begins.
+
+**Structural problem:** Regulating lateral position through two integrators with
+pure P gain on position error is unconditionally oscillatory without strong rate
+damping. Commercial guidance systems (Trimble AgGPS, John Deere StarFire, AgLeader,
+AgOpenGPS) don't use this topology — they use pure pursuit or Stanley control,
+which reformulate the problem from "error → correction" to "geometry → trajectory."
+
+**Decision:** Replace the PD outer loop with pure pursuit. The inner loop (WAS
+feedback → PWM with min_pwm floor and angle deadband) is unchanged.
+
+Pure pursuit selects a lookahead point on the AB line some distance `L` ahead of
+the tractor's projection onto the line, then commands the wheel angle that would
+curve the bicycle-model vehicle through that point:
+
+```
+L = lookahead_base + lookahead_speed_factor × speed
+alpha = atan2(-xte, L) - heading_error    [closed form, line-frame geometry]
+desired_angle = atan2(2 · wheelbase · sin(alpha), L)
+desired_angle = clamp(desired_angle, ±max_steer_angle)
+```
+
+**Why this topology works:** XTE and heading error are captured in a single
+geometric quantity (`alpha`) — they can't fight each other because they're two
+views of the same thing (the bearing to the lookahead point). The controller is
+inherently damped: as the tractor approaches the line, both XTE and heading
+naturally go to zero together, and the lookahead-based curvature command smoothly
+tapers rather than snapping at XTE=0. No Kp/Kh balance to get wrong.
+
+**Parameters replaced:**
+- Removed: `kp` (°/m), `kh` (°/°)
+- Added: `lookahead_base` (m, default 3.0), `lookahead_speed_factor` (s, default
+  1.0), `wheelbase_m` (m, default 2.8 — tractor-specific, not a tuning knob)
+- Kept: `max_steer_angle`, `kp_angle`, `max_pwm`, `min_pwm`, `angle_deadband_deg`,
+  `deadband_m` — all inner-loop parameters work identically
+
+**Operator-facing UI:** The two pure-pursuit lookahead parameters are exposed
+as sliders labelled "Approach Aggression" and "Online Aggression", each with a
+1–10 range where higher = more aggressive (shorter lookahead). This inverts the
+underlying math (smaller lookahead = crisper/more aggressive) to give intuitive
+tuning. The slider labels show the internal value in physical units so the
+operator can learn the mapping:
+- Approach Aggression → `lookahead_speed_factor`: slider 1 = 3.0 s time-horizon
+  (very gentle), slider 7 = 1.2 s (balanced default), slider 10 = 0.3 s (aggressive)
+- Online Aggression → `lookahead_base`: slider 1 = 7.5 m (very smooth), slider 5
+  = 5.1 m (balanced default), slider 10 = 2.1 m (crisp)
+
+The live computed lookahead (`base + speed × factor`) is displayed on both the
+working-page overlay (`L:N.Nm`) and the setup page AUTO-STEER section, so the
+operator can see the lookahead expand with speed and understand how the
+controller is framing the problem at any moment.
+
+**Config key migration:** Old `steer_kp` and `steer_kh` keys are ignored (left
+in SQLite config table as harmless dead data). New keys: `steer_lookahead_base`,
+`steer_lookahead_speed_factor`, `steer_wheelbase`. `steer_max_angle` and
+`steer_kp_angle` are retained. `steer_kp_angle` default bumped 4.0 → 10.0 to
+match the new controller's expected angle-error magnitudes (pure pursuit
+produces smaller commanded angles for the same XTE than the old Kp=30 did).
+
+**Alternatives considered:**
+- Stanley controller (rejected: Stanley's `atan(k·XTE/speed)` term divides by
+  speed and misbehaves near standstill; pure pursuit is well-defined at any
+  speed with its base lookahead floor)
+- Retuning the PD controller (rejected: structural oscillation, not a tuning
+  issue — would recur under any parameter choice)
+- Reinforcement learning (rejected for now: policy is trivial — "drive along
+  the line" — so the right fix is better sensing and geometry, not a learned
+  policy. Reconsider in Phase 7 if vehicle-specific refinements need learning)
+
+---
+
+## #024 — Fused heading filter (IMU + GPS complementary filter)
+**Date:** 16 April 2026
+**Context:** Investigation of the hunting behaviour in #023 revealed a deeper
+problem with the heading signal itself. The steering controller was consuming
+`fix.heading` from GPS VTG course-over-ground, which has three compounding
+defects:
+
+1. **Rate-limited to 1 Hz** — the LC29H DA firmware caps at 1 Hz (Decision #008).
+   Between fixes, heading is frozen. At 30 fps the outer loop computes the same
+   heading error 30 times in a row.
+2. **Noisy at low speed** — GPS COG is derived from successive position deltas.
+   At 5 km/h (1.4 m/s) the tractor moves ~1.4 m per fix, while standalone GPS
+   position noise is ±30–50 cm per fix. The bearing between two noisy points
+   separated by ~1 m can wobble by ±10–20°.
+3. **Stale after turns** — because the interpolator dead-reckons position forward
+   using `fix.heading`, turning the tractor leaves the projected heading behind
+   for up to 1 s.
+
+Meanwhile, a BNO055 IMU was physically installed, its data was being parsed into
+`latest_imu` at 10 Hz, and its heading was being displayed in the SENSORS panel —
+but it was never fed into any guidance calculation. The best heading source on
+the tractor was serving as a dashboard gauge.
+
+**Decision:** Add a `HeadingFilter` (new module `pc/src/position/heading_filter.rs`)
+that fuses BNO055 IMU yaw with GPS COG using a complementary filter. The fused
+heading is passed as an `override_heading` parameter to `PositionInterpolator`
+and thereby overrides `fix.heading` for all downstream guidance calculations
+(AB line error, pure-pursuit alpha, field view rotation).
+
+**Filter structure:**
+```
+On each IMU sample:
+  dt = now - last_imu_time
+  imu_yaw_rate = wrap_diff(imu_heading - prev_imu_heading) / dt
+  predicted = wrap(fused + imu_yaw_rate · dt)
+  fused ← predicted
+
+On each GPS fix (speed ≥ 0.8 m/s):
+  diff = wrap_diff(gps_cog - fused)
+  fused ← wrap(fused + (1 - alpha) · diff)   [alpha = 0.98]
+```
+
+The `alpha = 0.98` constant means ~2% pull toward GPS COG per fix. With GPS at
+1 Hz, this means the filter's long-term heading anchor is GPS, but it runs at
+IMU rate (10 Hz) between fixes — giving clean, high-frequency heading response
+with no long-term drift.
+
+**Gating:**
+- **IMU trusted only if `cal_sys ≥ 2`** (BNO055 system calibration metric).
+  Below this, the magnetometer reference isn't trustworthy. Filter falls back
+  to GPS COG only (no IMU prediction contribution).
+- **GPS COG trusted only if `speed ≥ 0.8 m/s`** (~2.9 km/h). At lower speed,
+  COG is noise. Filter holds on IMU prediction only at standstill / creep.
+- **Neither source available → fused heading is `None`** and the interpolator
+  falls back to the old behaviour (using the stale `fix.heading` from the last
+  real GPS sample).
+
+**UI:** A new line in the SENSORS panel shows the fused heading with a colour
+code:
+- Green "`Fused heading: N.N° (IMU+GPS)`" — both sources active
+- Amber "`Fused heading: N.N° (GPS only — IMU not calibrated)`" — filter is
+  operating but degraded. Operator is prompted to run the BNO055 calibration
+  dance (figure-eight motions until cal_sys = 2+)
+
+**Wrap-around handling:** All heading math uses `wrap_diff()` (returns signed
+shortest-path difference in -180..+180) and `normalise_360()` helpers. Avoids
+the classic bug where 5° and 355° appear 350° apart instead of 10°.
+
+**Interpolator change:** `PositionInterpolator::interpolate()` gained an
+`override_heading: Option<f64>` parameter. When supplied, it replaces `fix.heading`
+for both the dead-reckon projection direction AND in the returned synthetic fix's
+`heading` field. This means position tracking during turns is now correct (no
+1-second lag) and all downstream consumers see the fused heading transparently.
+
+**Why complementary filter, not Kalman:** A Kalman filter would require process
+and measurement noise covariances that we'd need to measure or guess. The
+complementary filter achieves ~95% of the benefit with zero tuning, using only
+the IMU calibration gate and the speed gate as state transitions. We can upgrade
+later if telemetry reveals a need.
+
+**Alternatives considered:**
+- Use IMU heading directly when calibrated, ignore GPS (rejected: IMU heading
+  drifts with magnetometer interference — GPS provides long-term anchoring)
+- Kalman filter with proper covariances (rejected: premature optimisation;
+  complementary filter is good enough and has fewer knobs to get wrong)
+- Integrate raw gyro rate from the BNO055 separately (rejected: the firmware
+  sends BNO055's fused heading, not raw gyro; differentiating the fused heading
+  gives us yaw rate for free without firmware changes)
+- Run the filter on the ESP32 (rejected: calibration gating, GPS COG delivery,
+  and the fused output all live on the PC anyway — keeping filter logic PC-side
+  is simpler and doesn't require re-flashing to tune)

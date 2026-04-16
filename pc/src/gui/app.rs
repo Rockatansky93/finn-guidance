@@ -20,6 +20,7 @@ use crate::guidance::steering::SteeringController;
 use crate::coverage::logger::CoverageLogger;
 use crate::coverage::db::{CoverageDb, SavedField, SavedAbLine};
 use crate::position::interpolator::PositionInterpolator;
+use crate::position::heading_filter::HeadingFilter;
 use super::field_view::FieldView;
 
 /// Target frame interval — 30fps is smooth for guidance display while
@@ -51,6 +52,10 @@ pub struct GuidanceApp {
     current_fix: Option<GpsFix>,
     /// Position interpolator for smooth GUI updates between 1Hz fixes
     interpolator: PositionInterpolator,
+    /// Fused heading filter — blends IMU yaw with GPS COG for a clean heading
+    /// at 10 Hz (vs GPS COG alone at 1 Hz with low-speed noise). Overrides
+    /// `fix.heading` everywhere downstream.
+    heading_filter: HeadingFilter,
     /// The display fix — either interpolated (when moving) or real (when stopped).
     /// Used for field view, guidance, lightbar. Updated every frame.
     display_fix: Option<GpsFix>,
@@ -90,7 +95,7 @@ pub struct GuidanceApp {
     motor_test_msg: Option<(String, u32)>,
 
     // --- Auto-steer ---
-    /// Steering controller (PID / proportional control)
+    /// Steering controller — pure pursuit outer loop + WAS-feedback inner loop
     steering: SteeringController,
     /// Status message for auto-steer events (shown on working page)
     steer_status_msg: Option<(String, u32)>,
@@ -180,16 +185,21 @@ impl GuidanceApp {
             .map(|v| v == "true")
             .unwrap_or(false);
 
-        // Load steering controller gains from database
-        let steer_kp = db.as_ref()
-            .and_then(|d| d.get_config("steer_kp"))
+        // Load pure-pursuit steering parameters from database.
+        // Note: pre-pure-pursuit databases may have `steer_kp` / `steer_kh`
+        // stored — those keys are now ignored and left in place (harmless).
+        let lookahead_base = db.as_ref()
+            .and_then(|d| d.get_config("steer_lookahead_base"))
             .and_then(|v| v.parse::<f64>().ok())
-            .and_then(|v| if v > 50.0 { None } else { Some(v) }) // ignore old PWM/m values
-            .unwrap_or(30.0);
-        let steer_kh = db.as_ref()
-            .and_then(|d| d.get_config("steer_kh"))
+            .unwrap_or(3.0);
+        let lookahead_speed_factor = db.as_ref()
+            .and_then(|d| d.get_config("steer_lookahead_speed_factor"))
             .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.5);
+            .unwrap_or(1.0);
+        let steer_wheelbase = db.as_ref()
+            .and_then(|d| d.get_config("steer_wheelbase"))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(2.8);
         let steer_max_angle = db.as_ref()
             .and_then(|d| d.get_config("steer_max_angle"))
             .and_then(|v| v.parse::<f64>().ok())
@@ -197,7 +207,7 @@ impl GuidanceApp {
         let steer_kp_angle = db.as_ref()
             .and_then(|d| d.get_config("steer_kp_angle"))
             .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(4.0);
+            .unwrap_or(10.0);
 
         // Auto-load last-used AB line on startup
         let mut guide = AbLineGuide::new(implement_width);
@@ -218,6 +228,7 @@ impl GuidanceApp {
             finn_rx,
             current_fix: None,
             interpolator: PositionInterpolator::new(),
+            heading_filter: HeadingFilter::new(),
             display_fix: None,
             guide,
             current_error: None,
@@ -237,8 +248,9 @@ impl GuidanceApp {
             motor_test_msg: None,
             steering: {
                 let mut s = SteeringController::new();
-                s.kp = steer_kp;
-                s.kh = steer_kh;
+                s.lookahead_base = lookahead_base;
+                s.lookahead_speed_factor = lookahead_speed_factor;
+                s.wheelbase_m = steer_wheelbase;
                 s.max_steer_angle = steer_max_angle;
                 s.kp_angle = steer_kp_angle;
                 s
@@ -323,6 +335,10 @@ impl eframe::App for GuidanceApp {
             // Feed the interpolator with the true position
             self.interpolator.update_fix(&fix);
 
+            // Feed the heading filter with the GPS course-over-ground (speed-gated
+            // internally — ignored at low speed where COG is noise).
+            self.heading_filter.update_gps_fix(&fix);
+
             // Add real fix to trail (1Hz is fine for the breadcrumb path)
             self.position_trail.push_back((fix.latitude, fix.longitude));
             if self.position_trail.len() > self.max_trail {
@@ -356,6 +372,8 @@ impl eframe::App for GuidanceApp {
                     self.latest_was = Some(was);
                 }
                 FinnMessage::Imu(imu) => {
+                    // Feed the heading filter — gated by cal_sys internally
+                    self.heading_filter.update_imu(&imu);
                     self.latest_imu = Some(imu);
                 }
                 FinnMessage::SensorHeartbeat(hb) => {
@@ -376,7 +394,13 @@ impl eframe::App for GuidanceApp {
         // Between 1Hz real fixes, the interpolator dead-reckons the position
         // using speed × heading. This makes the vehicle triangle, trail, lightbar,
         // and XTE readout update smoothly instead of jumping once per second.
-        if let Some(interp_fix) = self.interpolator.interpolate() {
+        //
+        // The fused IMU+GPS heading from `heading_filter` is passed in as an
+        // override — this replaces the stale 1 Hz VTG heading with a clean 10 Hz
+        // estimate for both the dead-reckon projection and the guidance
+        // calculation downstream.
+        let fused_heading = self.heading_filter.current_heading();
+        if let Some(interp_fix) = self.interpolator.interpolate(fused_heading) {
             let interp_fix = interp_fix.clone();
 
             // Recalculate guidance error with interpolated position (smooth lightbar/XTE)
@@ -706,12 +730,16 @@ impl GuidanceApp {
 
                 // Auto-steer status indicator (top-left, below lightbar)
                 if self.steering.engaged {
+                    // Show: PWM / Target angle / Actual angle / Heading error / Lookahead
+                    // The L: readout lets the operator see the pure-pursuit lookahead
+                    // stretching with speed — handy for intuition while tuning.
                     let steer_text = format!(
-                        "AUTO-STEER  PWM {}  T:{:.0}° A:{:.0}° H:{:.0}°",
+                        "AUTO-STEER  PWM {}  T:{:.0}° A:{:.0}° H:{:.0}°  L:{:.1}m",
                         self.steering.last_output_pwm,
                         self.steering.last_desired_angle,
                         self.steering.last_actual_angle,
                         self.steering.last_heading_error,
+                        self.steering.last_lookahead_m,
                     );
                     let steer_pos = egui::pos2(overlay_rect.left() + 20.0, overlay_rect.top() + 55.0);
                     let indicator_colour = if self.steering.was_stale {
@@ -1572,6 +1600,28 @@ impl GuidanceApp {
                         ui.label(egui::RichText::new("IMU: no data").size(12.0).weak());
                     }
 
+                    // Fused heading — shows the output of the heading filter
+                    // (IMU + GPS COG blend). If the IMU isn't trusted yet (cal_sys < 2)
+                    // the filter is running on GPS COG alone, which is noisy at low
+                    // speed — signal this clearly.
+                    if let Some(fused) = self.heading_filter.current_heading() {
+                        if self.heading_filter.imu_trusted {
+                            ui.colored_label(
+                                egui::Color32::GREEN,
+                                format!("Fused heading: {:.1}° (IMU+GPS)", fused),
+                            );
+                        } else {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(255, 200, 60),
+                                format!("Fused heading: {:.1}° (GPS only — IMU not calibrated)", fused),
+                            );
+                        }
+                    } else {
+                        ui.label(egui::RichText::new(
+                            "Fused heading: waiting for data"
+                        ).size(11.0).weak());
+                    }
+
                     // Motor
                     if let Some(mtr) = &self.latest_motor {
                         let en_label = if mtr.enabled { "ON" } else { "OFF" };
@@ -1765,13 +1815,19 @@ impl GuidanceApp {
                             egui::RichText::new(format!("● ENGAGED  PWM {}", self.steering.last_output_pwm))
                                 .size(14.0).strong()
                         );
-                        // Show inner loop debug: desired vs actual angle, heading error
+                        // Show inner loop debug: desired vs actual angle, heading error,
+                        // plus the live pure-pursuit lookahead so the operator can see
+                        // it expanding with speed.
                         ui.label(egui::RichText::new(format!(
                             "Target: {:.1}°  Actual: {:.1}°  Hdg err: {:.1}°",
                             self.steering.last_desired_angle,
                             self.steering.last_actual_angle,
                             self.steering.last_heading_error,
                         )).size(12.0));
+                        ui.label(egui::RichText::new(format!(
+                            "Lookahead: {:.1} m",
+                            self.steering.last_lookahead_m,
+                        )).size(12.0).color(egui::Color32::from_rgb(100, 200, 255)));
 
                         // WAS stale warning
                         if self.steering.was_stale {
@@ -1789,47 +1845,116 @@ impl GuidanceApp {
 
                     ui.add_space(6.0);
 
-                    // Outer loop: Kp (XTE → desired angle)
-                    ui.label(egui::RichText::new("Outer loop — line seeking:").size(12.0).strong());
-                    ui.add_space(2.0);
-                    ui.label(egui::RichText::new("Kp (°/m):").size(12.0));
-                    let old_kp = self.steering.kp;
-                    ui.add(egui::Slider::new(&mut self.steering.kp, 5.0..=60.0)
+                    // Outer loop: pure pursuit — two aggression sliders.
+                    //
+                    // These map to the pure-pursuit lookahead distance, inverted so
+                    // higher slider = more aggressive (shorter lookahead). Intuition:
+                    //  • "Approach Aggression" — how firmly the tractor drives toward
+                    //    the line when approaching from the side. Maps to
+                    //    lookahead_speed_factor (seconds). Higher slider = smaller
+                    //    time-horizon = sharper approach.
+                    //  • "Online Aggression" — how firmly the tractor holds the line
+                    //    once near it. Maps to lookahead_base (metres). Higher slider
+                    //    = smaller base distance = crisper corrections on-line.
+                    ui.label(egui::RichText::new("Outer loop — line tracking:").size(12.0).strong());
+                    ui.add_space(4.0);
+
+                    // Slider range 1..=10; higher = more aggressive.
+                    // See mapping helpers below the slider.
+                    //
+                    // Approach Aggression (affects lookahead_speed_factor).
+                    //   internal = (11 - slider) * 0.3
+                    //   slider 1  → 3.0 s (very gentle approach)
+                    //   slider 7  → 1.2 s (balanced — default)
+                    //   slider 10 → 0.3 s (aggressive)
+                    let current_approach_slider: i32 = {
+                        let lsf = self.steering.lookahead_speed_factor;
+                        let s = (11.0 - (lsf / 0.3)).round() as i32;
+                        s.clamp(1, 10)
+                    };
+                    let mut approach_slider = current_approach_slider;
+                    ui.label(egui::RichText::new("Approach Aggression").size(12.0));
+                    ui.add(egui::Slider::new(&mut approach_slider, 1..=10)
                         .step_by(1.0)
-                        .suffix(" °/m")
                     );
-                    if (self.steering.kp - old_kp).abs() > 0.1 {
+                    if approach_slider != current_approach_slider {
+                        self.steering.lookahead_speed_factor = (11 - approach_slider) as f64 * 0.3;
                         if let Some(db) = &self.db {
-                            let _ = db.set_config("steer_kp", &format!("{:.0}", self.steering.kp));
+                            let _ = db.set_config(
+                                "steer_lookahead_speed_factor",
+                                &format!("{:.2}", self.steering.lookahead_speed_factor),
+                            );
                         }
                     }
                     ui.label(egui::RichText::new(
-                        format!("1m off-line → {:.0}° desired turn", self.steering.kp)
+                        format!(
+                            "{:.1} s time-horizon  (higher = sharper line capture)",
+                            self.steering.lookahead_speed_factor,
+                        )
                     ).size(11.0).weak());
 
                     ui.add_space(6.0);
 
-                    // Heading error gain: Kh (heading error → desired angle)
-                    ui.label(egui::RichText::new("Kh (°/°):").size(12.0));
-                    let old_kh = self.steering.kh;
-                    ui.add(egui::Slider::new(&mut self.steering.kh, 0.0..=2.0)
-                        .step_by(0.1)
-                        .suffix(" °/°")
+                    // Online Aggression (affects lookahead_base).
+                    //   internal = (11 - slider) * 0.6 + 1.5
+                    //   slider 1  → 7.5 m (very smooth on line)
+                    //   slider 5  → 5.1 m (balanced — default)
+                    //   slider 10 → 2.1 m (crisp / twitchy)
+                    let current_online_slider: i32 = {
+                        let lb = self.steering.lookahead_base;
+                        let s = (11.0 - ((lb - 1.5) / 0.6)).round() as i32;
+                        s.clamp(1, 10)
+                    };
+                    let mut online_slider = current_online_slider;
+                    ui.label(egui::RichText::new("Online Aggression").size(12.0));
+                    ui.add(egui::Slider::new(&mut online_slider, 1..=10)
+                        .step_by(1.0)
                     );
-                    if (self.steering.kh - old_kh).abs() > 0.01 {
+                    if online_slider != current_online_slider {
+                        self.steering.lookahead_base = (11 - online_slider) as f64 * 0.6 + 1.5;
                         if let Some(db) = &self.db {
-                            let _ = db.set_config("steer_kh", &format!("{:.1}", self.steering.kh));
+                            let _ = db.set_config(
+                                "steer_lookahead_base",
+                                &format!("{:.2}", self.steering.lookahead_base),
+                            );
                         }
                     }
                     ui.label(egui::RichText::new(
-                        format!("10° off bearing → {:.0}° correction", self.steering.kh * 10.0)
+                        format!(
+                            "{:.1} m base lookahead  (higher = crisper on-line holding)",
+                            self.steering.lookahead_base,
+                        )
                     ).size(11.0).weak());
-                    if self.steering.kh < 0.1 {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(255, 200, 60),
-                            egui::RichText::new("⚠ Heading disabled — tractor will overshoot line").size(11.0)
-                        );
+
+                    ui.add_space(4.0);
+
+                    // Live lookahead display (computed lookahead = base + speed × factor)
+                    if self.steering.engaged {
+                        ui.label(egui::RichText::new(
+                            format!("Live lookahead: {:.1} m", self.steering.last_lookahead_m)
+                        ).size(11.0).color(egui::Color32::from_rgb(100, 200, 255)));
                     }
+
+                    ui.add_space(6.0);
+
+                    // Wheelbase — not a tuning knob, but exposed so it can be set
+                    // once per tractor. Pure pursuit uses this in the bicycle-model
+                    // curvature calculation.
+                    ui.label(egui::RichText::new("Wheelbase:").size(12.0));
+                    let old_wb = self.steering.wheelbase_m;
+                    ui.add(egui::Slider::new(&mut self.steering.wheelbase_m, 1.5..=4.5)
+                        .step_by(0.1)
+                        .suffix(" m")
+                    );
+                    if (self.steering.wheelbase_m - old_wb).abs() > 0.01 {
+                        if let Some(db) = &self.db {
+                            let _ = db.set_config("steer_wheelbase",
+                                &format!("{:.2}", self.steering.wheelbase_m));
+                        }
+                    }
+                    ui.label(egui::RichText::new(
+                        "Tractor wheelbase — measure once, don't tune"
+                    ).size(11.0).weak());
 
                     ui.add_space(6.0);
 
