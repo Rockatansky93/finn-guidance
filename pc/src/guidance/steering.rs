@@ -5,12 +5,24 @@
 //! Two nested control loops:
 //!
 //! **Outer loop (GPS → desired steering angle):**
-//!   desired_angle = clamp(-kp_xte × xte_m, ±max_steer_angle)
+//!   desired_angle = clamp(-kp_xte × xte_m + kh × heading_error, ±max_steer_angle)
 //!
-//!   This converts cross-track error (how far off the line we are) into
-//!   a desired wheel angle. Large XTE → large desired angle to get back.
-//!   As the tractor approaches the line, the desired angle reduces toward
-//!   zero, naturally commanding "straighten up" before reaching the line.
+//!   This converts cross-track error (how far off the line we are) AND
+//!   heading error (how far off the line bearing we're pointed) into a
+//!   desired wheel angle. The XTE term drives toward the line; the heading
+//!   term ensures the tractor arrives *aligned* with it, not at an angle.
+//!
+//!   Without heading error: as XTE→0 the controller commands "straighten
+//!   up", but if the tractor approached at an angle it's still pointed
+//!   diagonally. The wheels straighten, the tractor drives through the
+//!   line and keeps going — potentially overshooting into the next pass.
+//!   Traditional systems with this bug produce a weaving wave pattern;
+//!   ours was overshooting so far it grabbed the next AB line and drove
+//!   perpendicular.
+//!
+//!   With heading error: the controller keeps the wheels turned until the
+//!   tractor is both close to the line AND pointed along it. This is
+//!   standard in commercial guidance systems.
 //!
 //! **Inner loop (desired angle vs actual WAS → motor PWM):**
 //!   angle_error = desired_angle - actual_angle
@@ -19,8 +31,8 @@
 //!   This drives the motor to achieve the desired wheel position. It uses
 //!   the WAS (wheel angle sensor) as feedback, so it knows when the wheels
 //!   have reached the target angle and stops driving. This is what makes
-//!   the wheels return to straight — when XTE is zero, desired_angle is
-//!   zero, and if the wheels are still turned, the inner loop corrects.
+//!   the wheels return to straight — when XTE is zero AND heading error
+//!   is zero, desired_angle is zero, and the inner loop straightens up.
 //!
 //! ## Sign convention
 //!
@@ -53,6 +65,16 @@ pub struct SteeringController {
     /// Higher = more aggressive line-seeking.
     /// 30.0 means 1m off-line → command 30° of steering.
     pub kp: f64,
+
+    /// Heading error gain: degrees of desired steering angle per degree of
+    /// heading error. This is the key term that prevents diagonal approach.
+    /// Without it, the controller straightens the wheels when XTE→0 but
+    /// the tractor is still pointed at an angle to the line, causing it to
+    /// drive through and overshoot. With it, the controller keeps turning
+    /// until the tractor is both on the line AND pointed along it.
+    /// 0.5 means 10° off the line bearing → add 5° of desired steering.
+    /// Range: 0.0 (disabled, pure XTE) to ~1.5 (very heading-aggressive).
+    pub kh: f64,
 
     /// Maximum desired steering angle (degrees). Caps how hard the outer
     /// loop can command a turn, even when far off-line.
@@ -118,6 +140,9 @@ pub struct SteeringController {
     /// The last actual steering angle from WAS (for display).
     pub last_actual_angle: f64,
 
+    /// The last heading error in degrees (for display).
+    pub last_heading_error: f64,
+
     /// Reason for last disengage (for UI display).
     pub disengage_reason: Option<String>,
 }
@@ -126,6 +151,7 @@ impl SteeringController {
     pub fn new() -> Self {
         Self {
             kp: 30.0,
+            kh: 0.5,
             max_steer_angle: 25.0,
             kp_angle: 4.0,
             max_pwm: 180,
@@ -142,6 +168,7 @@ impl SteeringController {
             last_output_pwm: 0,
             last_desired_angle: 0.0,
             last_actual_angle: 0.0,
+            last_heading_error: 0.0,
             disengage_reason: None,
         }
     }
@@ -208,13 +235,14 @@ impl SteeringController {
     /// Call this every GUI frame.
     ///
     /// `xte_m`: cross-track error in metres (positive = right of line)
+    /// `heading_error_deg`: heading error in degrees (positive = pointed right of line bearing)
     /// `speed_mps`: current vehicle speed in m/s
     /// `actual_angle_deg`: current steering angle from WAS (negative = left, positive = right).
     ///                     Pass None if WAS is not calibrated (shouldn't happen if engage
     ///                     preconditions are met, but handled gracefully).
     ///
     /// Returns (pwm, disengaged_this_frame)
-    pub fn compute(&mut self, xte_m: f64, speed_mps: f64, actual_angle_deg: Option<f64>) -> (i16, bool) {
+    pub fn compute(&mut self, xte_m: f64, heading_error_deg: f64, speed_mps: f64, actual_angle_deg: Option<f64>) -> (i16, bool) {
         if !self.engaged {
             self.last_output_pwm = 0;
             return (0, false);
@@ -232,13 +260,36 @@ impl SteeringController {
             return (0, false);
         }
 
-        // === Outer loop: XTE → desired steering angle ===
-        let desired_angle = if xte_m.abs() < self.deadband_m {
-            // Within deadband — target straight ahead
+        // === Outer loop: XTE + heading error → desired steering angle ===
+        //
+        // Two terms work together:
+        //   -kp * xte: drives toward the line (proportional to distance off)
+        //   kh * heading_error: aligns with the line bearing
+        //
+        // Without kh: as XTE→0 the controller commands "straighten up", but
+        // if the tractor approached at an angle (say 15°), "straight wheels"
+        // means driving a straight line AT 15° TO THE AB LINE. The tractor
+        // punches through and overshoots. This was causing our tractor to
+        // grab the next AB line and drive perpendicular.
+        //
+        // With kh: the controller keeps turning until BOTH errors are small.
+        // The heading term naturally damps the approach — as the tractor
+        // aligns with the line, both terms go to zero together.
+        //
+        // Sign: positive heading_error = pointed right of line bearing.
+        // kh * positive_heading_error = positive desired angle = steer right.
+        // But we want to steer LEFT to correct rightward heading error, so
+        // we SUBTRACT: -kh * heading_error (same sign logic as XTE term).
+        self.last_heading_error = heading_error_deg;
+
+        let desired_angle = if xte_m.abs() < self.deadband_m && heading_error_deg.abs() < 2.0 {
+            // Within deadband for both XTE and heading — target straight ahead.
+            // Heading threshold of 2° prevents hunting when well-aligned.
             0.0
         } else {
-            // Positive XTE (right of line) → negative desired angle (steer left)
-            let raw = -self.kp * xte_m;
+            // XTE term: positive XTE (right of line) → negative desired angle (steer left)
+            // Heading term: positive heading error (pointed right) → negative desired angle (steer left)
+            let raw = -self.kp * xte_m - self.kh * heading_error_deg;
             raw.clamp(-self.max_steer_angle, self.max_steer_angle)
         };
 

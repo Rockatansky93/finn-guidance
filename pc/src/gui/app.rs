@@ -185,6 +185,10 @@ impl GuidanceApp {
             .and_then(|v| v.parse::<f64>().ok())
             .and_then(|v| if v > 50.0 { None } else { Some(v) }) // ignore old PWM/m values
             .unwrap_or(30.0);
+        let steer_kh = db.as_ref()
+            .and_then(|d| d.get_config("steer_kh"))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.5);
         let steer_kp_angle = db.as_ref()
             .and_then(|d| d.get_config("steer_kp_angle"))
             .and_then(|v| v.parse::<f64>().ok())
@@ -229,6 +233,7 @@ impl GuidanceApp {
             steering: {
                 let mut s = SteeringController::new();
                 s.kp = steer_kp;
+                s.kh = steer_kh;
                 s.kp_angle = steer_kp_angle;
                 s
             },
@@ -380,6 +385,7 @@ impl eframe::App for GuidanceApp {
 
                     let (raw_pwm, disengaged) = self.steering.compute(
                         error.distance_m,
+                        error.heading_error,
                         interp_fix.speed,
                         actual_angle,
                     );
@@ -690,10 +696,11 @@ impl GuidanceApp {
                 // Auto-steer status indicator (top-left, below lightbar)
                 if self.steering.engaged {
                     let steer_text = format!(
-                        "AUTO-STEER  PWM {}  T:{:.0}° A:{:.0}°",
+                        "AUTO-STEER  PWM {}  T:{:.0}° A:{:.0}° H:{:.0}°",
                         self.steering.last_output_pwm,
                         self.steering.last_desired_angle,
                         self.steering.last_actual_angle,
+                        self.steering.last_heading_error,
                     );
                     let steer_pos = egui::pos2(overlay_rect.left() + 20.0, overlay_rect.top() + 55.0);
                     let indicator_colour = if self.steering.was_stale {
@@ -1747,11 +1754,12 @@ impl GuidanceApp {
                             egui::RichText::new(format!("● ENGAGED  PWM {}", self.steering.last_output_pwm))
                                 .size(14.0).strong()
                         );
-                        // Show inner loop debug: desired vs actual angle
+                        // Show inner loop debug: desired vs actual angle, heading error
                         ui.label(egui::RichText::new(format!(
-                            "Target: {:.1}°  Actual: {:.1}°",
+                            "Target: {:.1}°  Actual: {:.1}°  Hdg err: {:.1}°",
                             self.steering.last_desired_angle,
                             self.steering.last_actual_angle,
+                            self.steering.last_heading_error,
                         )).size(12.0));
 
                         // WAS stale warning
@@ -1787,6 +1795,30 @@ impl GuidanceApp {
                     ui.label(egui::RichText::new(
                         format!("1m off-line → {:.0}° desired turn", self.steering.kp)
                     ).size(11.0).weak());
+
+                    ui.add_space(6.0);
+
+                    // Heading error gain: Kh (heading error → desired angle)
+                    ui.label(egui::RichText::new("Kh (°/°):").size(12.0));
+                    let old_kh = self.steering.kh;
+                    ui.add(egui::Slider::new(&mut self.steering.kh, 0.0..=2.0)
+                        .step_by(0.1)
+                        .suffix(" °/°")
+                    );
+                    if (self.steering.kh - old_kh).abs() > 0.01 {
+                        if let Some(db) = &self.db {
+                            let _ = db.set_config("steer_kh", &format!("{:.1}", self.steering.kh));
+                        }
+                    }
+                    ui.label(egui::RichText::new(
+                        format!("10° off bearing → {:.0}° correction", self.steering.kh * 10.0)
+                    ).size(11.0).weak());
+                    if self.steering.kh < 0.1 {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 200, 60),
+                            egui::RichText::new("⚠ Heading disabled — tractor will overshoot line").size(11.0)
+                        );
+                    }
 
                     ui.add_space(6.0);
 

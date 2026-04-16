@@ -719,3 +719,81 @@ is already faster than the GPS update rate), Stanley controller or pure pursuit
 (rejected: these are path-following algorithms that require heading + look-ahead
 distance — overkill for straight AB line following where cross-track error alone
 is sufficient; reconsider for curved guidance lines in future phases).
+
+---
+
+## #021 — Heading error feedforward in outer loop (fixes diagonal overshoot)
+**Date:** 16 April 2026
+**Context:** Second field test with the two-loop controller (#020) revealed a
+fundamental flaw: when the tractor approached the AB line at an angle, the outer
+loop drove XTE toward zero and commanded `desired_angle = 0` ("straighten up").
+But "straight wheels" only means "driving parallel to the line" if the tractor's
+heading already matches the line bearing. If the tractor approached at e.g. 15°,
+straightening the wheels meant driving a straight line AT 15° to the AB line.
+The tractor punched through the line and kept going — overshooting so far that
+auto-pass snapped to the next AB line (12m away), causing the tractor to drive
+perpendicular to all the AB lines.
+
+Traditional guidance systems with only XTE control produce a weaving/wave pattern.
+Ours was worse because the 12m implement width meant the perpendicular overshoot
+exceeded the auto-pass 60% snap threshold (7.2m).
+
+**Root cause:** Pure XTE control has no heading awareness. It knows *how far* off
+the line but not *which direction the tractor is pointed relative to it*.
+
+**Decision:** Add heading error as a feedforward term in the outer loop. The formula
+changed from:
+```
+desired_angle = -Kp × XTE
+```
+to:
+```
+desired_angle = -Kp × XTE - Kh × heading_error
+```
+
+Where `heading_error` is the difference between the tractor's GPS heading (from VTG)
+and the AB line bearing, normalised to ±180°. This was already computed in
+`AbLineGuide::calculate_error()` and returned in `CrossTrackError.heading_error` —
+it just wasn't used by the controller.
+
+**Sign convention:** Positive heading_error = pointed right of line bearing. The `-Kh`
+sign ensures this produces a negative desired angle (steer left to correct), matching
+the XTE term's sign logic.
+
+**New parameter — Kh (heading error gain):**
+- Default: 0.5 °/° (10° off bearing → 5° of desired steering correction)
+- Range: 0.0 (disabled, pure XTE) to 2.0 (very heading-aggressive)
+- Persisted: SQLite config key `steer_kh`, saved on slider change
+- UI: Slider in Setup page AUTO-STEER section, between Kp and Kp_angle
+- Warning: amber label when Kh < 0.1 ("tractor will overshoot line")
+
+**Deadband update:** Previously, the deadband only checked XTE (`xte < deadband_m →
+zero output`). This meant the controller stopped correcting when on-line but still
+pointed diagonally. Now requires BOTH `xte < deadband_m` AND `heading_error < 2°`.
+The 2° heading threshold prevents hunting when well-aligned.
+
+**Display updates:**
+- Working page overlay: `AUTO-STEER  PWM N  T:-X° A:-Y° H:-Z°` (H: = heading error)
+- Setup page engaged status: `Target: X°  Actual: Y°  Hdg err: Z°`
+- `last_heading_error` field added to `SteeringController` for display
+
+**Why this works:** The heading term naturally damps the approach. As the tractor
+turns toward the line, XTE decreases AND heading aligns simultaneously. When both
+are small, `desired_angle → 0` and the wheels straighten — but now "straight" means
+"pointed along the line", not just "wheels centred". This is standard in all
+commercial guidance systems (AgOpenGPS, Trimble, Raven, etc.).
+
+**Tuning guidance:**
+- Start at Kh = 0.5 (conservative)
+- If still overshooting: increase to 0.8, then 1.0, then 1.2
+- If sluggish getting onto line: decrease to 0.3
+- Kh interacts with Kp: high Kh with high Kp may oscillate; reduce Kp first
+- At Kh = 0: behaviour reverts to pure XTE control (the old broken behaviour)
+
+**Alternatives considered:** Stanley controller (rejected: would require a complete
+rewrite of the outer loop architecture; the heading feedforward achieves the same
+core benefit — heading-aware line tracking — with a single additive term),
+derivative term on XTE (rejected: Kd would damp the rate-of-change of XTE, which
+helps with oscillation but doesn't address the fundamental problem of not knowing
+which way the tractor is pointed), look-ahead point tracking (rejected:
+over-engineering for straight AB lines — reconsider for curved guidance).
