@@ -5,55 +5,50 @@
 > Updated at the end of each working session.
 
 ## Last updated
-Session 18 — 16 April 2026 (Heading error feedforward in steering controller)
+Session 18 — 16 April 2026 (Heading error, max steer angle, data rate, min_pwm fix)
 
 ## What we're working on
-**Phase 5 — Two-loop auto-steer controller. Heading error fix for diagonal overshoot.**
+**Phase 5 — Two-loop auto-steer controller. Four field-test issues fixed.**
 
-Second field test revealed a fundamental controller flaw: when the tractor
-approached the AB line at an angle, the outer loop drove XTE toward zero and
-commanded "straighten up" (desired_angle → 0). But "straight wheels" only
-means "driving parallel to the line" if the tractor's heading already matches
-the line bearing. If the tractor approached at e.g. 15°, it drove straight
-*through* the line at 15°, overshot so far it grabbed the next AB pass line
-(12m away), and ended up driving perpendicular to all the AB lines.
+Second and third field tests revealed four issues:
 
-Traditional guidance systems with this bug produce a weaving wave pattern.
-Ours was worse because the overshoot exceeded the auto-pass snap threshold.
+**1. Diagonal overshoot (fixed):** Pure XTE control had no heading awareness.
+Added heading error feedforward (Kh) to the outer loop.
 
-**Root cause:** Pure XTE control has no heading awareness — it knows *how far*
-off the line but not *which direction the tractor is pointed relative to it*.
+**2. Full-lock runaway (fixed):** max_steer_angle reduced 25°→15° (adjustable
+5°–30° via slider, persisted).
 
-**Fix implemented this session:**
-- **Heading error feedforward (Kh)**: New gain in the outer loop that adds
-  heading error (tractor heading minus AB line bearing) to the desired steering
-  angle. Formula changed from `desired = -Kp × XTE` to
-  `desired = -Kp × XTE - Kh × heading_error`. This keeps the wheels turned
-  until the tractor is both on the line AND pointed along it. Standard in all
-  commercial guidance systems.
-- **Kh parameter**: Default 0.5 °/° (10° off bearing → 5° extra correction).
-  Adjustable via slider in Setup page AUTO-STEER section (range 0.0–2.0).
-  Persisted to SQLite config (`steer_kh`). Warning shown when Kh < 0.1.
-- **Deadband updated**: Now requires BOTH XTE < deadband AND heading error < 2°
-  before zeroing output. Previously only checked XTE, which meant the controller
-  stopped correcting when on-line but still pointed diagonally.
-- **Display updated**: Working page overlay now shows `H:` (heading error) alongside
-  `T:` (target angle) and `A:` (actual WAS angle). Setup page shows heading error
-  in the engaged status readout. Heading error was already computed in
-  `ab_line.rs calculate_error()` — it just wasn't used by the controller.
+**3. System lag (fixed):** Sensor ESP32 and steer commands both reduced 20Hz→10Hz.
+Total serial volume halved.
 
-**Previous session (Session 17) completed:**
-- Framerate cap (30fps), steer command throttle (20Hz), trail cap (5K)
-- Motor deadzone compensation (min_pwm = 80)
-- ESP32 driver issue identified (CP2102/CH340 on Dell 7390s)
+**4. Bang-bang motor oscillation (fixed):** The min_pwm deadzone compensation was
+BOOSTING any non-zero output to ±80 PWM, creating a three-level controller
+(0, +80, -80). For straight-line tracking where the inner loop needs small
+corrections back and forth, this meant the motor was slamming between ±80 on
+every frame — no proportional range in between.
+
+The Trimble EZ-Steer is direct-drive (single shaft, no gears) on the steering
+column. The hydraulic steering resistance stalls the motor below ~100 PWM.
+This means the boost IS needed (the motor genuinely can't move without it),
+but the old approach had no mechanism to prevent hunting.
+
+Fix: kept the boost (non-zero output → ±min_pwm) but added an **inner loop
+angle deadband** (2° default). When the angle error is within 2° of the target,
+the motor outputs zero — the wheels are "close enough." The motor only fires
+when the angle error exceeds 2°, makes its correction, and stops when back
+within 2°. This prevents the +100/-100 bang-bang cycle.
+
+Also: min_pwm raised from 80→100 (based on field observation that 80 sometimes
+stalls), Kp_angle raised from 4→10 (so realistic angle errors produce proportional
+PWM above the 100 threshold), and the firmware brake phase was removed (unnecessary
+for direct-drive — steering resistance is the brake).
 
 **Not yet done:**
-- **Third field test** — verify heading error fix resolves diagonal overshoot,
-  then tune Kp/Kh/Kp_angle/deadband (see STEERING_TUNING_GUIDE.md)
-- **Install ESP32 drivers on Dell 7390s** — CP2102 or CH340 (check chip on boards)
+- **Re-flash BOTH ESP32s** — sensor (10Hz) and motor (brake phase)
+- **Fourth field test** — verify all four fixes together
+- Tune Kp/Kh/Kp_angle/max_steer_angle/min_pwm/deadband in the field
 - Add derivative term (Kd) to outer loop if oscillation persists after tuning
 - Wire up CSV export button in job history UI
-- Touch target improvements (lower priority, UI is useable)
 
 ## Current state of the code
 All features below are IMPLEMENTED and working:
@@ -119,7 +114,7 @@ All features below are IMPLEMENTED and working:
   Kp, Kh and Kp_angle adjustable via sliders in Setup page, persisted to SQLite.
   Working page overlay shows live PWM, target angle (T:), actual angle (A:),
   heading error (H:).
-  **Steer commands throttled to ~20Hz** (50ms interval) to avoid flooding serial.
+  **Steer commands throttled to ~10Hz** (100ms interval) to avoid flooding serial.
   See `docs/STEERING_TUNING_GUIDE.md` for tuning procedure.
 
 ## Key decisions (see DECISIONS.md for full detail)
@@ -141,6 +136,7 @@ All features below are IMPLEMENTED and working:
 - #019: Coverage render thinning bridging fix (quads span i→i+step, not i→i+1)
 - #020: Auto-steer as P-control in GUI loop with safety auto-disengage
 - #021: Heading error feedforward in outer loop (fixes diagonal overshoot)
+- #022: Max steer angle cap (15°) and sensor rate reduction (20Hz→10Hz)
 
 ## Phase 4 hardware inventory (as of 15 April 2026)
 - **ESP32 #1 (sensor node)**: reads WAS (ADC GPIO 34), BNO055 (I2C GPIO 21/22),
@@ -247,12 +243,19 @@ The 5V VIN pins back-feed 5V to the GPS and IBT-2 logic (bench-tested OK).
 
 ## Next session should
 1. Read this file and DECISIONS.md for context
-2. **Install ESP32 USB-serial drivers on Dell 7390s** — check chip (CP2102 or CH340),
-   download driver from Silicon Labs or WCH, verify COM ports appear in Device Manager
-3. **Third field test** — verify heading error fix (H: display should show approach angle
-   decreasing as tractor aligns with line; tractor should NOT punch through diagonally)
-4. Tune Kp/Kh/Kp_angle/deadband — start Kh=0.5, increase to 0.8–1.0 if still overshooting,
-   decrease to 0.3 if sluggish onto line. Refer to STEERING_TUNING_GUIDE.md
+2. **Re-flash BOTH ESP32s**:
+   - Sensor: `cd firmware-sensor-pio && pio run --target upload` (10Hz WAS+IMU)
+   - Motor: `cd firmware-motor-pio && pio run --target upload` (direction brake phase)
+3. **Fourth field test** — verify all four fixes:
+   - Heading error (no diagonal overshoot — watch H: decreasing on approach)
+   - Max steer angle (no full-lock runaway — gentle arc back)
+   - Data rate (responsive UI, no lag)
+   - Min PWM threshold (smooth proportional corrections, no bang-bang slamming)
+4. Tune Kp/Kh/Kp_angle/max_steer_angle/min_pwm/deadband.
+   New defaults: Kp=30, Kh=0.5, Kp_angle=10, max_angle=15°, min_pwm=80.
+   Key relationship: Kp_angle × angle_error must exceed min_pwm for the motor
+   to move. At Kp_angle=10, 8° error → 80 PWM (motor starts). Refer to
+   STEERING_TUNING_GUIDE.md
 5. If oscillation persists after tuning, add derivative term (Kd) to outer loop
 6. Wire up CSV export button in job history UI
 
@@ -312,6 +315,6 @@ docs/ACTIVE_CONTEXT.md       — this file
 - `apply_motor_direction()` is applied AFTER the steering controller, not inside it
 - WAS timeout is tiered: warn at 2s (amber), disengage at 5s (not hard 1s)
 - GUI framerate capped at ~30fps (FRAME_INTERVAL = 33ms) — do NOT use uncapped `request_repaint()`
-- Motor serial writes throttled to ~20Hz (STEER_SEND_INTERVAL = 50ms) — safety disengages bypass throttle
-- Motor deadzone: min_pwm = 80 (Trimble EZ-Steer won't spin below this). Non-zero output boosted to ±min_pwm.
+- Motor serial writes throttled to ~10Hz (STEER_SEND_INTERVAL = 100ms) — safety disengages bypass throttle
+- Motor stall: min_pwm = 100 (direct-drive EZ-Steer stalls below this against steering resistance). Non-zero output boosted to ±min_pwm. Inner loop angle deadband (2°) prevents bang-bang hunting.
 - Trail capped at 5,000 points (was 50K) — ~83 minutes at 1Hz, plenty for a working session

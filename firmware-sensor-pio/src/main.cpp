@@ -12,7 +12,7 @@
  *   IMU:  $FINNIMU,<roll>,<pitch>,<heading>,<cal_sys>,<cal_gyro>,<cal_accel>,<cal_mag>*<checksum>\r\n
  *   HB:   $FINNHB,<uptime_ms>*<checksum>\r\n
  *
- * Rates: WAS + IMU at ~20Hz, GPS passthrough at 1Hz, heartbeat every 2s.
+ * Rates: WAS + IMU at ~10Hz, GPS passthrough at 1Hz, heartbeat every 2s.
  */
 
 #include <Arduino.h>
@@ -30,7 +30,7 @@
 #define BNO_SCL_PIN    22   // I2C SCL
 
 // ── Timing ───────────────────────────────────────────────────────────
-#define SENSOR_INTERVAL_MS    50    // 20Hz for WAS + IMU
+#define SENSOR_INTERVAL_MS    100   // 10Hz for WAS + IMU
 #define HEARTBEAT_INTERVAL_MS 2000  // Every 2 seconds
 
 // ── GPS UART ─────────────────────────────────────────────────────────

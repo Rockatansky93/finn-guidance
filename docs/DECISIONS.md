@@ -797,3 +797,62 @@ derivative term on XTE (rejected: Kd would damp the rate-of-change of XTE, which
 helps with oscillation but doesn't address the fundamental problem of not knowing
 which way the tractor is pointed), look-ahead point tracking (rejected:
 over-engineering for straight AB lines — reconsider for curved guidance).
+
+---
+
+## #022 — Max steer angle cap (15°) and sensor rate reduction (20Hz→10Hz)
+**Date:** 16 April 2026
+**Context:** Third field test with heading error fix (#021) revealed two additional
+problems:
+
+1. **Full-lock runaway**: when the tractor was far off-line, the outer loop
+commanded increasingly aggressive steering angles up to the previous cap of 25°.
+25° is close to the physical steering lock limit. At full lock the tractor turns
+in a tight circle and can't recover back to the line — it just circles. The Kp
+gain of 30 °/m means you only need to be 0.83m off-line to hit 25° (30 × 0.83 = 25).
+With standalone GPS wander of 1-2m, this happens routinely.
+
+2. **System lag**: the sensor ESP32 was sending WAS + IMU at 20Hz (41 messages/second
+total), and the PC was sending steer commands at 20Hz (50ms interval). On the Dell
+7390 field laptops, this was too much serial I/O — causing visible lag in both the
+steering response and the UI. The lag compounded because slow frames caused message
+queue buildup, and draining the queue made the next frame slower.
+
+**Decisions:**
+
+**Max steer angle reduced to 15° (adjustable 5°–30°):** At 15° with Kp=30, the
+controller commands max steering at 0.5m off-line. Beyond that distance, the
+desired angle plateaus at 15° and the tractor sweeps back in a gentle arc. This is
+a much more farmable behaviour than cranking to full lock. The previous 25° default
+was too close to physical limits where the steering geometry becomes nonlinear and
+the tractor enters tight circles. The slider (5°–30°, persisted to SQLite as
+`steer_max_angle`) lets the operator find the sweet spot for their tractor's
+turning radius.
+
+**Sensor rate: 20Hz → 10Hz:** The WAS potentiometer doesn't change fast enough to
+benefit from 20Hz sampling — at tractor speeds the steering angle changes at maybe
+1-2°/second. 10Hz captures this with ample margin. Halving the sensor rate:
+- Cuts serial message volume from ~41 msg/s to ~21 msg/s
+- Halves the parsing load on the PC's serial reader thread
+- Reduces the `finn_rx` channel queue depth (fewer messages per GUI frame)
+
+**Steer command rate: 20Hz → 10Hz:** Sending steer commands faster than the WAS
+update rate is pointless — the inner loop can't react to wheel position changes
+it hasn't measured yet. 10Hz steer commands with 10Hz WAS readings means every
+command uses the latest available wheel angle. The ESP32 watchdog (500ms) still
+has 5× safety margin.
+
+**GUI optimisation:** Moved `steering.notify_was_reading()` from inside the
+per-message loop to once-per-frame after the loop. When multiple WAS messages
+arrive between frames (during burst drain), only one timestamp update is needed.
+
+**Firmware change required:** The sensor ESP32 must be re-flashed with the updated
+`SENSOR_INTERVAL_MS` (50→100). Run `pio run --target upload` in
+`firmware-sensor-pio/`.
+
+**Alternatives considered:** Reducing to 5Hz (rejected: might miss fast WAS changes
+during aggressive corrections — 10Hz is conservative enough), adaptive rate based
+on steering activity (rejected: complexity without clear benefit — fixed 10Hz is
+simple and adequate), moving serial I/O to a separate thread (rejected: the serial
+read is already on its own thread; the lag was from message volume overwhelming the
+GUI frame budget, which is fixed by sending less).

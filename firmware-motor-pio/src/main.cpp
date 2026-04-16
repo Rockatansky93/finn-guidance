@@ -60,6 +60,9 @@ uint8_t nmeaChecksum(const char* body) {
 }
 
 // ── Apply PWM value to IBT-2 ─────────────────────────────────────────
+// The Trimble EZ-Steer is direct-drive on the steering column — no gears.
+// The hydraulic steering resistance stops the motor almost instantly when
+// PWM is removed, so no explicit brake phase is needed on direction reversal.
 void applyPwm(int16_t pwm) {
     uint8_t duty = (uint8_t)min(abs(pwm), 255);
 

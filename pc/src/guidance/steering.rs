@@ -51,8 +51,9 @@
 //! - Auto-disengage if GPS fix age exceeds `max_fix_age_secs`
 //! - WAS data loss: warning after `was_warn_secs`, disengage after `was_disengage_secs`
 //! - PWM clamped to `max_pwm` (never sends full 255 unless configured to)
-//! - Motor deadzone: output boosted to `min_pwm` (default 80) if non-zero,
-//!   because the Trimble EZ-Steer doesn't spin below ~80 PWM
+//! - Motor stall compensation: output boosted to `min_pwm` (default 100) if non-zero,
+//!   because the Trimble EZ-Steer direct-drive motor stalls below ~100 PWM against
+//!   hydraulic steering resistance. Inner loop angle deadband prevents bang-bang.
 //! - Speed gate: no steering below minimum speed
 
 use std::time::Instant;
@@ -84,18 +85,32 @@ pub struct SteeringController {
 
     /// Inner loop gain: PWM per degree of angle error.
     /// Controls how aggressively the motor drives to reach the desired angle.
-    /// 4.0 means 10° error → 40 PWM.
+    /// Must be high enough that realistic angle errors (5-15°) produce PWM
+    /// above min_pwm (80), otherwise the motor won't move for small corrections.
+    /// At 10.0: 8° error → 80 PWM (motor starts moving).
+    /// At 4.0: 20° error needed → motor basically never moves for fine corrections.
     pub kp_angle: f64,
 
     /// Maximum PWM magnitude the controller will output.
     pub max_pwm: i16,
 
-    /// Minimum PWM to actually move the motor. Below this the Trimble
-    /// EZ-Steer motor doesn't spin — the controller was computing PWM
-    /// values in the 0–79 dead zone where nothing happened, causing
-    /// delayed corrections and lurching. Any non-zero output is boosted
-    /// to at least this value.
+    /// Minimum PWM to overcome steering resistance. The Trimble EZ-Steer
+    /// is a direct-drive motor on the steering column — no gears, no
+    /// backlash. The hydraulic steering resistance stalls the motor below
+    /// this PWM. Any non-zero output is boosted to at least this value so
+    /// the motor actually moves. Hysteresis on the inner loop angle error
+    /// prevents bang-bang oscillation (see `angle_deadband_deg`).
     pub min_pwm: i16,
+
+    /// Inner loop angle deadband in degrees. When the angle error is below
+    /// this threshold, the motor outputs zero — the wheels are "close enough"
+    /// to the desired angle. This prevents the motor from hunting back and
+    /// forth when near the target. Without this, the min_pwm boost creates
+    /// a bang-bang controller: any tiny angle error gets boosted to ±min_pwm,
+    /// the motor overshoots, the error flips sign, and it slams the other way.
+    /// With a 2° deadband, the motor only fires when the wheels are genuinely
+    /// off-target, and stops when they're within 2° of where they should be.
+    pub angle_deadband_deg: f64,
 
     /// Deadband in metres. XTE below this produces zero desired angle.
     /// Prevents the motor from hunting when already on the line.
@@ -152,10 +167,11 @@ impl SteeringController {
         Self {
             kp: 30.0,
             kh: 0.5,
-            max_steer_angle: 25.0,
-            kp_angle: 4.0,
+            max_steer_angle: 15.0,
+            kp_angle: 10.0,
             max_pwm: 180,
-            min_pwm: 80,
+            min_pwm: 100,
+            angle_deadband_deg: 2.0,
             deadband_m: 0.03,
             engaged: false,
             min_speed: 0.5,
@@ -301,14 +317,27 @@ impl SteeringController {
 
         let angle_error = desired_angle - actual;
 
+        // Inner loop angle deadband: if the wheels are within angle_deadband_deg
+        // of the target, output zero. This prevents hunting — without it, the
+        // min_pwm boost turns any tiny angle error into a ±100 PWM slam, the
+        // motor overshoots by a degree, the error flips sign, and it slams
+        // back. The deadband gives the motor a "close enough" zone where it
+        // stops and lets the tractor settle.
+        if angle_error.abs() < self.angle_deadband_deg {
+            self.last_output_pwm = 0;
+            return (0, false);
+        }
+
         let raw_pwm = self.kp_angle * angle_error;
         let clamped = (raw_pwm.round() as i16).clamp(-self.max_pwm, self.max_pwm);
 
-        // Motor deadzone compensation: the Trimble EZ-Steer doesn't spin below
-        // ~80 PWM. If the controller wants any non-zero output, boost it to at
-        // least min_pwm so the motor actually moves. Without this, small
-        // corrections sit in the 0–79 dead zone doing nothing until the error
-        // grows large enough to produce PWM ≥ 80, causing delayed lurching.
+        // Motor stall torque compensation: the Trimble EZ-Steer is direct-drive
+        // on the steering column with no gears. The hydraulic steering resistance
+        // stalls the motor below ~100 PWM. Any non-zero output is boosted to at
+        // least min_pwm so the motor can overcome the resistance and actually
+        // turn the wheels. The angle deadband above prevents this boost from
+        // creating bang-bang oscillation — the motor only fires when the wheels
+        // are genuinely off-target (>2°), and stops when close enough.
         let output = if clamped == 0 {
             0
         } else if clamped > 0 {

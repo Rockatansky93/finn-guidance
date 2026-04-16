@@ -27,9 +27,10 @@ use super::field_view::FieldView;
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
 /// Minimum interval between motor serial writes. The ESP32 watchdog is
-/// 500ms, so 50ms (20Hz) keeps it well fed without flooding the serial
-/// bus. Matches the WAS update rate so we react to every new reading.
-const STEER_SEND_INTERVAL: Duration = Duration::from_millis(50);
+/// 500ms, so 100ms (10Hz) keeps it well fed without flooding the serial
+/// bus. Matches the WAS update rate so we react to every new reading
+/// without sending redundant commands between readings.
+const STEER_SEND_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Which page is currently displayed
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -189,6 +190,10 @@ impl GuidanceApp {
             .and_then(|d| d.get_config("steer_kh"))
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(0.5);
+        let steer_max_angle = db.as_ref()
+            .and_then(|d| d.get_config("steer_max_angle"))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(15.0);
         let steer_kp_angle = db.as_ref()
             .and_then(|d| d.get_config("steer_kp_angle"))
             .and_then(|v| v.parse::<f64>().ok())
@@ -234,6 +239,7 @@ impl GuidanceApp {
                 let mut s = SteeringController::new();
                 s.kp = steer_kp;
                 s.kh = steer_kh;
+                s.max_steer_angle = steer_max_angle;
                 s.kp_angle = steer_kp_angle;
                 s
             },
@@ -341,13 +347,13 @@ impl eframe::App for GuidanceApp {
         }
 
         // === Process FINN sensor messages from ESP32 ===
-        // These arrive at 20Hz (WAS + IMU) plus heartbeat every 2s.
-        // We only keep the latest value of each — no need to buffer history yet.
+        // These arrive at 10Hz (WAS + IMU) plus heartbeat every 2s.
+        // We only keep the latest value of each type — drain the entire
+        // queue but only the final message of each kind matters.
         while let Ok(msg) = self.finn_rx.try_recv() {
             match msg {
                 FinnMessage::Was(was) => {
                     self.latest_was = Some(was);
-                    self.steering.notify_was_reading();
                 }
                 FinnMessage::Imu(imu) => {
                     self.latest_imu = Some(imu);
@@ -359,6 +365,11 @@ impl eframe::App for GuidanceApp {
                     self.latest_motor = Some(mtr);
                 }
             }
+        }
+        // Notify steering controller once per frame if we got any WAS data
+        // (not per-message — avoids redundant timestamp updates)
+        if self.latest_was.is_some() {
+            self.steering.notify_was_reading();
         }
 
         // === Interpolate position for smooth display (every frame, ~30fps) ===
@@ -1822,6 +1833,24 @@ impl GuidanceApp {
 
                     ui.add_space(6.0);
 
+                    // Max steer angle — caps how hard the outer loop can command
+                    ui.label(egui::RichText::new("Max steer angle:").size(12.0));
+                    let old_max_angle = self.steering.max_steer_angle;
+                    ui.add(egui::Slider::new(&mut self.steering.max_steer_angle, 5.0..=30.0)
+                        .step_by(1.0)
+                        .suffix("°")
+                    );
+                    if (self.steering.max_steer_angle - old_max_angle).abs() > 0.1 {
+                        if let Some(db) = &self.db {
+                            let _ = db.set_config("steer_max_angle", &format!("{:.0}", self.steering.max_steer_angle));
+                        }
+                    }
+                    ui.label(egui::RichText::new(
+                        "Caps desired wheel angle — lower = gentler return arc"
+                    ).size(11.0).weak());
+
+                    ui.add_space(6.0);
+
                     // Inner loop: Kp_angle (angle error → PWM)
                     ui.label(egui::RichText::new("Inner loop — wheel position:").size(12.0).strong());
                     ui.add_space(2.0);
@@ -1837,7 +1866,7 @@ impl GuidanceApp {
                         }
                     }
                     ui.label(egui::RichText::new(
-                        format!("10° error → {} PWM", (self.steering.kp_angle * 10.0) as i32)
+                        format!("10° error → {} PWM (motor threshold: {})", (self.steering.kp_angle * 10.0) as i32, self.steering.min_pwm)
                     ).size(11.0).weak());
 
                     ui.add_space(4.0);
@@ -1852,15 +1881,27 @@ impl GuidanceApp {
 
                     ui.add_space(4.0);
 
-                    // Min PWM slider (motor deadzone compensation)
-                    ui.label(egui::RichText::new("Min PWM (motor deadzone):").size(12.0));
+                    // Min PWM slider (motor stall torque)
+                    ui.label(egui::RichText::new("Min PWM (stall torque):").size(12.0));
                     let mut min_pwm_f = self.steering.min_pwm as f64;
-                    ui.add(egui::Slider::new(&mut min_pwm_f, 0.0..=120.0)
+                    ui.add(egui::Slider::new(&mut min_pwm_f, 0.0..=150.0)
                         .step_by(5.0)
                     );
                     self.steering.min_pwm = min_pwm_f as i16;
                     ui.label(egui::RichText::new(
-                        "Motor won't spin below this — set to lowest PWM that moves"
+                        "Motor can't overcome steering resistance below this"
+                    ).size(11.0).weak());
+
+                    ui.add_space(4.0);
+
+                    // Angle deadband slider (inner loop)
+                    ui.label(egui::RichText::new("Angle deadband:").size(12.0));
+                    ui.add(egui::Slider::new(&mut self.steering.angle_deadband_deg, 0.5..=5.0)
+                        .step_by(0.5)
+                        .suffix("°")
+                    );
+                    ui.label(egui::RichText::new(
+                        "Motor stops when within this angle of target — prevents hunting"
                     ).size(11.0).weak());
 
                     ui.add_space(4.0);
