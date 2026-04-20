@@ -1037,3 +1037,106 @@ later if telemetry reveals a need.
 - Run the filter on the ESP32 (rejected: calibration gating, GPS COG delivery,
   and the fused output all live on the PC anyway — keeping filter logic PC-side
   is simpler and doesn't require re-flashing to tune)
+
+---
+
+## #025 — Waveform-aware inner loop (replaces hard deadbands with smooth damping)
+**Date:** 18 April 2026
+**Context:** Epiphany from real driving observation: straight-line tractor driving
+is not actually straight — the steering wheel constantly oscillates left and right.
+A human driver tracks a line by minimising the *amplitude* of this oscillation, not
+by snapping to a fixed angle. The existing inner loop had three mechanisms that
+worked against this natural oscillation model:
+
+1. **Hard XTE deadband** (3cm + heading < 2° → desired_angle = 0): this clipped
+   the control signal at the zero-crossing — the motor went silent in exactly the
+   zone where fine corrections matter most. The tractor coasted through, overshot,
+   and only got a correction once it was 3cm+ past the line.
+
+2. **Hard angle deadband** (angle_error < 2° → PWM = 0): created a dead zone where
+   the motor stopped and the tractor drifted. Combined with the min_pwm stall floor
+   (100 PWM), this produced a bang-bang pattern: 0→0→0→suddenly 100→0→0→0→-100.
+
+3. **No rate information**: the controller had no knowledge of whether XTE was
+   growing or shrinking. A tractor at 3cm XTE and converging rapidly got the same
+   correction as one at 3cm and diverging. No mechanism to damp the oscillation
+   amplitude over successive cycles.
+
+**Decision:** Three changes to the inner loop in `guidance/steering.rs`. The outer
+loop (pure pursuit geometry from #023) is unchanged.
+
+**Change 1 — XTE rate damping (dXTE/dt):**
+New field `kd_xte` (default 0.5, persisted to SQLite as `steer_kd_xte`). Each
+`compute()` call calculates the rate of change of cross-track error from the
+previous sample. The damping term is added to the desired angle:
+```
+desired_angle += kd_xte × dXTE/dt
+```
+When converging (dXTE/dt has opposite sign to XTE), this reduces the desired angle
+magnitude — softer approach, less overshoot. When diverging (same sign), it
+increases correction urgency. This is the core amplitude-reduction mechanism that
+makes the oscillation waveform converge rather than sustain.
+
+Rate calculation is gated: dt must be between 1ms and 1s to reject double-calls
+and stale samples. On first call after engage, rate is zero (no history). State
+(`prev_xte_m`, `prev_compute_time`) is reset on both engage and disengage.
+
+**Change 2 — Smooth taper replaces hard XTE deadband:**
+Instead of snapping `desired_angle` to zero when XTE < `deadband_m`, the desired
+angle is now scaled by `taper = |XTE| / deadband_m` within the deadband zone
+(still gated by heading_error < 2°). At the deadband boundary the scale is 1.0
+(full correction); at XTE = 0 the scale is 0.0 (natural zero). The waveform
+passes through the zero-crossing smoothly instead of being clipped.
+
+**Change 3 — Sub-stall pulsing replaces hard angle deadband:**
+The hard angle deadband (`angle_error < 2° → PWM = 0`) is removed from the
+control loop. Instead, the inner loop now operates in three zones:
+
+- **Above stall floor** (`|desired_pwm| ≥ min_pwm`): direct drive with stall
+  compensation, same as before. Pulse accumulator is reset.
+- **Sub-stall zone** (`1 ≤ |desired_pwm| < min_pwm`): desired effort is
+  accumulated in a `pulse_accumulator` each cycle. When the accumulator
+  reaches ±min_pwm, one pulse at min_pwm is fired and the accumulator is
+  decremented. This gives time-averaged torque below the stall floor —
+  the motor makes small periodic corrections instead of either doing nothing
+  or slamming at full stall torque.
+- **Negligible zone** (`|desired_pwm| < 1`): accumulator is zeroed, motor is
+  silent. This replaces the hard deadband — the motor only goes truly silent
+  when the entire control chain (pursuit + damping + taper) outputs
+  essentially nothing.
+
+The `angle_deadband_deg` field is retained in the struct and UI slider for
+backward compatibility but is no longer read by `compute()`.
+
+**UI changes:**
+- New "XTE damping (Kd)" slider in Setup page AUTO-STEER section, range
+  0.0–2.0, step 0.1. Persisted to SQLite as `steer_kd_xte`.
+- Angle deadband slider remains but is now effectively inert (cosmetic, can
+  be removed in a future cleanup).
+
+**New tests added:**
+- `test_converging_xte_reduces_correction`: verifies that when XTE is
+  shrinking, the desired angle magnitude is reduced vs steady-state.
+- `test_diverging_xte_increases_correction`: verifies the opposite.
+- `test_sub_stall_pulsing`: verifies that repeated sub-stall calls
+  eventually fire a pulse at min_pwm.
+
+**Field test tuning guidance:**
+- Start at kd_xte = 0.5 (default). If still overshooting the line, increase
+  toward 1.0. If corrections feel sluggish on approach, decrease toward 0.2.
+- Sub-stall pulsing should be immediately noticeable as small periodic
+  motor twitches when near the line, replacing the old dead-silence → sudden
+  kick pattern.
+- The combination of smooth taper + rate damping should produce visibly
+  smoother line tracking compared to the old hard-deadband controller.
+
+**Alternatives considered:**
+- Full PID on XTE (rejected: integral windup is dangerous for a mobile plant —
+  accumulated error during a headland turn would produce a large kick on
+  re-entry. Rate damping achieves the needed dynamic response without windup)
+- Kalman filter on XTE (rejected: over-engineering for this stage; simple
+  finite-difference dXTE/dt is adequate given 30fps compute rate)
+- Variable-rate PWM output instead of pulse accumulation (rejected: the ESP32
+  motor controller firmware uses fixed 20kHz PWM; we can't change the PWM
+  frequency per-command. Pulse accumulation achieves the same average-torque
+  effect within the existing firmware)

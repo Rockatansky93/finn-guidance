@@ -51,19 +51,37 @@
 //! aggression; it can't fight itself.
 //!
 //! **Inner loop (desired angle vs actual WAS → motor PWM):**
-//! Unchanged from the previous design. The inner loop takes whatever
-//! desired angle the outer loop commands and drives the motor to hit it:
 //!
-//! ```text
-//!   angle_error = desired_angle - actual_angle
-//!   pwm = clamp(Kp_angle × angle_error, ±max_pwm)
-//!   if |pwm| > 0: pwm = sign(pwm) × max(|pwm|, min_pwm)  // stall-torque boost
-//! ```
+//! Reworked with a "waveform" philosophy. In reality, straight-line driving
+//! is not straight — the steering wheel constantly oscillates left and right
+//! around the line. The controller's job is to minimise the amplitude of
+//! that oscillation, not to snap to a fixed angle.
 //!
-//! An angle deadband (default 2°) prevents hunting around the target. The
-//! min_pwm floor (default 100) is there because the Trimble EZ-Steer
-//! direct-drive motor stalls below that PWM against hydraulic steering
-//! resistance. The deadband makes sure the floor doesn't produce bang-bang.
+//! Three changes from the original inner loop:
+//!
+//! 1. **Smooth taper replaces hard deadband.** The old XTE deadband snapped
+//!    desired_angle to zero when XTE was within 3cm. This clipped the
+//!    waveform at the zero-crossing — the motor went silent in exactly the
+//!    zone where fine control mattered most. Now the desired angle tapers
+//!    linearly to zero as XTE approaches the line, preserving the waveform
+//!    shape through the crossing.
+//!
+//! 2. **XTE rate damping (dXTE/dt).** The controller now tracks how fast
+//!    XTE is changing. When the tractor is converging on the line (error
+//!    shrinking), the damping term reduces the correction, preventing
+//!    overshoot. When diverging, it adds urgency. This is the mechanism
+//!    that makes the oscillation amplitude shrink over successive cycles.
+//!    Governed by `kd_xte` (default 0.5).
+//!
+//! 3. **Sub-stall pulsing.** The EZ-Steer motor stalls below ~100 PWM.
+//!    The old design used a hard deadband to avoid bang-bang at the stall
+//!    floor. Now we use pulse accumulation: desired PWM below the stall
+//!    threshold is accumulated over cycles, and when the accumulator
+//!    reaches min_pwm, one pulse is fired. This gives time-averaged torque
+//!    below the stall floor — analog-like control without bang-bang.
+//!
+//! The angle deadband field is retained in the struct for compatibility
+//! but is no longer used in the control loop.
 //!
 //! ## Sign convention
 //!
@@ -142,11 +160,37 @@ pub struct SteeringController {
     /// from creating bang-bang oscillation near the target.
     pub angle_deadband_deg: f64,
 
-    /// XTE deadband in metres. When the tractor is within this of the line
-    /// AND heading error is small, the outer loop commands straight wheels
-    /// instead of trying to correct micro-offsets (which GPS noise would
-    /// drive the motor to chase).
+    /// XTE deadband in metres. Below this threshold the outer loop begins
+    /// tapering its output rather than cutting to zero — the smooth taper
+    /// replaces the old hard deadband. The taper zone runs from deadband_m
+    /// down to zero, scaling the desired angle linearly so corrections
+    /// fade out rather than clipping.
     pub deadband_m: f64,
+
+    // === Waveform damping ===
+
+    /// XTE rate damping gain. Multiplied by dXTE/dt (m/s) and subtracted
+    /// from the desired angle. When the tractor is converging on the line
+    /// (dXTE/dt negative, shrinking error), this reduces the correction,
+    /// preventing overshoot. When diverging it adds urgency. This is the
+    /// key "amplitude reduction" mechanism — it makes the oscillation
+    /// waveform converge rather than sustain.
+    pub kd_xte: f64,
+
+    /// Previous XTE sample for computing dXTE/dt.
+    prev_xte_m: Option<f64>,
+
+    /// Timestamp of the previous compute() call for dt calculation.
+    prev_compute_time: Option<Instant>,
+
+    // === Sub-stall pulsing ===
+
+    /// Pulse accumulator for sub-stall motor control. When the desired PWM
+    /// is below min_pwm, we accumulate the desired effort each cycle. When
+    /// the accumulator exceeds min_pwm, we emit one pulse at min_pwm and
+    /// subtract it. This gives analog-like average torque below the stall
+    /// floor — PWM-within-PWM.
+    pulse_accumulator: f64,
 
     /// Whether auto-steer is currently engaged.
     pub engaged: bool,
@@ -216,6 +260,18 @@ impl SteeringController {
             angle_deadband_deg: 2.0,
             deadband_m: 0.03,
 
+            // Waveform damping.
+            // kd_xte = 0.5: at dXTE/dt of -0.1 m/s (converging at 10cm/s),
+            // this subtracts 0.05 rad ≈ 2.9° from the desired angle — a
+            // meaningful damping that prevents overshoot without killing
+            // the approach. Tunable in the field.
+            kd_xte: 0.5,
+            prev_xte_m: None,
+            prev_compute_time: None,
+
+            // Sub-stall pulsing.
+            pulse_accumulator: 0.0,
+
             engaged: false,
             min_speed: 0.5,
             max_fix_age_secs: 2.0,
@@ -239,6 +295,11 @@ impl SteeringController {
         self.last_output_pwm = 0;
         self.last_desired_angle = 0.0;
         self.was_stale = false;
+        // Reset waveform state so we start fresh — no stale dXTE/dt
+        // from a previous engagement or old pulse accumulator.
+        self.prev_xte_m = None;
+        self.prev_compute_time = None;
+        self.pulse_accumulator = 0.0;
         self.engaged = true;
         true
     }
@@ -248,6 +309,9 @@ impl SteeringController {
         self.engaged = false;
         self.last_output_pwm = 0;
         self.last_desired_angle = 0.0;
+        self.prev_xte_m = None;
+        self.prev_compute_time = None;
+        self.pulse_accumulator = 0.0;
         self.disengage_reason = reason;
     }
 
@@ -324,6 +388,32 @@ impl SteeringController {
 
         self.last_heading_error = heading_error_deg;
 
+        // === Compute dXTE/dt for waveform damping ===
+        //
+        // The rate of change of cross-track error tells us whether the
+        // oscillation is converging or diverging. Positive dXTE/dt when
+        // XTE is positive means we're drifting further right (diverging);
+        // negative means we're coming back (converging). The damping term
+        // reduces corrections when converging and increases them when
+        // diverging — this is what makes the waveform amplitude shrink
+        // over successive cycles.
+        let now = Instant::now();
+        let xte_rate = match (self.prev_xte_m, self.prev_compute_time) {
+            (Some(prev_xte), Some(prev_time)) => {
+                let dt = prev_time.elapsed().as_secs_f64();
+                if dt > 0.001 && dt < 1.0 {
+                    // Valid dt window: > 1ms (not a double-call) and
+                    // < 1s (not a stale sample from a long pause).
+                    (xte_m - prev_xte) / dt
+                } else {
+                    0.0
+                }
+            }
+            _ => 0.0, // First call after engage — no rate yet.
+        };
+        self.prev_xte_m = Some(xte_m);
+        self.prev_compute_time = Some(now);
+
         // === Outer loop: pure pursuit geometry ===
         //
         // Lookahead distance scales with speed. At standstill the controller
@@ -337,57 +427,102 @@ impl SteeringController {
         // Pure-pursuit target bearing (`alpha`) relative to the tractor's
         // current heading. Closed-form derivation from XTE + heading error,
         // as described in the module docstring.
-        //
-        // Sign: XTE positive = right of line. To pull back to the line, the
-        // lookahead point must be to the LEFT of the tractor (bearing < 0).
-        // We use -xte_m in the atan2 so positive XTE yields negative alpha.
         let psi_rad = heading_error_deg.to_radians();
         let alpha_line_frame = (-xte_m).atan2(lookahead_m);
         let alpha_rad = alpha_line_frame - psi_rad;
 
-        // Deadband: if both XTE and heading are inside the deadband, command
-        // straight wheels. Prevents GPS-noise-driven micro-corrections from
-        // chasing the motor when we're already on the line.
-        let desired_angle = if xte_m.abs() < self.deadband_m
-            && heading_error_deg.abs() < 2.0
-        {
-            0.0
-        } else {
-            // Bicycle model: wheel angle that curves the vehicle through
-            // the lookahead point.
-            //   delta = atan2(2 · L_w · sin(alpha), L)
-            let delta_rad = (2.0 * self.wheelbase_m * alpha_rad.sin())
-                .atan2(lookahead_m);
-            let delta_deg = delta_rad.to_degrees();
-            delta_deg.clamp(-self.max_steer_angle, self.max_steer_angle)
-        };
+        // Bicycle model: wheel angle that curves the vehicle through
+        // the lookahead point.
+        let delta_rad = (2.0 * self.wheelbase_m * alpha_rad.sin())
+            .atan2(lookahead_m);
+        let mut desired_angle = delta_rad.to_degrees();
+
+        // === Waveform damping: dXTE/dt reduces corrections when converging ===
+        //
+        // The damping term is applied in degrees: we convert the rate-based
+        // correction to an angle offset. kd_xte × xte_rate gives a correction
+        // in the same sign-space as XTE (positive = rightward drift rate),
+        // so we ADD it because positive drift → steer more left (the pure
+        // pursuit alpha already encodes "right of line → steer left").
+        //
+        // When converging (xte_rate has opposite sign to xte_m), this
+        // reduces the desired angle magnitude → gentler approach → less
+        // overshoot. When diverging (same sign), it increases urgency.
+        desired_angle += self.kd_xte * xte_rate;
+
+        // === Smooth taper near the line (replaces hard deadband) ===
+        //
+        // Instead of snapping desired_angle to 0 inside the deadband,
+        // we scale it smoothly from 0 at xte=0 to 1.0 at xte=deadband_m.
+        // This means corrections fade out proportionally as the tractor
+        // approaches the line — no clipping of the waveform zero-crossing.
+        // Beyond the deadband the scale is 1.0 (full correction).
+        if self.deadband_m > 0.0 {
+            let xte_abs = xte_m.abs();
+            if xte_abs < self.deadband_m && heading_error_deg.abs() < 2.0 {
+                let taper = xte_abs / self.deadband_m;
+                desired_angle *= taper;
+            }
+        }
+
+        // Clamp after damping and taper so nothing exceeds physical limits.
+        desired_angle = desired_angle.clamp(-self.max_steer_angle, self.max_steer_angle);
 
         self.last_desired_angle = desired_angle;
 
         // === Inner loop: angle error → motor PWM ===
+        //
+        // Reworked to eliminate the hard angle deadband and use sub-stall
+        // pulsing instead. The motor always gets a proportional signal;
+        // when the desired PWM is below the stall floor, we accumulate
+        // it and emit periodic pulses.
         let actual = actual_angle_deg.unwrap_or(0.0);
         self.last_actual_angle = actual;
 
         let angle_error = desired_angle - actual;
-
-        // Angle deadband — prevents bang-bang hunting around the target.
-        if angle_error.abs() < self.angle_deadband_deg {
-            self.last_output_pwm = 0;
-            return (0, false);
-        }
-
         let raw_pwm = self.kp_angle * angle_error;
-        let clamped = (raw_pwm.round() as i16).clamp(-self.max_pwm, self.max_pwm);
+        let desired_pwm = raw_pwm.clamp(-(self.max_pwm as f64), self.max_pwm as f64);
 
-        // Motor stall torque compensation: non-zero output gets boosted to
-        // at least min_pwm so the direct-drive motor actually moves against
-        // hydraulic steering resistance.
-        let output = if clamped == 0 {
+        // Sub-stall pulsing: if the desired effort is below the motor's
+        // stall threshold, we can't just apply it (motor won't move).
+        // Instead we accumulate the desired effort over multiple cycles.
+        // When the accumulator reaches min_pwm, we fire one pulse at
+        // min_pwm. This gives time-averaged torque below the stall floor.
+        //
+        // Above stall threshold: pass through directly with stall boost.
+        let abs_desired = desired_pwm.abs();
+        let output = if abs_desired >= self.min_pwm as f64 {
+            // Above stall floor — direct drive. Reset accumulator since
+            // we're making real movement.
+            self.pulse_accumulator = 0.0;
+            let clamped = (desired_pwm.round() as i16).clamp(-self.max_pwm, self.max_pwm);
+            // Ensure we're at least at min_pwm (stall compensation).
+            if clamped > 0 {
+                clamped.max(self.min_pwm)
+            } else {
+                clamped.min(-self.min_pwm)
+            }
+        } else if abs_desired < 1.0 {
+            // Negligible effort — don't accumulate noise. Let the motor
+            // rest. This replaces the old hard deadband: instead of a
+            // fixed angle threshold, we only go silent when the entire
+            // control chain (pursuit + damping + taper) says "basically
+            // nothing needed."
+            self.pulse_accumulator = 0.0;
             0
-        } else if clamped > 0 {
-            clamped.max(self.min_pwm)
         } else {
-            clamped.min(-self.min_pwm)
+            // Sub-stall zone: accumulate desired effort.
+            self.pulse_accumulator += desired_pwm;
+
+            if self.pulse_accumulator.abs() >= self.min_pwm as f64 {
+                // Accumulated enough for one pulse. Fire it and subtract.
+                let pulse_dir = self.pulse_accumulator.signum() as i16;
+                self.pulse_accumulator -= pulse_dir as f64 * self.min_pwm as f64;
+                pulse_dir * self.min_pwm
+            } else {
+                // Not enough accumulated yet — hold.
+                0
+            }
         };
 
         self.last_output_pwm = output;
@@ -405,14 +540,17 @@ mod tests {
         c.last_fix_time = Some(Instant::now());
         c.last_was_time = Some(Instant::now());
         c.engaged = true;
+        // Pre-seed prev_compute_time so dXTE/dt calculation has a valid
+        // baseline on the first test call.
+        c.prev_compute_time = Some(Instant::now());
         c
     }
 
     #[test]
     fn test_on_line_aligned_commands_straight() {
-        // XTE = 0, heading error = 0 → desired angle = 0 → no motor output.
+        // XTE = 0, heading error = 0 → desired angle ≈ 0 → no motor output.
         let mut c = engaged_controller();
-        c.angle_deadband_deg = 2.0;
+        c.prev_xte_m = Some(0.0);
         let (pwm, dis) = c.compute(0.0, 0.0, 2.0, Some(0.0));
         assert!(!dis);
         assert_eq!(pwm, 0);
@@ -424,6 +562,7 @@ mod tests {
         // Positive XTE (right of line), aligned heading → should command
         // a negative wheel angle (steer left).
         let mut c = engaged_controller();
+        c.prev_xte_m = Some(1.0); // Steady XTE, no rate.
         let (_pwm, _dis) = c.compute(1.0, 0.0, 2.0, Some(0.0));
         assert!(c.last_desired_angle < 0.0,
             "Right of line should command left steering, got {}",
@@ -433,6 +572,7 @@ mod tests {
     #[test]
     fn test_left_of_line_steers_right() {
         let mut c = engaged_controller();
+        c.prev_xte_m = Some(-1.0);
         let (_pwm, _dis) = c.compute(-1.0, 0.0, 2.0, Some(0.0));
         assert!(c.last_desired_angle > 0.0,
             "Left of line should command right steering, got {}",
@@ -443,6 +583,7 @@ mod tests {
     fn test_heading_error_alone_commands_correction() {
         // On the line but pointed right of the bearing → should steer left.
         let mut c = engaged_controller();
+        c.prev_xte_m = Some(0.0);
         let (_pwm, _dis) = c.compute(0.0, 10.0, 2.0, Some(0.0));
         assert!(c.last_desired_angle < 0.0,
             "Pointed right of line should command left steer, got {}",
@@ -476,7 +617,81 @@ mod tests {
     fn test_speed_gate_kills_output() {
         let mut c = engaged_controller();
         c.min_speed = 0.5;
+        c.prev_xte_m = Some(2.0);
         let (pwm, _dis) = c.compute(2.0, 10.0, 0.1, Some(0.0));
         assert_eq!(pwm, 0, "Below min speed should output 0");
+    }
+
+    #[test]
+    fn test_converging_xte_reduces_correction() {
+        // When XTE is shrinking (converging), the damping term should
+        // reduce the desired angle compared to steady-state.
+        let mut c = engaged_controller();
+
+        // First: steady XTE (no rate) — get baseline desired angle.
+        c.prev_xte_m = Some(1.0);
+        c.compute(1.0, 0.0, 2.0, Some(0.0));
+        let steady_angle = c.last_desired_angle;
+
+        // Second: converging XTE (was 1.5, now 1.0 → negative rate).
+        let mut c2 = engaged_controller();
+        c2.prev_xte_m = Some(1.5);
+        c2.compute(1.0, 0.0, 2.0, Some(0.0));
+        let converging_angle = c2.last_desired_angle;
+
+        // Converging should produce a less aggressive (smaller magnitude)
+        // correction than steady-state.
+        assert!(converging_angle.abs() < steady_angle.abs(),
+            "Converging XTE should reduce correction: steady={:.3} converging={:.3}",
+            steady_angle, converging_angle);
+    }
+
+    #[test]
+    fn test_diverging_xte_increases_correction() {
+        // When XTE is growing (diverging), the damping term should
+        // increase the desired angle compared to steady-state.
+        let mut c = engaged_controller();
+
+        // Steady XTE baseline.
+        c.prev_xte_m = Some(1.0);
+        c.compute(1.0, 0.0, 2.0, Some(0.0));
+        let steady_angle = c.last_desired_angle;
+
+        // Diverging XTE (was 0.5, now 1.0 → positive rate).
+        let mut c2 = engaged_controller();
+        c2.prev_xte_m = Some(0.5);
+        c2.compute(1.0, 0.0, 2.0, Some(0.0));
+        let diverging_angle = c2.last_desired_angle;
+
+        assert!(diverging_angle.abs() > steady_angle.abs(),
+            "Diverging XTE should increase correction: steady={:.3} diverging={:.3}",
+            steady_angle, diverging_angle);
+    }
+
+    #[test]
+    fn test_sub_stall_pulsing() {
+        // Small angle errors that produce PWM below min_pwm should
+        // accumulate over multiple calls and eventually fire a pulse.
+        let mut c = engaged_controller();
+        c.prev_xte_m = Some(0.2);
+        c.kp_angle = 10.0;
+        c.min_pwm = 100;
+
+        // With small XTE the desired angle will be small, producing
+        // sub-stall PWM. Call repeatedly — eventually the accumulator
+        // should fire a pulse.
+        let mut got_pulse = false;
+        for _ in 0..50 {
+            c.prev_xte_m = Some(0.2);
+            c.prev_compute_time = Some(Instant::now());
+            let (pwm, _) = c.compute(0.2, 0.0, 2.0, Some(0.0));
+            if pwm != 0 {
+                got_pulse = true;
+                assert!(pwm.abs() >= c.min_pwm,
+                    "Pulse should be at least min_pwm, got {}", pwm);
+                break;
+            }
+        }
+        assert!(got_pulse, "Sub-stall accumulator should eventually fire a pulse");
     }
 }

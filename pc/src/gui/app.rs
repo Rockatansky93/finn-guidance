@@ -209,6 +209,11 @@ impl GuidanceApp {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(10.0);
 
+        let steer_kd_xte = db.as_ref()
+            .and_then(|d| d.get_config("steer_kd_xte"))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.5);
+
         // Auto-load last-used AB line on startup
         let mut guide = AbLineGuide::new(implement_width);
         guide.overlap_m = overlap;
@@ -253,6 +258,7 @@ impl GuidanceApp {
                 s.wheelbase_m = steer_wheelbase;
                 s.max_steer_angle = steer_max_angle;
                 s.kp_angle = steer_kp_angle;
+                s.kd_xte = steer_kd_xte;
                 s
             },
             steer_status_msg: None,
@@ -1992,6 +1998,23 @@ impl GuidanceApp {
                     }
                     ui.label(egui::RichText::new(
                         format!("10° error → {} PWM (motor threshold: {})", (self.steering.kp_angle * 10.0) as i32, self.steering.min_pwm)
+                    ).size(11.0).weak());
+
+                    ui.add_space(4.0);
+
+                    // XTE rate damping — waveform amplitude reduction
+                    ui.label(egui::RichText::new("XTE damping (Kd):").size(12.0));
+                    let old_kd = self.steering.kd_xte;
+                    ui.add(egui::Slider::new(&mut self.steering.kd_xte, 0.0..=2.0)
+                        .step_by(0.1)
+                    );
+                    if (self.steering.kd_xte - old_kd).abs() > 0.01 {
+                        if let Some(db) = &self.db {
+                            let _ = db.set_config("steer_kd_xte", &format!("{:.2}", self.steering.kd_xte));
+                        }
+                    }
+                    ui.label(egui::RichText::new(
+                        "Reduces correction when converging on line — prevents overshoot"
                     ).size(11.0).weak());
 
                     ui.add_space(4.0);

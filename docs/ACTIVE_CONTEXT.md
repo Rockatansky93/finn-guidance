@@ -5,61 +5,59 @@
 > Updated at the end of each working session.
 
 ## Last updated
-Session 19 — 16 April 2026 (Pure pursuit outer loop + IMU heading fusion)
+Session 20 — 18 April 2026 (Waveform-aware inner loop: rate damping, smooth taper, sub-stall pulsing)
 
 ## What we're working on
-**Phase 5 — Structural controller rewrite. Hunting behaviour in field test 4
-traced to controller topology + stale heading signal. Two changes, implemented
-together; ready for field test 5.**
+**Phase 5 continued — Waveform-aware inner loop rewrite (Decision #025).**
 
-**1. Pure pursuit replaces PD outer loop (Decision #023).**
-The `-Kp·XTE - Kh·heading_error` formulation was structurally oscillatory — at
-realistic XTE/heading magnitudes the XTE term had ~36× the authority of the
-heading term, so heading couldn't damp the approach. Replaced with pure pursuit
-geometry: a lookahead point `L` metres ahead on the line, then bicycle-model
-curvature through that point. Single geometric quantity (`alpha`) captures both
-XTE and heading with no term-balancing. `L` scales with speed:
-`L = lookahead_base + lookahead_speed_factor × speed`, clamped to [2, 15] m.
+Insight from real driving: straight-line tractor steering is not straight — the
+wheel constantly oscillates left and right. The controller's job is to minimise
+the *amplitude* of that oscillation, not snap to a fixed angle. The previous inner
+loop's hard deadbands clipped the control signal at the zero-crossing (where fine
+control matters most) and the min_pwm stall floor created bang-bang switching.
 
-Operator-facing as two sliders: **"Approach Aggression"** (maps to
-`lookahead_speed_factor`, 0.3–3.0 s range) and **"Online Aggression"** (maps to
-`lookahead_base`, 2.1–7.5 m range). Both 1–10 scales where higher = more
-aggressive. Live lookahead shown on working-page overlay (`L:N.Nm`) and setup
-page.
+Three changes implemented in `guidance/steering.rs`, all in the inner loop.
+Outer loop (pure pursuit from #023) is unchanged:
 
-**2. Fused heading filter (Decision #024).**
-GPS VTG course-over-ground was the controller's only heading source — 1 Hz,
-noisy at low speed, stale through turns. Meanwhile the BNO055 IMU was parsed,
-stored, displayed, and completely unused. Added complementary filter
-(`pc/src/position/heading_filter.rs`) that blends IMU yaw (10 Hz) with GPS COG
-(1 Hz). Gated by `cal_sys ≥ 2` (IMU) and `speed ≥ 0.8 m/s` (GPS COG). Fused
-heading passed as `override_heading` to the interpolator, overrides `fix.heading`
-for all guidance calculations.
+**1. XTE rate damping (dXTE/dt) — Decision #025, Change 1.**
+New `kd_xte` field (default 0.5). Each `compute()` call tracks how fast XTE is
+changing. When converging on the line, the damping term reduces the desired angle
+(prevents overshoot). When diverging, it adds urgency. This is the core mechanism
+that makes the oscillation amplitude shrink over successive cycles. Rate gated to
+reject stale/double samples (dt must be 1ms–1s). State reset on engage/disengage.
 
-SENSORS panel shows filter status: green "Fused heading (IMU+GPS)" when healthy,
-amber "GPS only — IMU not calibrated" to prompt BNO055 calibration dance.
+**2. Smooth taper replaces hard XTE deadband — Decision #025, Change 2.**
+Instead of snapping `desired_angle` to 0 when XTE < 3cm, the desired angle now
+tapers linearly to zero via `taper = |XTE| / deadband_m`. The waveform passes
+through the zero-crossing smoothly — no more signal clipping in the zone where
+fine control matters most.
 
-**Sequencing rationale:** Bad heading would sabotage any controller. Bad
-controller topology would misuse any heading. Fixing one without the other
-leaves the field test ambiguous. Shipping them together.
+**3. Sub-stall pulsing replaces hard angle deadband — Decision #025, Change 3.**
+The old `angle_error < 2° → PWM = 0` deadband is removed. Instead, when desired
+PWM is below `min_pwm`, it's accumulated over cycles. When the accumulator
+reaches min_pwm, one pulse is fired. This gives time-averaged torque below the
+stall floor — small periodic corrections instead of dead-silence → sudden kick.
+The motor only goes truly silent when the entire control chain (pursuit + damping
++ taper) outputs essentially nothing (`|desired_pwm| < 1`).
 
 **Not yet done:**
-- **Field test 5** — verify hunting is gone and the tractor tracks parallel.
-  Calibrate BNO055 before engaging (figure-eight motions until cal_sys=2+).
-- Tune Approach / Online aggression sliders from defaults (7 / 5) to taste.
-- Update `docs/STEERING_TUNING_GUIDE.md` to describe the new two-slider tuning
-  procedure (current guide describes old Kp/Kh approach).
+- **Field test 6** — verify waveform-aware inner loop behaviour.
+- Tune `kd_xte` from default 0.5 based on field observations.
+- Remove or relabel the now-inert angle deadband slider.
+- Update `docs/STEERING_TUNING_GUIDE.md` to describe the new three-slider tuning
+  procedure (Approach Aggression, Online Aggression, XTE Damping).
 
 ## Current state of the code
-All features below are IMPLEMENTED. Changes in Session 19 are marked **NEW**.
+All features below are IMPLEMENTED. Changes in Session 20 are marked **S20**.
+Previous session changes marked **S19**.
 
 - **GPS reading**: auto-detect COM port, PAIR module config (1Hz LC29H DA), NMEA
   parsing (GGA + VTG, epoch-based), crossbeam channel to GUI thread
 - **Position interpolation**: dead-reckoning between 1Hz fixes at ~30fps for smooth
-  display. Real fixes for coverage/auto-pass, interpolated for GUI. **NEW:**
+  display. Real fixes for coverage/auto-pass, interpolated for GUI. **S19:**
   `interpolate(override_heading)` takes optional fused heading; when supplied,
   both projects position along it and overwrites `fix.heading` on the returned
-  synthetic fix. **NEW:** `HeadingFilter` in `position/heading_filter.rs` fuses
+  synthetic fix. **S19:** `HeadingFilter` in `position/heading_filter.rs` fuses
   BNO055 IMU yaw (10 Hz) with GPS COG (1 Hz) via complementary filter.
 - **Field view canvas**: heading-up/north-up (now driven by fused heading),
   zoom, adaptive grid, scale bar, vehicle triangle with fix-quality ring,
@@ -77,14 +75,16 @@ All features below are IMPLEMENTED. Changes in Session 19 are marked **NEW**.
   zoom-dependent render thinning with bridging quads. Clear button. Field-tested.
 - **Job management**: JOB HISTORY list in Setup page (last 10, with delete)
 - **GUI**: working page (full-screen + overlaid lightbar/XTE/notifications/auto-steer
-  indicator) and setup page. **NEW:** auto-steer overlay now shows lookahead
-  distance (`L:N.Nm`) alongside PWM/target/actual/heading. **NEW:** SENSORS
-  panel shows fused heading with colour-coded filter status. GPS status bar
+  indicator) and setup page. **S19:** auto-steer overlay now shows lookahead
+  distance (`L:N.Nm`) alongside PWM/target/actual/heading. **S19:** SENSORS
+  panel shows fused heading with colour-coded filter status. **S20:** new
+  "XTE damping (Kd)" slider in AUTO-STEER section. GPS status bar
   shared across both pages. Framerate capped at ~30fps.
 - **Configuration persistence**: implement width, overlap, lightbar sensitivity,
-  last AB line ID, WAS calibration, motor invert, **NEW:** `steer_lookahead_base`,
-  `steer_lookahead_speed_factor`, `steer_wheelbase`, plus retained `steer_max_angle`,
-  `steer_kp_angle`. Old `steer_kp` / `steer_kh` keys ignored (not removed).
+  last AB line ID, WAS calibration, motor invert, **S19:** `steer_lookahead_base`,
+  `steer_lookahead_speed_factor`, `steer_wheelbase`, **S20:** `steer_kd_xte`,
+  plus retained `steer_max_angle`, `steer_kp_angle`. Old `steer_kp` / `steer_kh`
+  keys ignored (not removed).
 - **ESP32 firmware**: both sensor and motor modules flashed. Unchanged this session.
 - **FINN sentence parser**: PC-side parser for `$FINNWAS`, `$FINNIMU`, `$FINNHB`,
   `$FINNMTR` with NMEA-style checksum validation.
@@ -95,16 +95,23 @@ All features below are IMPLEMENTED. Changes in Session 19 are marked **NEW**.
   Current values: centre=1832, left=1617, right=2031.
 - **Motor direction**: `motor_invert` toggle persisted to SQLite.
 - **Auto-steer controller**: `SteeringController` in `guidance/steering.rs`.
-  **NEW ARCHITECTURE:**
+  **S19 ARCHITECTURE:**
   - Outer loop: **pure pursuit** — lookahead point on the AB line, bicycle-model
     curvature. Single geometric quantity captures XTE + heading. Parameters:
     `lookahead_base` (m), `lookahead_speed_factor` (s), `wheelbase_m` (m),
     `max_steer_angle` (°). Removed: `kp`, `kh`.
-  - Inner loop: unchanged. Desired angle vs WAS actual → PWM, with `kp_angle`
-    PWM/°, min_pwm stall compensation, angle deadband.
+  - **S20 — Waveform-aware inner loop rewrite:**
+    - XTE rate damping (`kd_xte`, default 0.5): dXTE/dt reduces corrections
+      when converging, increases when diverging. Core amplitude reduction.
+    - Smooth taper replaces hard XTE deadband: desired angle scales linearly
+      from 0 at XTE=0 to full at XTE=deadband_m. No zero-crossing clipping.
+    - Sub-stall pulsing: accumulates sub-min_pwm effort, fires periodic pulses.
+      Replaces hard angle deadband. Motor only silent when entire chain ≈ 0.
+    - `angle_deadband_deg` retained in struct/UI but no longer used by compute().
   Safety: GPS fix timeout (2s disengage), WAS timeout tiered, speed gate,
   max PWM clamp, motor deadzone compensation. Engage button on working page.
-  Two aggression sliders in Setup page persisted to SQLite.
+  Three tuning sliders (Approach Aggression, Online Aggression, XTE Damping)
+  plus inner loop Kp in Setup page, all persisted to SQLite.
   Working page overlay: `PWM / T° / A° / H° / L:m` (L = live lookahead).
   Steer commands throttled to ~10Hz (100ms).
 
@@ -113,8 +120,9 @@ All features below are IMPLEMENTED. Changes in Session 19 are marked **NEW**.
 - #020: Auto-steer as P-control in GUI loop with safety auto-disengage
 - #021: Heading error feedforward in outer loop (fixes diagonal overshoot)
 - #022: Max steer angle cap (15°) and sensor rate reduction (20Hz→10Hz)
-- **#023: Pure pursuit outer loop (replaces XTE+heading PD controller)**
-- **#024: Fused heading filter (IMU + GPS complementary filter)**
+- #023: Pure pursuit outer loop (replaces XTE+heading PD controller)
+- #024: Fused heading filter (IMU + GPS complementary filter)
+- **#025: Waveform-aware inner loop (rate damping, smooth taper, sub-stall pulsing)**
 
 ## Phase 4 hardware inventory (as of 15 April 2026)
 - **ESP32 #1 (sensor node)**: reads WAS (ADC GPIO 34), BNO055 (I2C GPIO 21/22),
@@ -132,34 +140,36 @@ All features below are IMPLEMENTED. Changes in Session 19 are marked **NEW**.
 - **RTK**: no base station or NTRIP subscription yet. Running standalone GPS
   (HDOP 0.4 with 42–50 sats — usable for guidance display, not centimetre-accurate)
 
-## Auto-steer field test checklist (FIFTH TEST — pure pursuit + IMU fusion)
+## Auto-steer field test checklist (SIXTH TEST — waveform-aware inner loop)
 **Pre-flight (before engaging auto-steer):**
 - [ ] Motor responds to MOTOR TEST preset buttons
 - [ ] Motor direction verified: +50 PWM steers RIGHT (toggle motor_invert if not)
 - [ ] WAS calibration values loaded (L:1617 C:1832 R:2031)
 - [ ] AB line set and loaded
-- [ ] **NEW: BNO055 calibrated** — drive figure-eights until SENSORS shows
-      `Cal: S2+ G3 A3 M3` and "Fused heading (IMU+GPS)" is GREEN. If stuck on
-      amber "(GPS only — IMU not calibrated)", steering will still work using
-      GPS COG but will be noisier.
-- [ ] Sliders at defaults: Approach Aggression=7, Online Aggression=5
+- [ ] BNO055 calibrated — drive figure-eights until SENSORS shows
+      `Cal: S2+ G3 A3 M3` and "Fused heading (IMU+GPS)" is GREEN
+- [ ] Sliders at defaults: Approach Aggression=7, Online Aggression=5, XTE Damping=0.5
 
 **First engagement:**
 - [ ] Drive onto AB line at working speed (~5 km/h)
 - [ ] Tap ⊕ AUTO-STEER on working page
 - [ ] Green overlay should show: `AUTO-STEER PWM N T:X° A:Y° H:Z° L:M.Mm`
-- [ ] **Key test — smooth tracking**: watch the L: readout. It should be
-      ~3 m at standstill and ~5–8 m at working speed. The motor should
-      command modest angles (T:±5° typical when off-line, T:0° when tracking).
-- [ ] **Key test — no hunting**: once on the line, T: A: and H: should all hover
-      near zero. If still hunting, try increasing Approach Aggression one step
-      at a time (sharper line acquisition) or decreasing Online Aggression
-      (gentler on-line holding).
-- [ ] **Key test — heading tracks turns**: yank the wheel 20° and watch the
-      SENSORS panel's fused heading update within 100ms (10 Hz). Previously
-      this lagged up to 1 s.
+- [ ] **Key test — smooth zero-crossing**: watch PWM as the tractor crosses the
+      line (XTE goes through zero). With the old controller, PWM went to zero in
+      the deadband. Now it should smoothly taper, possibly with small sub-stall
+      pulses. No dead silence → sudden kick pattern.
+- [ ] **Key test — converging damping**: approach the line from 1m off. As XTE
+      decreases, the correction should visibly ease off (desired angle shrinking
+      faster than XTE alone would predict). No overshoot through the line.
+- [ ] **Key test — no hunting**: once on the line, T: A: and H: should hover
+      near zero with small oscillations. The oscillation amplitude should be
+      smaller than with the previous hard-deadband controller.
+- [ ] **Key test — sub-stall pulses**: when near the line (small XTE), watch
+      for periodic small motor movements (pulses at min_pwm). These should be
+      gentle nudges, not the old bang-bang kicks.
 - [ ] If motor steers AWAY from line: immediately ⊗ STEER OFF, toggle motor_invert.
-- [ ] If too aggressive (twitchy): decrease sliders. If too lazy: increase them.
+- [ ] If oscillation amplitude is too large: increase XTE Damping (Kd) toward 1.0.
+- [ ] If approach to line feels sluggish: decrease XTE Damping toward 0.2.
 
 **Safety verification:** (unchanged from previous tests)
 - [ ] ⊗ STEER OFF → motor stops immediately
@@ -169,12 +179,13 @@ All features below are IMPLEMENTED. Changes in Session 19 are marked **NEW**.
 - [ ] WAS amber warning appears briefly during normal driving (not full disengage)
 
 ## Next session should
-1. Read this file and DECISIONS.md #023–#024 for context
-2. **Field test 5** — verify pure pursuit + IMU fusion behaviour as described above
-3. Tune Approach / Online aggression from field observations
-4. If behaviour is good, update STEERING_TUNING_GUIDE.md to reflect the two-slider
-   approach (old guide talks about Kp/Kh which no longer exist)
-5. If a specific repeatable failure mode appears, capture it in DECISIONS.md
+1. Read this file and DECISIONS.md #025 for context
+2. **Field test 6** — verify waveform-aware inner loop as described above
+3. Tune XTE Damping (kd_xte) from field observations
+4. If behaviour is good, update STEERING_TUNING_GUIDE.md to reflect the three-slider
+   approach (Approach Aggression, Online Aggression, XTE Damping)
+5. Remove or relabel the now-inert angle deadband slider
+6. If a specific repeatable failure mode appears, capture it in DECISIONS.md
    before patching — want to understand the structural cause first
 
 ## File map (quick reference)
