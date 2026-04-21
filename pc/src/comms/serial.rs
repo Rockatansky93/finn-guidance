@@ -139,6 +139,7 @@ pub fn run_motor_reader(
     baud_rate: u32,
     handle: MotorHandle,
     finn_tx: Sender<FinnMessage>,
+    finn_tx_steer: Sender<FinnMessage>,
 ) {
     // Brief delay to let the GPS reader claim its port first
     std::thread::sleep(Duration::from_secs(2));
@@ -186,8 +187,12 @@ pub fn run_motor_reader(
 
                 if sentence.starts_with("$FINN") {
                     if let Some(msg) = finn_parser::parse_finn_sentence(&sentence) {
-                        if finn_tx.send(msg).is_err() {
-                            tracing::warn!("FINN channel closed, stopping motor reader");
+                        // Send to GUI channel
+                        let gui_closed = finn_tx.send(msg.clone()).is_err();
+                        // Send to steer thread channel
+                        let steer_closed = finn_tx_steer.send(msg).is_err();
+                        if gui_closed && steer_closed {
+                            tracing::warn!("All FINN channels closed, stopping motor reader");
                             return;
                         }
                     }

@@ -9,14 +9,14 @@
 //! The GPS status bar is always visible on both pages (safety-critical).
 
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use eframe::egui;
 use crossbeam_channel::Receiver;
 use finn_guidance_common::types::{GpsFix, CrossTrackError, FixQuality, MotorStatus};
 use finn_guidance_common::protocol::FinnMessage;
 use crate::comms::serial::MotorHandle;
 use crate::guidance::ab_line::AbLineGuide;
-use crate::guidance::steering::SteeringController;
+use crate::guidance::steer_thread::{SteerStateHandle, SteerCommand, SteerDisplayState, AbLineData};
 use crate::coverage::logger::CoverageLogger;
 use crate::coverage::db::{CoverageDb, SavedField, SavedAbLine};
 use crate::position::interpolator::PositionInterpolator;
@@ -25,12 +25,6 @@ use super::field_view::FieldView;
 /// Target frame interval — 30fps is smooth for guidance display while
 /// keeping CPU load low on field laptops (Dell 7390 etc).
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
-
-/// Minimum interval between motor serial writes. The ESP32 watchdog is
-/// 500ms, so 100ms (10Hz) keeps it well fed without flooding the serial
-/// bus. Matches the WAS update rate so we react to every new reading
-/// without sending redundant commands between readings.
-const STEER_SEND_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Which page is currently displayed
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -84,13 +78,13 @@ pub struct GuidanceApp {
     motor_test_msg: Option<(String, u32)>,
 
     // --- Auto-steer ---
-    /// Steering controller — pure pursuit outer loop + WAS-feedback inner loop
-    steering: SteeringController,
+    /// Shared steering state — steer thread owns the controller,
+    /// GUI reads display state and writes commands/tuning.
+    steer_state: SteerStateHandle,
+    /// Cached display snapshot (refreshed each frame from shared state)
+    steer_display: SteerDisplayState,
     /// Status message for auto-steer events (shown on working page)
     steer_status_msg: Option<(String, u32)>,
-    /// Last time a steer command was sent to the motor ESP32.
-    /// Throttles serial writes to ~20Hz instead of every frame.
-    last_steer_send: Instant,
 
     // --- WAS calibration ---
     /// WAS ADC value at steering centre (wheels straight)
@@ -130,7 +124,7 @@ pub struct GuidanceApp {
 }
 
 impl GuidanceApp {
-    pub fn new(gps_rx: Receiver<GpsFix>, finn_rx: Receiver<FinnMessage>, motor_handle: MotorHandle, implement_width: f64) -> Self {
+    pub fn new(gps_rx: Receiver<GpsFix>, finn_rx: Receiver<FinnMessage>, motor_handle: MotorHandle, steer_state: SteerStateHandle, implement_width: f64) -> Self {
         // Open the coverage database.  `CoverageLogger` also holds a reference
         // in some configurations; here we open a second handle for persistence.
         let db = CoverageDb::open(std::path::Path::new("data/coverage.db")).ok();
@@ -193,7 +187,7 @@ impl GuidanceApp {
             .and_then(|d| d.get_config("steer_max_angle"))
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(15.0);
-        let steer_kp_angle = db.as_ref()
+        let _steer_kp_angle = db.as_ref()
             .and_then(|d| d.get_config("steer_kp_angle"))
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(10.0);
@@ -217,6 +211,16 @@ impl GuidanceApp {
             }
         }
 
+        // Capture values from guide before it moves into Self
+        let guide_width = guide.implement_width_m;
+        let guide_overlap = guide.overlap_m;
+        let guide_ab_points = guide.ab_points().map(|pts| AbLineData {
+            a_lat: pts.a_lat,
+            a_lon: pts.a_lon,
+            b_lat: pts.b_lat,
+            b_lon: pts.b_lon,
+        });
+
         Self {
             gps_rx,
             finn_rx,
@@ -236,17 +240,26 @@ impl GuidanceApp {
             motor_handle,
             test_pwm: 0,
             motor_test_msg: None,
-            steering: {
-                let mut s = SteeringController::new();
-                s.lookahead_base = lookahead_base;
-                s.lookahead_speed_factor = lookahead_speed_factor;
-                s.wheelbase_m = steer_wheelbase;
-                s.max_steer_angle = steer_max_angle;
-                s.kd_xte = steer_kd_xte;
-                s
+            steer_state: {
+                // Update shared state with loaded tuning params
+                let mut state = steer_state.lock().unwrap();
+                state.lookahead_base = lookahead_base;
+                state.lookahead_speed_factor = lookahead_speed_factor;
+                state.wheelbase_m = steer_wheelbase;
+                state.max_steer_angle = steer_max_angle;
+                state.kd_xte = steer_kd_xte;
+                state.implement_width_m = guide_width;
+                state.overlap_m = guide_overlap;
+                // Sync the loaded AB line to steer thread
+                if let Some(ab) = guide_ab_points {
+                    state.ab_line = Some(ab);
+                    state.ab_line_dirty = true;
+                }
+                drop(state);
+                steer_state
             },
+            steer_display: SteerDisplayState::default(),
             steer_status_msg: None,
-            last_steer_send: Instant::now(),
             was_centre,
             was_left_lock,
             was_right_lock,
@@ -272,6 +285,25 @@ impl GuidanceApp {
             self.saved_fields = db.list_fields().unwrap_or_default();
             self.saved_ab_lines = db.list_ab_lines().unwrap_or_default();
         }
+    }
+
+    /// Sync the current AB line state from the GUI's guide to the steer thread.
+    /// Call whenever the AB line, pass number, nudge, implement width, or overlap changes.
+    fn sync_guide_to_steer_thread(&self) {
+        let mut state = self.steer_state.lock().unwrap();
+        state.implement_width_m = self.guide.implement_width_m;
+        state.overlap_m = self.guide.overlap_m;
+        state.pass_number = self.guide.pass_number;
+        state.nudge_m = self.guide.nudge_m;
+        if let Some(pts) = self.guide.ab_points() {
+            state.ab_line = Some(AbLineData {
+                a_lat: pts.a_lat,
+                a_lon: pts.a_lon,
+                b_lat: pts.b_lat,
+                b_lon: pts.b_lon,
+            });
+        }
+        state.ab_line_dirty = true;
     }
 
     /// Compute a calibrated steering angle from a raw WAS ADC value.
@@ -319,13 +351,14 @@ impl GuidanceApp {
 impl eframe::App for GuidanceApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // === Process real GPS fixes from the reader thread ===
-        // These are 1Hz from the LC29H DA. Used for coverage logging and auto-pass
-        // detection (things that need true positions, not interpolated ones).
+        // These arrive at 10Hz from the LC29H BA. Used for coverage logging,
+        // auto-pass detection, trail, and display interpolation.
+        // NOTE: Steering compute is now handled by the dedicated steer thread.
         while let Ok(fix) = self.gps_rx.try_recv() {
             // Feed the interpolator with the true position
             self.interpolator.update_fix(&fix);
 
-            // Add real fix to trail (1Hz is fine for the breadcrumb path)
+            // Add real fix to trail
             self.position_trail.push_back((fix.latitude, fix.longitude));
             if self.position_trail.len() > self.max_trail {
                 self.position_trail.pop_front();
@@ -333,6 +366,10 @@ impl eframe::App for GuidanceApp {
 
             // Auto-pass: detect headland turn and snap to nearest pass (real fix only)
             if let Some(event) = self.guide.update_auto_pass(&fix) {
+                // Sync the new pass number to the steer thread
+                let mut state = self.steer_state.lock().unwrap();
+                state.pass_number = self.guide.pass_number;
+                drop(state);
                 self.auto_pass_notification = Some((
                     format!("Auto → Pass {}", event.new_pass),
                     180, // ~3 seconds at 60fps
@@ -342,9 +379,6 @@ impl eframe::App for GuidanceApp {
             // Log coverage if engaged (real fix only — distance filter needs true positions)
             self.coverage.log_fix(&fix, self.db.as_ref());
 
-            // Notify steering controller of fresh GPS data (for safety timeout)
-            self.steering.notify_gps_fix();
-
             self.current_fix = Some(fix);
         }
 
@@ -352,7 +386,8 @@ impl eframe::App for GuidanceApp {
         while let Ok(msg) = self.finn_rx.try_recv() {
             match msg {
                 FinnMessage::MotorStatus(mtr) => {
-                    self.steering.update_motor_feedback(mtr.current_pwm, mtr.actual_angle);
+                    // GUI keeps motor status for sensor display panel only.
+                    // Steer thread gets its own copy via its own channel.
                     self.latest_motor = Some(mtr);
                 }
                 FinnMessage::ConfigAck(ack) => {
@@ -364,49 +399,32 @@ impl eframe::App for GuidanceApp {
             }
         }
 
+        // === Read latest steering display state from steer thread ===
+        {
+            let mut state = self.steer_state.lock().unwrap();
+            self.steer_display = state.display.clone();
+            // Check if steer thread flagged a disengage event
+            if state.display.just_disengaged {
+                let reason = state.display.disengage_reason.clone()
+                    .unwrap_or_else(|| "Unknown".to_string());
+                self.steer_status_msg = Some((
+                    format!("Auto-steer OFF: {}", reason),
+                    300,
+                ));
+                state.display.just_disengaged = false;
+            }
+        }
+
         // === Interpolate position for smooth display (every frame, ~30fps) ===
         // At 10Hz GPS from the LC29H BA, the interpolator bridges 100ms gaps.
         // No external heading filter needed — the BA handles IMU fusion internally.
+        // NOTE: Steering compute is handled by the steer thread. GUI only
+        // calculates XTE here for lightbar/display purposes.
         if let Some(interp_fix) = self.interpolator.interpolate(None) {
             let interp_fix = interp_fix.clone();
 
             // Recalculate guidance error with interpolated position (smooth lightbar/XTE)
             self.current_error = self.guide.calculate_error(&interp_fix);
-
-            // === Auto-steer: compute desired angle and send to ESP32 ===
-            // Throttled to ~10Hz. The ESP32 runs the inner loop at 100Hz locally.
-            if self.steering.engaged {
-                let now = Instant::now();
-                let should_send = now.duration_since(self.last_steer_send) >= STEER_SEND_INTERVAL;
-
-                if let Some(error) = &self.current_error {
-                    let (desired_angle, disengaged) = self.steering.compute(
-                        error.distance_m,
-                        error.heading_error,
-                        interp_fix.speed,
-                    );
-                    if disengaged {
-                        // Safety disengage — send zero angle immediately
-                        let _ = self.motor_handle.send_steer_angle(0.0);
-                        self.last_steer_send = now;
-                        let reason = self.steering.disengage_reason.clone()
-                            .unwrap_or_else(|| "Unknown".to_string());
-                        self.steer_status_msg = Some((
-                            format!("Auto-steer OFF: {}", reason),
-                            300,
-                        ));
-                    } else if should_send {
-                        let _ = self.motor_handle.send_steer_angle(desired_angle);
-                        self.last_steer_send = now;
-                    }
-                } else {
-                    // No guidance error (no AB line?) — send zero angle (throttled)
-                    if should_send {
-                        let _ = self.motor_handle.send_steer_angle(0.0);
-                        self.last_steer_send = now;
-                    }
-                }
-            }
 
             self.display_fix = Some(interp_fix);
         }
@@ -519,7 +537,7 @@ impl GuidanceApp {
                         && self.was_left_lock.is_some()
                         && self.was_right_lock.is_some();
 
-                    let (steer_text, steer_colour) = if self.steering.engaged {
+                    let (steer_text, steer_colour) = if self.steer_display.engaged {
                         ("⊗ STEER OFF", egui::Color32::from_rgb(255, 60, 60))
                     } else {
                         ("⊕ AUTO-STEER", egui::Color32::from_rgb(100, 200, 255))
@@ -528,16 +546,19 @@ impl GuidanceApp {
                         egui::RichText::new(steer_text).size(18.0).strong().color(steer_colour)
                     ).min_size(egui::vec2(140.0, 40.0));
                     let steer_resp = ui.add_enabled(
-                        can_auto_steer || self.steering.engaged,
+                        can_auto_steer || self.steer_display.engaged,
                         steer_btn,
                     );
                     if steer_resp.clicked() {
-                        if self.steering.engaged {
-                            self.steering.disengage(Some("Manual disengage".to_string()));
-                            let _ = self.motor_handle.send_steer_angle(0.0);
+                        if self.steer_display.engaged {
+                            let mut state = self.steer_state.lock().unwrap();
+                            state.commands.push(SteerCommand::Disengage);
+                            drop(state);
                             self.steer_status_msg = Some(("Auto-steer OFF".to_string(), 180));
                         } else {
-                            self.steering.engage();
+                            let mut state = self.steer_state.lock().unwrap();
+                            state.commands.push(SteerCommand::Engage);
+                            drop(state);
                             self.steer_status_msg = Some(("Auto-steer ON".to_string(), 180));
                         }
                     }
@@ -689,17 +710,14 @@ impl GuidanceApp {
                 }
 
                 // Auto-steer status indicator (top-left, below lightbar)
-                if self.steering.engaged {
-                    // Show: PWM / Target angle / Actual angle / Heading error / Lookahead
-                    // The L: readout lets the operator see the pure-pursuit lookahead
-                    // stretching with speed — handy for intuition while tuning.
+                if self.steer_display.engaged {
                     let steer_text = format!(
                         "AUTO-STEER  PWM {}  T:{:.0}° A:{:.0}° H:{:.0}°  L:{:.1}m",
-                        self.steering.last_output_pwm,
-                        self.steering.last_desired_angle,
-                        self.steering.last_actual_angle,
-                        self.steering.last_heading_error,
-                        self.steering.last_lookahead_m,
+                        self.steer_display.output_pwm,
+                        self.steer_display.desired_angle,
+                        self.steer_display.actual_angle,
+                        self.steer_display.heading_error,
+                        self.steer_display.lookahead_m,
                     );
                     let steer_pos = egui::pos2(overlay_rect.left() + 20.0, overlay_rect.top() + 55.0);
                     let indicator_colour = egui::Color32::from_rgb(100, 255, 100);
@@ -875,11 +893,13 @@ impl GuidanceApp {
                         if ui.add(egui::Button::new("Set A").min_size(egui::vec2(70.0, 30.0))).clicked() {
                             if let Some(fix) = &self.current_fix {
                                 self.guide.set_point_a(fix);
+                                self.sync_guide_to_steer_thread();
                             }
                         }
                         if ui.add(egui::Button::new("Set B").min_size(egui::vec2(70.0, 30.0))).clicked() {
                             if let Some(fix) = &self.current_fix {
                                 self.guide.set_point_b(fix);
+                                self.sync_guide_to_steer_thread();
                             }
                         }
                     });
@@ -890,6 +910,7 @@ impl GuidanceApp {
                     ui.horizontal(|ui| {
                         if ui.add(egui::Button::new("◄ Pass").min_size(egui::vec2(70.0, 30.0))).clicked() {
                             self.guide.prev_pass();
+                            self.sync_guide_to_steer_thread();
                         }
                         ui.label(
                             egui::RichText::new(format!("Pass {}", self.guide.pass_number))
@@ -897,6 +918,7 @@ impl GuidanceApp {
                         );
                         if ui.add(egui::Button::new("Pass ►").min_size(egui::vec2(70.0, 30.0))).clicked() {
                             self.guide.next_pass();
+                            self.sync_guide_to_steer_thread();
                         }
                     });
 
@@ -938,6 +960,7 @@ impl GuidanceApp {
                     if align_resp.clicked() {
                         if let Some(fix) = self.current_fix.clone() {
                             if let Some(new_pass) = self.guide.align_grid_to_position(&fix) {
+                                self.sync_guide_to_steer_thread();
                                 self.ab_status_msg = Some((
                                     format!("Grid aligned — now on Pass {}", new_pass),
                                     240,
@@ -1103,6 +1126,7 @@ impl GuidanceApp {
                                         ui.horizontal(|ui| {
                                             if ui.small_button("Load").clicked() {
                                                 self.guide.load_ab_line(*a_lat, *a_lon, *b_lat, *b_lon);
+                                                self.sync_guide_to_steer_thread();
                                                 if let Some(db) = &self.db {
                                                     let _ = db.set_config("last_ab_line_id", &id.to_string());
                                                 }
@@ -1144,6 +1168,7 @@ impl GuidanceApp {
                                             ui.horizontal(|ui| {
                                                 if ui.small_button("Load").clicked() {
                                                     self.guide.load_ab_line(a_lat, a_lon, b_lat, b_lon);
+                                                    self.sync_guide_to_steer_thread();
                                                     if let Some(db) = &self.db {
                                                         let _ = db.set_config("last_ab_line_id", &id.to_string());
                                                     }
@@ -1260,6 +1285,7 @@ impl GuidanceApp {
                             self.guide.implement_width_m = new_width;
                             self.coverage.set_implement_width(new_width);
                             self.guide.pass_offset_m = self.guide.pass_spacing() * self.guide.pass_number as f64;
+                            self.sync_guide_to_steer_thread();
                             if let Some(db) = &self.db {
                                 let _ = db.set_config("implement_width_m", &format!("{:.1}", new_width));
                             }
@@ -1273,6 +1299,7 @@ impl GuidanceApp {
                             self.guide.implement_width_m = new_width;
                             self.coverage.set_implement_width(new_width);
                             self.guide.pass_offset_m = self.guide.pass_spacing() * self.guide.pass_number as f64;
+                            self.sync_guide_to_steer_thread();
                             if let Some(db) = &self.db {
                                 let _ = db.set_config("implement_width_m", &format!("{:.1}", new_width));
                             }
@@ -1289,6 +1316,7 @@ impl GuidanceApp {
                             let new_cm = (overlap_cm - 5).max(0);
                             self.guide.overlap_m = new_cm as f64 / 100.0;
                             self.guide.pass_offset_m = self.guide.pass_spacing() * self.guide.pass_number as f64;
+                            self.sync_guide_to_steer_thread();
                             if let Some(db) = &self.db {
                                 let _ = db.set_config("overlap_m", &format!("{:.2}", self.guide.overlap_m));
                             }
@@ -1303,6 +1331,7 @@ impl GuidanceApp {
                             let new_cm = (overlap_cm + 5).min(max_cm);
                             self.guide.overlap_m = new_cm as f64 / 100.0;
                             self.guide.pass_offset_m = self.guide.pass_spacing() * self.guide.pass_number as f64;
+                            self.sync_guide_to_steer_thread();
                             if let Some(db) = &self.db {
                                 let _ = db.set_config("overlap_m", &format!("{:.2}", self.guide.overlap_m));
                             }
@@ -1353,12 +1382,15 @@ impl GuidanceApp {
                     ui.horizontal(|ui| {
                         if ui.add(egui::Button::new("◄◄ 5").min_size(egui::vec2(56.0, 30.0))).clicked() {
                             self.guide.nudge_left(0.05);
+                            self.sync_guide_to_steer_thread();
                         }
                         if ui.add(egui::Button::new("Reset").min_size(egui::vec2(50.0, 30.0))).clicked() {
                             self.guide.nudge_reset();
+                            self.sync_guide_to_steer_thread();
                         }
                         if ui.add(egui::Button::new("5 ►►").min_size(egui::vec2(56.0, 30.0))).clicked() {
                             self.guide.nudge_right(0.05);
+                            self.sync_guide_to_steer_thread();
                         }
                     });
 
@@ -1369,10 +1401,12 @@ impl GuidanceApp {
                     ui.horizontal(|ui| {
                         if ui.add(egui::Button::new("◄ 1").min_size(egui::vec2(56.0, 30.0))).clicked() {
                             self.guide.nudge_left(0.01);
+                            self.sync_guide_to_steer_thread();
                         }
                         ui.add_space(50.0); // keep alignment with row above
                         if ui.add(egui::Button::new("1 ►").min_size(egui::vec2(56.0, 30.0))).clicked() {
                             self.guide.nudge_right(0.01);
+                            self.sync_guide_to_steer_thread();
                         }
                     });
 
@@ -1725,59 +1759,47 @@ impl GuidanceApp {
                     ui.label(egui::RichText::new("AUTO-STEER").size(14.0).strong());
                     ui.add_space(4.0);
 
-                    // Status
-                    if self.steering.engaged {
+                    // Status (read from steer thread display state)
+                    if self.steer_display.engaged {
                         ui.colored_label(egui::Color32::GREEN,
-                            egui::RichText::new(format!("● ENGAGED  PWM {}", self.steering.last_output_pwm))
+                            egui::RichText::new(format!("● ENGAGED  PWM {}", self.steer_display.output_pwm))
                                 .size(14.0).strong()
                         );
-                        // Show inner loop debug: desired vs actual angle, heading error,
-                        // plus the live pure-pursuit lookahead so the operator can see
-                        // it expanding with speed.
                         ui.label(egui::RichText::new(format!(
                             "Target: {:.1}°  Actual: {:.1}°  Hdg err: {:.1}°",
-                            self.steering.last_desired_angle,
-                            self.steering.last_actual_angle,
-                            self.steering.last_heading_error,
+                            self.steer_display.desired_angle,
+                            self.steer_display.actual_angle,
+                            self.steer_display.heading_error,
                         )).size(12.0));
                         ui.label(egui::RichText::new(format!(
                             "Lookahead: {:.1} m",
-                            self.steering.last_lookahead_m,
+                            self.steer_display.lookahead_m,
                         )).size(12.0).color(egui::Color32::from_rgb(100, 200, 255)));
                     } else {
                         ui.colored_label(egui::Color32::GRAY, "● Disengaged");
-                        if let Some(ref reason) = self.steering.disengage_reason {
+                        if let Some(ref reason) = self.steer_display.disengage_reason {
                             ui.label(egui::RichText::new(format!("Last: {}", reason)).size(11.0).weak());
                         }
                     }
 
                     ui.add_space(6.0);
 
-                    // Outer loop: pure pursuit — two aggression sliders.
-                    //
-                    // These map to the pure-pursuit lookahead distance, inverted so
-                    // higher slider = more aggressive (shorter lookahead). Intuition:
-                    //  • "Approach Aggression" — how firmly the tractor drives toward
-                    //    the line when approaching from the side. Maps to
-                    //    lookahead_speed_factor (seconds). Higher slider = smaller
-                    //    time-horizon = sharper approach.
-                    //  • "Online Aggression" — how firmly the tractor holds the line
-                    //    once near it. Maps to lookahead_base (metres). Higher slider
-                    //    = smaller base distance = crisper corrections on-line.
+                    // Read current tuning values from shared state for sliders
+                    let (mut cur_lookahead_base, mut cur_lookahead_speed_factor,
+                         mut cur_wheelbase, mut cur_max_angle, mut cur_kd_xte,
+                         mut cur_deadband_m) = {
+                        let state = self.steer_state.lock().unwrap();
+                        (state.lookahead_base, state.lookahead_speed_factor,
+                         state.wheelbase_m, state.max_steer_angle, state.kd_xte,
+                         state.deadband_m)
+                    };
+
                     ui.label(egui::RichText::new("Outer loop — line tracking:").size(12.0).strong());
                     ui.add_space(4.0);
 
-                    // Slider range 1..=10; higher = more aggressive.
-                    // See mapping helpers below the slider.
-                    //
-                    // Approach Aggression (affects lookahead_speed_factor).
-                    //   internal = (11 - slider) * 0.3
-                    //   slider 1  → 3.0 s (very gentle approach)
-                    //   slider 7  → 1.2 s (balanced — default)
-                    //   slider 10 → 0.3 s (aggressive)
+                    // Approach Aggression slider
                     let current_approach_slider: i32 = {
-                        let lsf = self.steering.lookahead_speed_factor;
-                        let s = (11.0 - (lsf / 0.3)).round() as i32;
+                        let s = (11.0 - (cur_lookahead_speed_factor / 0.3)).round() as i32;
                         s.clamp(1, 10)
                     };
                     let mut approach_slider = current_approach_slider;
@@ -1786,31 +1808,26 @@ impl GuidanceApp {
                         .step_by(1.0)
                     );
                     if approach_slider != current_approach_slider {
-                        self.steering.lookahead_speed_factor = (11 - approach_slider) as f64 * 0.3;
+                        cur_lookahead_speed_factor = (11 - approach_slider) as f64 * 0.3;
                         if let Some(db) = &self.db {
                             let _ = db.set_config(
                                 "steer_lookahead_speed_factor",
-                                &format!("{:.2}", self.steering.lookahead_speed_factor),
+                                &format!("{:.2}", cur_lookahead_speed_factor),
                             );
                         }
                     }
                     ui.label(egui::RichText::new(
                         format!(
                             "{:.1} s time-horizon  (higher = sharper line capture)",
-                            self.steering.lookahead_speed_factor,
+                            cur_lookahead_speed_factor,
                         )
                     ).size(11.0).weak());
 
                     ui.add_space(6.0);
 
-                    // Online Aggression (affects lookahead_base).
-                    //   internal = (11 - slider) * 0.6 + 1.5
-                    //   slider 1  → 7.5 m (very smooth on line)
-                    //   slider 5  → 5.1 m (balanced — default)
-                    //   slider 10 → 2.1 m (crisp / twitchy)
+                    // Online Aggression slider
                     let current_online_slider: i32 = {
-                        let lb = self.steering.lookahead_base;
-                        let s = (11.0 - ((lb - 1.5) / 0.6)).round() as i32;
+                        let s = (11.0 - ((cur_lookahead_base - 1.5) / 0.6)).round() as i32;
                         s.clamp(1, 10)
                     };
                     let mut online_slider = current_online_slider;
@@ -1819,45 +1836,43 @@ impl GuidanceApp {
                         .step_by(1.0)
                     );
                     if online_slider != current_online_slider {
-                        self.steering.lookahead_base = (11 - online_slider) as f64 * 0.6 + 1.5;
+                        cur_lookahead_base = (11 - online_slider) as f64 * 0.6 + 1.5;
                         if let Some(db) = &self.db {
                             let _ = db.set_config(
                                 "steer_lookahead_base",
-                                &format!("{:.2}", self.steering.lookahead_base),
+                                &format!("{:.2}", cur_lookahead_base),
                             );
                         }
                     }
                     ui.label(egui::RichText::new(
                         format!(
                             "{:.1} m base lookahead  (higher = crisper on-line holding)",
-                            self.steering.lookahead_base,
+                            cur_lookahead_base,
                         )
                     ).size(11.0).weak());
 
                     ui.add_space(4.0);
 
-                    // Live lookahead display (computed lookahead = base + speed × factor)
-                    if self.steering.engaged {
+                    // Live lookahead display
+                    if self.steer_display.engaged {
                         ui.label(egui::RichText::new(
-                            format!("Live lookahead: {:.1} m", self.steering.last_lookahead_m)
+                            format!("Live lookahead: {:.1} m", self.steer_display.lookahead_m)
                         ).size(11.0).color(egui::Color32::from_rgb(100, 200, 255)));
                     }
 
                     ui.add_space(6.0);
 
-                    // Wheelbase — not a tuning knob, but exposed so it can be set
-                    // once per tractor. Pure pursuit uses this in the bicycle-model
-                    // curvature calculation.
+                    // Wheelbase
                     ui.label(egui::RichText::new("Wheelbase:").size(12.0));
-                    let old_wb = self.steering.wheelbase_m;
-                    ui.add(egui::Slider::new(&mut self.steering.wheelbase_m, 1.5..=4.5)
+                    let old_wb = cur_wheelbase;
+                    ui.add(egui::Slider::new(&mut cur_wheelbase, 1.5..=4.5)
                         .step_by(0.1)
                         .suffix(" m")
                     );
-                    if (self.steering.wheelbase_m - old_wb).abs() > 0.01 {
+                    if (cur_wheelbase - old_wb).abs() > 0.01 {
                         if let Some(db) = &self.db {
                             let _ = db.set_config("steer_wheelbase",
-                                &format!("{:.2}", self.steering.wheelbase_m));
+                                &format!("{:.2}", cur_wheelbase));
                         }
                     }
                     ui.label(egui::RichText::new(
@@ -1866,16 +1881,16 @@ impl GuidanceApp {
 
                     ui.add_space(6.0);
 
-                    // Max steer angle — caps how hard the outer loop can command
+                    // Max steer angle
                     ui.label(egui::RichText::new("Max steer angle:").size(12.0));
-                    let old_max_angle = self.steering.max_steer_angle;
-                    ui.add(egui::Slider::new(&mut self.steering.max_steer_angle, 5.0..=30.0)
+                    let old_max_angle = cur_max_angle;
+                    ui.add(egui::Slider::new(&mut cur_max_angle, 5.0..=30.0)
                         .step_by(1.0)
                         .suffix("°")
                     );
-                    if (self.steering.max_steer_angle - old_max_angle).abs() > 0.1 {
+                    if (cur_max_angle - old_max_angle).abs() > 0.1 {
                         if let Some(db) = &self.db {
-                            let _ = db.set_config("steer_max_angle", &format!("{:.0}", self.steering.max_steer_angle));
+                            let _ = db.set_config("steer_max_angle", &format!("{:.0}", cur_max_angle));
                         }
                     }
                     ui.label(egui::RichText::new(
@@ -1884,15 +1899,15 @@ impl GuidanceApp {
 
                     ui.add_space(6.0);
 
-                    // XTE rate damping — waveform amplitude reduction
+                    // XTE rate damping
                     ui.label(egui::RichText::new("XTE damping (Kd):").size(12.0));
-                    let old_kd = self.steering.kd_xte;
-                    ui.add(egui::Slider::new(&mut self.steering.kd_xte, 0.0..=2.0)
+                    let old_kd = cur_kd_xte;
+                    ui.add(egui::Slider::new(&mut cur_kd_xte, 0.0..=2.0)
                         .step_by(0.1)
                     );
-                    if (self.steering.kd_xte - old_kd).abs() > 0.01 {
+                    if (cur_kd_xte - old_kd).abs() > 0.01 {
                         if let Some(db) = &self.db {
-                            let _ = db.set_config("steer_kd_xte", &format!("{:.2}", self.steering.kd_xte));
+                            let _ = db.set_config("steer_kd_xte", &format!("{:.2}", cur_kd_xte));
                         }
                     }
                     ui.label(egui::RichText::new(
@@ -1901,14 +1916,25 @@ impl GuidanceApp {
 
                     ui.add_space(4.0);
 
-                    // Deadband slider (outer loop smooth taper zone)
-                    let mut deadband_cm = self.steering.deadband_m * 100.0;
+                    // Deadband slider
+                    let mut deadband_cm = cur_deadband_m * 100.0;
                     ui.label(egui::RichText::new("Deadband:").size(12.0));
                     ui.add(egui::Slider::new(&mut deadband_cm, 0.0..=20.0)
                         .step_by(1.0)
                         .suffix(" cm")
                     );
-                    self.steering.deadband_m = deadband_cm / 100.0;
+                    cur_deadband_m = deadband_cm / 100.0;
+
+                    // Write all tuning params back to shared state
+                    {
+                        let mut state = self.steer_state.lock().unwrap();
+                        state.lookahead_base = cur_lookahead_base;
+                        state.lookahead_speed_factor = cur_lookahead_speed_factor;
+                        state.wheelbase_m = cur_wheelbase;
+                        state.max_steer_angle = cur_max_angle;
+                        state.kd_xte = cur_kd_xte;
+                        state.deadband_m = cur_deadband_m;
+                    }
 
                     ui.add_space(10.0);
                     ui.separator();

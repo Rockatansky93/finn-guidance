@@ -261,6 +261,7 @@ fn format_pair_command(body: &str) -> String {
 pub fn run_gps_reader(
     config: GpsConfig,
     gps_tx: Sender<GpsFix>,
+    gps_tx_steer: Sender<GpsFix>,
     port_name_tx: Sender<String>,
 ) {
     // === Step 1: Resolve port name ===
@@ -322,8 +323,12 @@ pub fn run_gps_reader(
                             fix.latitude, fix.longitude, fix.satellites, fix.fix_quality
                         );
                     }
-                    if gps_tx.send(fix).is_err() {
-                        tracing::warn!("GPS channel closed, stopping reader");
+                    // Send to GUI channel
+                    let gui_closed = gps_tx.send(fix.clone()).is_err();
+                    // Send to steer thread channel
+                    let steer_closed = gps_tx_steer.send(fix).is_err();
+                    if gui_closed && steer_closed {
+                        tracing::warn!("All GPS channels closed, stopping reader");
                         return;
                     }
                 }
