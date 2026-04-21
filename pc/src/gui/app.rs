@@ -1595,6 +1595,10 @@ impl GuidanceApp {
                             if let Some(db) = &self.db {
                                 let _ = db.set_config("was_centre", &mtr.was_raw.to_string());
                             }
+                            // Send to ESP32 if all three values are now set
+                            if let (Some(c), Some(l), Some(r)) = (Some(mtr.was_raw), self.was_left_lock, self.was_right_lock) {
+                                let _ = self.motor_handle.send_was_config(c, l, r);
+                            }
                             self.was_cal_msg = Some((
                                 format!("Centre set: {}", mtr.was_raw), 180
                             ));
@@ -1613,6 +1617,9 @@ impl GuidanceApp {
                             self.was_left_lock = Some(mtr.was_raw);
                             if let Some(db) = &self.db {
                                 let _ = db.set_config("was_left_lock", &mtr.was_raw.to_string());
+                            }
+                            if let (Some(c), Some(l), Some(r)) = (self.was_centre, Some(mtr.was_raw), self.was_right_lock) {
+                                let _ = self.motor_handle.send_was_config(c, l, r);
                             }
                             self.was_cal_msg = Some((
                                 format!("Left lock set: {}", mtr.was_raw), 180
@@ -1633,8 +1640,11 @@ impl GuidanceApp {
                             if let Some(db) = &self.db {
                                 let _ = db.set_config("was_right_lock", &mtr.was_raw.to_string());
                             }
+                            if let (Some(c), Some(l), Some(r)) = (self.was_centre, self.was_left_lock, Some(mtr.was_raw)) {
+                                let _ = self.motor_handle.send_was_config(c, l, r);
+                            }
                             self.was_cal_msg = Some((
-                                format!("Right lock set: {}", mtr.was_raw), 180
+                                format!("Right lock set: {} — config sent to ESP32", mtr.was_raw), 180
                             ));
                         }
                     }
@@ -1699,6 +1709,7 @@ impl GuidanceApp {
                         egui::RichText::new("Invert Motor Direction").size(13.0)
                     ).min_size(egui::vec2(160.0, 30.0))).clicked() {
                         self.motor_invert = !self.motor_invert;
+                        let _ = self.motor_handle.send_invert_config(self.motor_invert);
                         if let Some(db) = &self.db {
                             let _ = db.set_config("motor_invert",
                                 if self.motor_invert { "true" } else { "false" }
