@@ -255,7 +255,20 @@ impl SteeringController {
         let mut desired_angle = delta_rad.to_degrees();
 
         // === Waveform damping ===
-        desired_angle += self.kd_xte * xte_rate;
+        // dXTE/dt tells us if we're converging or diverging.
+        // We want to REDUCE the desired angle when converging (prevent
+        // overshoot) and INCREASE it when diverging (add urgency).
+        //
+        // Sign analysis: if XTE > 0 (right of line), desired_angle < 0
+        // (steer left). When converging, xte_rate < 0 (XTE shrinking).
+        // We want to make desired_angle less negative (reduce magnitude).
+        // Since xte_rate is negative and desired_angle is negative, we
+        // SUBTRACT kd * xte_rate: desired_angle -= kd * (-rate) means
+        // desired_angle += kd * |rate|, which makes it less negative. Correct.
+        //
+        // When diverging, xte_rate > 0, so desired_angle -= kd * (+rate)
+        // makes it more negative (stronger correction). Also correct.
+        desired_angle -= self.kd_xte * xte_rate;
 
         // === Smooth taper near the line ===
         if self.deadband_m > 0.0 {
@@ -355,11 +368,15 @@ mod tests {
 
     #[test]
     fn test_converging_xte_reduces_correction() {
+        // When XTE is shrinking (converging), the damping term should
+        // reduce the desired angle magnitude compared to steady-state.
         let mut c = engaged_controller();
         c.prev_xte_m = Some(1.0);
         c.compute(1.0, 0.0, 2.0);
         let steady_angle = c.last_desired_angle;
 
+        // Converging XTE (was 1.5, now 1.0 -> negative rate).
+        // With kd subtracted, converging should produce LESS aggressive correction.
         let mut c2 = engaged_controller();
         c2.prev_xte_m = Some(1.5);
         c2.compute(1.0, 0.0, 2.0);
@@ -372,11 +389,14 @@ mod tests {
 
     #[test]
     fn test_diverging_xte_increases_correction() {
+        // When XTE is growing (diverging), the damping term should
+        // increase the desired angle magnitude compared to steady-state.
         let mut c = engaged_controller();
         c.prev_xte_m = Some(1.0);
         c.compute(1.0, 0.0, 2.0);
         let steady_angle = c.last_desired_angle;
 
+        // Diverging XTE (was 0.5, now 1.0 -> positive rate).
         let mut c2 = engaged_controller();
         c2.prev_xte_m = Some(0.5);
         c2.compute(1.0, 0.0, 2.0);
