@@ -145,7 +145,28 @@ fn ensure_module_config(port: &mut Box<dyn serialport::SerialPort>, fix_rate_hz:
     let interval_ms = 1000 / fix_rate_hz as u16;
     tracing::info!("Configuring GPS module: target {}Hz ({}ms interval)", fix_rate_hz, interval_ms);
 
-    // Step 1: Disable unnecessary NMEA sentences
+    // Step 1: Enable DR-fused INS output (PQTMINS at 10Hz, PQTMIMU off, PQTMGPS off)
+    // This gives us gyro-stabilised heading that works at low speed.
+    // Format: $PQTMCFGEINSMSG,W,<PQTMINS>,<PQTMIMU>,<PQTMGPS>,<Rate>
+    // Rate=10 means 10Hz output for PQTMINS.
+    let ins_cmd = format_pair_command("PQTMCFGEINSMSG,W,1,0,0,10");
+    tracing::info!("  Enabling PQTMINS at 10Hz: {}", ins_cmd.trim());
+    if let Err(e) = port.write_all(ins_cmd.as_bytes()) {
+        tracing::warn!("  Failed to send PQTMCFGEINSMSG: {}", e);
+    }
+    let _ = port.flush();
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Save INS config to NVS so it persists across power cycles
+    let save_cmd = "$PQTMSAVEPAR*5A\r\n";
+    tracing::info!("  Saving config to NVS: {}", save_cmd.trim());
+    if let Err(e) = port.write_all(save_cmd.as_bytes()) {
+        tracing::warn!("  Failed to send PQTMSAVEPAR: {}", e);
+    }
+    let _ = port.flush();
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Step 2: Disable unnecessary NMEA sentences
     let disable_cmds = [
         ("GLL", format_pair_command("PAIR062,1,0")),
         ("GSA", format_pair_command("PAIR062,2,0")),
@@ -164,7 +185,7 @@ fn ensure_module_config(port: &mut Box<dyn serialport::SerialPort>, fix_rate_hz:
     let _ = port.flush();
     std::thread::sleep(Duration::from_millis(300));
 
-    // Step 2: Set the fix rate
+    // Step 3: Set the fix rate
     let rates_to_try: Vec<u8> = {
         let mut rates = vec![fix_rate_hz];
         for &r in &[10, 5, 2, 1] {
