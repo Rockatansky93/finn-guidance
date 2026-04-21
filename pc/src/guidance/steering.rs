@@ -241,9 +241,35 @@ impl SteeringController {
         self.prev_compute_time = Some(now);
 
         // === Outer loop: pure pursuit geometry ===
-        let lookahead_m = (self.lookahead_base
+        let base_lookahead = (self.lookahead_base
             + self.lookahead_speed_factor * speed_mps)
             .clamp(2.0, 15.0);
+
+        // Heading-aware lookahead reduction: when the tractor is pointed
+        // significantly off the line bearing but XTE is small (approaching
+        // the crossing point), shorten the lookahead so the heading error
+        // dominates the pure pursuit alpha. This makes the controller
+        // anticipate the line crossing and begin counter-steering earlier.
+        //
+        // Without this, at long lookahead the XTE component drives the
+        // alpha toward zero as the tractor reaches the line, and the
+        // heading term is too weak to command a reversal before crossing.
+        //
+        // The reduction factor scales with |heading_error| / max_heading
+        // and inversely with |XTE| — most active when near the line with
+        // large heading offset. Clamped so lookahead never drops below 2m.
+        let heading_abs = heading_error_deg.abs();
+        let xte_abs = xte_m.abs();
+        let lookahead_m = if heading_abs > 2.0 && xte_abs < 1.0 {
+            // Scale: at 10° heading error and 0m XTE, reduce lookahead by ~40%
+            // At 2° heading error, no reduction. Linear ramp between.
+            let heading_factor = ((heading_abs - 2.0) / 8.0).clamp(0.0, 1.0);
+            let proximity_factor = 1.0 - (xte_abs / 1.0).clamp(0.0, 1.0);
+            let reduction = 0.4 * heading_factor * proximity_factor;
+            (base_lookahead * (1.0 - reduction)).max(2.0)
+        } else {
+            base_lookahead
+        };
         self.last_lookahead_m = lookahead_m;
 
         let psi_rad = heading_error_deg.to_radians();

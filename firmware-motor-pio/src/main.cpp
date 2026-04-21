@@ -39,9 +39,14 @@
  * Inner loop (runs at ~100Hz):
  *   1. Read WAS ADC -> piecewise-linear map to angle using NVS calibration
  *   2. angle_error = desired_angle - actual_angle
- *   3. raw_pwm = kp_angle * angle_error
- *   4. Sub-stall pulsing: accumulate sub-min_pwm effort, fire periodic pulses
- *   5. Apply motor_invert, clamp to max_pwm, drive IBT-2
+ *   3. If |error| < deadband (1.0°): output 0 (on target)
+ *   4. If |error| >= deadband: output = minPwm + kpAngle * (|error| - deadband)
+ *   5. Clamp to minPwm..maxPwm, apply sign and motor_invert, drive IBT-2
+ *
+ *   This eliminates the sub-stall pulsing accumulator. Any error above the
+ *   deadband immediately drives at least minPwm, which is the minimum PWM
+ *   that actually moves the wheels against hydraulic resistance. kpAngle
+ *   adds proportional effort above minPwm for larger errors.
  *
  * Safety:
  *   - Motor stops if no valid $FINNSTEER for 500ms (watchdog)
@@ -85,18 +90,20 @@ int16_t wasLeft   = 1617;    // ADC count at full left lock
 int16_t wasRight  = 2031;    // ADC count at full right lock
 bool wasCalibrated = false;  // True if all three values loaded from NVS
 
-// ── Inner loop PID parameters (from NVS) ─────────────────────────────
-float kpAngle   = 10.0f;    // PWM per degree of angle error
-int16_t minPwm  = 100;      // Motor stall floor
+// ── Inner loop parameters (from NVS) ─────────────────────────────────
+float kpAngle   = 10.0f;    // Additional PWM per degree of error beyond deadband
+int16_t minPwm  = 100;      // Motor stall floor (minimum PWM that moves wheels)
 int16_t maxPwm  = 180;      // Maximum PWM output
-bool motorInvert = false;   // Flip PWM sign after PID
+bool motorInvert = false;   // Flip PWM sign after control calc
+
+// ── Inner loop constants ─────────────────────────────────────────────
+#define ANGLE_DEADBAND  1.0f // Degrees of error below which motor is not driven
 
 // ── Inner loop state ─────────────────────────────────────────────────
 float desiredAngle = 0.0f;   // From PC via $FINNSTEER (degrees)
 float actualAngle  = 0.0f;   // From local WAS (degrees)
 int16_t wasRaw     = 0;      // Latest raw ADC reading
 int16_t currentPwm = 0;      // PWM currently applied to motor
-float pulseAccumulator = 0.0f;  // Sub-stall pulsing accumulator
 
 // ── Control state ────────────────────────────────────────────────────
 bool motorEnabled = false;
@@ -269,7 +276,6 @@ void applyPwm(int16_t pwm) {
 // ═════════════════════════════════════════════════════════════════════
 void killMotor() {
     currentPwm = 0;
-    pulseAccumulator = 0.0f;
     ledcWrite(RPWM_CHANNEL, 0);
     ledcWrite(LPWM_CHANNEL, 0);
     digitalWrite(R_EN_PIN, LOW);
@@ -284,10 +290,13 @@ void killMotor() {
 // ~10Hz; between PC updates, the inner loop keeps driving the motor
 // toward the last received desired angle using local WAS feedback.
 //
-// Sub-stall pulsing: when the desired PWM is below the motor's stall
-// threshold (minPwm), we accumulate the desired effort. When the
-// accumulator reaches minPwm, one pulse is fired. This gives
-// time-averaged torque below the stall floor.
+// Deadband + minPwm clamp strategy:
+//   - Error below ANGLE_DEADBAND: motor off (we're close enough).
+//   - Error above deadband: immediately drive at minPwm + proportional
+//     boost. minPwm is set to the minimum PWM that actually moves the
+//     wheels against hydraulic resistance (~100). No accumulation delay.
+//   - kpAngle adds extra PWM per degree of error beyond the deadband,
+//     so larger errors get faster correction.
 // ═════════════════════════════════════════════════════════════════════
 void runInnerLoop() {
     // Read WAS
@@ -297,57 +306,33 @@ void runInnerLoop() {
     // If motor not enabled (watchdog tripped or never started), don't drive
     if (!motorEnabled) {
         currentPwm = 0;
-        pulseAccumulator = 0.0f;
         return;
     }
 
     // Compute angle error
     float angleError = desiredAngle - actualAngle;
+    float absError = fabsf(angleError);
 
-    // Proportional control
-    float rawPwm = kpAngle * angleError;
-
-    // Clamp to max
-    if (rawPwm > (float)maxPwm) rawPwm = (float)maxPwm;
-    if (rawPwm < -(float)maxPwm) rawPwm = -(float)maxPwm;
-
-    // Apply motor direction invert BEFORE sub-stall logic.
-    // This flips the relationship between angle error and motor direction
-    // so the WAS feedback stays consistent with the motor output.
-    // Without this, inverting after PID creates positive feedback (runaway).
-    if (motorInvert) rawPwm = -rawPwm;
-
-    float absDesired = fabsf(rawPwm);
     int16_t output;
 
-    if (absDesired >= (float)minPwm) {
-        // Above stall floor — direct drive with stall compensation
-        pulseAccumulator = 0.0f;
-        output = (int16_t)roundf(rawPwm);
-        // Ensure at least minPwm magnitude
-        if (output > 0 && output < minPwm) output = minPwm;
-        if (output < 0 && output > -minPwm) output = -minPwm;
-    } else if (absDesired < 1.0f) {
-        // Negligible effort — don't accumulate noise
-        pulseAccumulator = 0.0f;
+    if (absError < ANGLE_DEADBAND) {
+        // Within deadband — close enough, don't drive
         output = 0;
     } else {
-        // Sub-stall zone: accumulate desired effort
-        pulseAccumulator += rawPwm;
+        // Above deadband — drive at least minPwm, plus proportional boost
+        float excessError = absError - ANGLE_DEADBAND;
+        float pwmMagnitude = (float)minPwm + kpAngle * excessError;
 
-        if (fabsf(pulseAccumulator) >= (float)minPwm) {
-            // Fire one pulse
-            int16_t pulseDir = (pulseAccumulator > 0) ? 1 : -1;
-            pulseAccumulator -= pulseDir * (float)minPwm;
-            output = pulseDir * minPwm;
-        } else {
-            output = 0;
-        }
+        // Clamp to maxPwm
+        if (pwmMagnitude > (float)maxPwm) pwmMagnitude = (float)maxPwm;
+
+        // Apply sign from error direction
+        output = (int16_t)roundf(pwmMagnitude);
+        if (angleError < 0) output = -output;
+
+        // Apply motor direction invert
+        if (motorInvert) output = -output;
     }
-
-    // Final clamp
-    if (output > maxPwm) output = maxPwm;
-    if (output < -maxPwm) output = -maxPwm;
 
     currentPwm = output;
     applyPwm(currentPwm);
@@ -369,7 +354,6 @@ bool handleSentence(const char* body, unsigned long now) {
             digitalWrite(R_EN_PIN, HIGH);
             digitalWrite(L_EN_PIN, HIGH);
             motorEnabled = true;
-            pulseAccumulator = 0.0f;
             Serial.println("Motor ENABLED (first steer command)");
         }
         return true;
