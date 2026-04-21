@@ -311,6 +311,12 @@ void runInnerLoop() {
     if (rawPwm > (float)maxPwm) rawPwm = (float)maxPwm;
     if (rawPwm < -(float)maxPwm) rawPwm = -(float)maxPwm;
 
+    // Apply motor direction invert BEFORE sub-stall logic.
+    // This flips the relationship between angle error and motor direction
+    // so the WAS feedback stays consistent with the motor output.
+    // Without this, inverting after PID creates positive feedback (runaway).
+    if (motorInvert) rawPwm = -rawPwm;
+
     float absDesired = fabsf(rawPwm);
     int16_t output;
 
@@ -338,9 +344,6 @@ void runInnerLoop() {
             output = 0;
         }
     }
-
-    // Apply motor direction invert
-    if (motorInvert) output = -output;
 
     // Final clamp
     if (output > maxPwm) output = maxPwm;
