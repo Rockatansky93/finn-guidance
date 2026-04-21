@@ -1,4 +1,6 @@
-.pio/build/esp32/src/main.cpp.o: src/main.cpp \
+.pio/build/esp32/lib662/Preferences/Preferences.cpp.o: \
+ C:/Users/malee/.platformio/packages/framework-arduinoespressif32/libraries/Preferences/src/Preferences.cpp \
+ C:/Users/malee/.platformio/packages/framework-arduinoespressif32/libraries/Preferences/src/Preferences.h \
  C:/Users/malee/.platformio/packages/framework-arduinoespressif32/cores/esp32/Arduino.h \
  C:/Users/malee/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp_arduino_version.h \
  C:/Users/malee/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/freertos/include/freertos/FreeRTOS.h \
@@ -133,4 +135,6 @@
  C:/Users/malee/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/esp_hw_support/include/soc/esp32/spiram.h \
  C:/Users/malee/.platformio/packages/framework-arduinoespressif32/cores/esp32/io_pin_remap.h \
  C:/Users/malee/.platformio/packages/framework-arduinoespressif32/cores/esp32/Arduino.h \
- C:/Users/malee/.platformio/packages/framework-arduinoespressif32/libraries/Preferences/src/Preferences.h
+ C:/Users/malee/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/nvs_flash/include/nvs.h \
+ C:/Users/malee/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/nvs_flash/include/nvs_flash.h \
+ C:/Users/malee/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/nvs_flash/include/nvs.h

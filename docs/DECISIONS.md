@@ -1140,3 +1140,269 @@ backward compatibility but is no longer read by `compute()`.
   motor controller firmware uses fixed 20kHz PWM; we can't change the PWM
   frequency per-command. Pulse accumulation achieves the same average-torque
   effect within the existing firmware)
+
+---
+
+## #026 — Hardware simplification: LC29H BA direct-connect + inner loop on ESP32 (revises #008, #015, #016, #018, #024, #025)
+**Date:** 21 April 2026
+**Context:** Field test 6 with the waveform-aware inner loop (#025) showed sluggish
+steering corrections — the tractor responded slowly to XTE errors despite the smooth
+taper and sub-stall pulsing working as designed. Analysis identified a structural
+bottleneck: the inner loop runs on the PC at 10Hz command rate (limited by the WAS
+sample rate from the sensor ESP32 and the 100ms steer-send throttle). Each correction
+cycle therefore takes at minimum 100ms, with real-world round-trip latency of
+150–200ms (WAS → USB → PC parse → compute → USB → motor ESP32). At 5 km/h the
+tractor travels 20–28cm per correction cycle, and multiple cycles are needed to
+converge — corrections always feel like they're arriving late.
+
+Concurrently, LC29H BA GPS modules arrived on new ArduSimple boards. The BA variant
+has two key advantages over the DA: (1) 10Hz fix rate (vs 1Hz on the DA), and
+(2) onboard IMU with internal GPS+IMU dead-reckoning fusion. The BNO055 IMU mounted
+on the sensor ESP32 has never achieved reliable calibration in the field — the tractor
+doesn't produce the rapid angular movements needed for magnetometer calibration,
+so `cal_sys` rarely exceeds 1. The HeadingFilter (#024) falls back to GPS-only
+heading most of the time, negating its purpose.
+
+Study of the AgOpenGPS codebase confirmed that commercial/open-source guidance
+systems run the inner loop (WAS → PWM) on the microcontroller at 100Hz+, with the
+PC sending a desired steer angle (not raw PWM) at a slower rate. This architecture
+gives the inner loop 10× faster reaction time than FINN's current PC-side approach.
+
+**Decision:** Two simultaneous hardware/architecture changes:
+
+### Change 1 — LC29H BA replaces DA, connects directly to laptop USB (no sensor ESP32)
+
+The ArduSimple LC29H BA board connects directly to the laptop via USB serial. It
+outputs standard NMEA (GGA, VTG) at 10Hz plus Quectel proprietary DR sentences
+(`$PQTMDRCAL` for calibration status, `$PQTMVEHMOT` for fused DR heading). The
+BA's onboard IMU handles heading fusion internally — no external IMU needed.
+
+**Calibration:** The BA self-calibrates by driving at >3 m/s with 3–4 turns for
+approximately 3 minutes. Calibration state is reported in `$PQTMDRCAL` with
+`CalState` field (0 = uncalibrated, 1 = calibrating, 2 = calibrated). This is
+dramatically easier than the BNO055 (no figure-eights, no magnetic interference
+issues, no per-session recalibration).
+
+**Mounting:** The BA module must be rigidly fixed to the vehicle frame (no relative
+movement). No orientation restrictions — the module auto-detects its mounting angle.
+
+**What this eliminates:**
+- Sensor ESP32 (entire board removed from cab)
+- BNO055 IMU board and I2C wiring
+- `firmware-sensor-pio/` firmware (archived, no longer maintained)
+- `position/heading_filter.rs` (HeadingFilter — replaced by BA's internal fusion)
+- FINNIMU parser in `gps/finn_parser.rs`
+- BNO055 calibration UI in setup page
+- GPS UART passthrough complexity (ESP32 was just forwarding NMEA from the LC29H)
+
+### Change 2 — Inner loop moves to motor ESP32 with local WAS
+
+The motor ESP32 gains the WAS potentiometer input (wire moved from sensor ESP32
+GPIO 34 to motor ESP32 — plenty of free ADC pins: 32, 33, 34, 35, 36, 39). It
+runs a local inner loop at 50–100Hz:
+
+```
+loop() at ~100Hz:
+  1. Read WAS via ADC → convert to angle using stored calibration
+  2. Check for new $FINNSTEER,<desired_angle_x100> from PC (arrives at 10Hz)
+  3. angle_error = desired_angle - actual_angle
+  4. pwm = kp_angle × angle_error
+  5. Apply min_pwm stall boost / max_pwm clamp / sub-stall pulsing
+  6. Drive IBT-2
+  7. Report: $FINNMTR,<pwm>,<was_raw>,<actual_angle_x100>,<enabled>
+  8. Watchdog: no $FINNSTEER for 500ms → stop motor
+```
+
+**Protocol change:** `$FINNSTEER,<value>` changes meaning from raw PWM (-255..255)
+to desired angle × 100 (e.g. `$FINNSTEER,-523` = -5.23°). The motor ESP32 does the
+angle-to-PWM conversion locally. `$FINNMTR` gains WAS and actual-angle fields so
+the PC can display them without needing a separate sensor serial port.
+
+**WAS calibration moves to ESP32 NVS:** The three-point calibration values
+(centre, left-lock, right-lock ADC counts) are stored in ESP32 NVS (non-volatile
+storage) so they survive power cycles without re-flashing. A new config sentence
+`$FINNCFG,WAS,<centre>,<left>,<right>*XX` allows the PC to push calibration values
+to the ESP32 during the calibration wizard. The ESP32 acknowledges with
+`$FINNACK,WAS,OK*XX`. Additional config sentences for inner loop tuning:
+`$FINNCFG,PID,<kp_angle_x100>,<min_pwm>,<max_pwm>*XX`.
+
+**Inner loop parameters that move to ESP32:**
+- `kp_angle` (PWM per degree of angle error)
+- `min_pwm` (motor stall floor)
+- `max_pwm` (output clamp)
+- Sub-stall pulse accumulator
+- Motor direction invert flag
+
+**What stays on the PC (outer loop only):**
+- Pure pursuit geometry (lookahead, wheelbase, max_steer_angle)
+- XTE rate damping (kd_xte) — operates on XTE not angle, so stays in outer loop
+- Smooth taper near the line — operates on desired angle before sending
+- Speed gate (below min_speed → send desired_angle = 0)
+- GPS fix timeout safety (disengage → send desired_angle = 0 continuously)
+- The PC no longer needs WAS data for control, but still receives it via
+  `$FINNMTR` for display and diagnostics
+
+### Combined new architecture
+
+```
+Laptop USB ──► ArduSimple LC29H BA (direct serial)
+                 └── 10Hz GGA + VTG + $PQTMDRCAL + $PQTMVEHMOT
+                 └── DR provides fused heading, position through GNSS gaps
+
+Laptop USB ──► Motor ESP32 (sole microcontroller)
+                 ├── WAS pot ADC input (wire moved from old sensor ESP32)
+                 ├── Inner loop: desired angle vs WAS → PWM at 50-100Hz
+                 ├── IBT-2 H-bridge motor drive
+                 ├── Status: $FINNMTR with PWM, WAS, angle, enabled
+                 └── Config: $FINNCFG for WAS cal + PID params via NVS
+```
+
+**USB device count:** 2 (down from 3). One COM port for GPS, one for motor ESP32.
+
+### Impact on PC-side code
+
+**`gps/reader.rs`:** Simplified — connects directly to the ArduSimple COM port
+(auto-detect looks for `$GNGGA`/`$GNVTG` without FINN sentences). Sends
+`$PAIR050,100` to configure 10Hz output (100ms interval). No more `is_esp32`
+flag or PAIR-skip logic. Adds parsing for `$PQTMDRCAL` (DR calibration state).
+
+**`gps/parser.rs`:** Unchanged — GGA and VTG parsing is identical regardless of
+the module variant. 10Hz data rate means the parser runs 10× more often.
+
+**`gps/finn_parser.rs`:** Simplified — remove `$FINNWAS` and `$FINNIMU` parsers
+(no longer received from GPS port). `$FINNMTR` parser updated to include WAS and
+angle fields. `$FINNHB` removed (sensor ESP32 gone).
+
+**`position/interpolator.rs`:** Retained but much less critical. At 10Hz GPS, the
+interpolator bridges 100ms gaps (was 1000ms). Dead-reckoning error in 100ms at
+5 km/h is ~14cm vs ~140cm at 1Hz. Could be simplified or eventually removed.
+
+**`position/heading_filter.rs`:** **Deleted.** The BA's internal fusion replaces
+this entirely. GPS VTG heading at 10Hz is already usable without external IMU
+fusion. The `$PQTMVEHMOT` sentence provides an even better DR-fused heading.
+
+**`guidance/steering.rs`:** Major simplification. The outer loop (pure pursuit
++ XTE rate damping + smooth taper) stays. The inner loop (kp_angle, min_pwm,
+max_pwm, sub-stall pulsing, angle deadband) is **removed entirely**. The
+`compute()` function now returns a desired angle (f64) instead of a PWM (i16).
+The caller sends `$FINNSTEER,<angle×100>` to the motor ESP32.
+
+**`comms/serial.rs`:** Motor serial handler updated:
+- `send_steer()` sends desired angle instead of PWM
+- Parses extended `$FINNMTR` for WAS/angle display data
+- New `send_config()` methods for WAS calibration and PID params
+
+**`gui/app.rs`:** Setup page changes:
+- WAS CALIBRATION wizard now sends `$FINNCFG,WAS,...` to ESP32 instead of
+  storing locally. The ESP32 saves to NVS.
+- Inner loop sliders (Kp_angle, min_pwm, max_pwm) send `$FINNCFG,PID,...`
+  to ESP32 on change.
+- BNO055 calibration UI removed. Replaced with DR calibration status from
+  `$PQTMDRCAL` (uncal/calibrating/calibrated indicator).
+- SENSORS panel simplified: no IMU section, just GPS + WAS (from $FINNMTR).
+
+**Auto-detect (`main.rs`):** Simplified from three-device to two-device:
+- Port with `$GNGGA`/`$GNVTG` = GPS module (claim for GPS reader)
+- Port with `$FINNMTR` = motor ESP32 (claim for motor handler)
+- No more sensor/motor disambiguation logic from #016
+
+### Motor ESP32 firmware changes
+
+The `firmware-motor-pio/src/main.cpp` grows from ~150 lines to ~350 lines:
+- Add ADC reading for WAS pot (same code as current sensor ESP32)
+- Add NVS storage for calibration values and PID parameters
+- Add `$FINNCFG` parser for receiving config from PC
+- Add inner loop P controller with sub-stall pulsing
+- Extend `$FINNMTR` status to include WAS raw, calibrated angle
+- Add `$FINNACK` response for config commands
+- Inner loop runs at hardware timer rate (50–100Hz), decoupled from serial I/O
+
+### Wiring changes in cab
+
+Only one physical change: move the WAS pot signal wire from the sensor ESP32's
+GPIO 34 to a free ADC pin on the motor ESP32 (suggest GPIO 34 for consistency,
+or GPIO 36/39 which are input-only with clean ADC). The pot's 3.3V reference
+wire moves from sensor ESP32 GPIO 33 to motor ESP32 GPIO 33 (or any free output
+pin). GND is common. The sensor ESP32, BNO055 board, and their associated wiring
+are removed from the cab entirely.
+
+### What this revises
+
+- **#008 (1Hz interpolation):** LC29H BA outputs 10Hz natively — the workaround
+  of interpolating between 1Hz fixes is largely obviated. Interpolator kept for
+  smoothing but gap is 100ms not 1000ms.
+- **#015 (dual ESP32 firmware):** Sensor ESP32 firmware archived. Only motor
+  ESP32 firmware is active.
+- **#016 (dual-ESP32 auto-detect):** Simplified to two-device detect (GPS vs
+  motor ESP32). No more sensor/motor sentence-type disambiguation.
+- **#018 (WAS calibration PC-side):** Calibration values move to ESP32 NVS.
+  PC-side wizard UX unchanged but sends config via serial instead of storing
+  locally.
+- **#024 (BNO055 heading filter):** Entire HeadingFilter module deleted. BA's
+  onboard IMU fusion replaces external BNO055 + complementary filter.
+- **#025 (waveform inner loop):** Sub-stall pulsing and inner loop move to
+  ESP32 at 50–100Hz. The PC-side steering controller becomes outer-loop only.
+
+### Implementation phases
+
+**Phase A — Hardware + firmware (do first):**
+1. Wire WAS pot to motor ESP32 (one wire move)
+2. Flash new motor ESP32 firmware with inner loop + NVS + WAS ADC
+3. Connect LC29H BA ArduSimple board directly to laptop USB
+4. Verify GPS sentences at 10Hz, confirm DR calibration process
+5. Remove sensor ESP32, BNO055, and old wiring from cab
+
+**Phase B — PC software refactor:**
+1. Update GPS reader for direct LC29H BA connection (remove ESP32 passthrough)
+2. Add `$PQTMDRCAL` parser for DR calibration status display
+3. Strip inner loop from `steering.rs` — return desired angle, not PWM
+4. Update motor serial handler for new `$FINNSTEER` (angle) and `$FINNMTR` format
+5. Update `$FINNCFG` send for WAS cal and PID params
+6. Delete `heading_filter.rs`, remove BNO055 UI
+7. Simplify auto-detect to two-device model
+8. Update config persistence (inner loop params sent to ESP32, not stored locally)
+
+**Phase C — Field test 7:**
+1. Verify GPS at 10Hz — position updates, heading, DR status
+2. Verify WAS reading on motor ESP32 (compare ADC values to known calibration)
+3. Verify inner loop: send fixed desired angles from MOTOR TEST, watch WAS track
+4. Full auto-steer test: engage on AB line, assess responsiveness vs field test 6
+5. Key metric: does the 100Hz inner loop eliminate the sluggishness?
+6. Tune inner loop PID on ESP32 if needed (via Setup page sliders → $FINNCFG)
+
+### Risk assessment
+
+**Low risk:**
+- WAS ADC reading on motor ESP32 — identical hardware, proven code from sensor ESP32
+- LC29H BA direct serial — same NMEA protocol, just faster fix rate
+- NVS storage on ESP32 — well-documented ESP32 feature, Arduino `Preferences.h`
+
+**Medium risk:**
+- Inner loop timing on ESP32 — need to verify that ADC read + PID + PWM output
+  fits within the loop period at 100Hz. The current motor firmware loop is trivially
+  fast (just serial parse + PWM write), so adding an ADC read and a few multiplies
+  should be fine, but needs bench verification.
+- DR calibration in field conditions — the BA requires driving at >3 m/s (10.8 km/h)
+  for calibration. This is working speed for broadacre but may require a deliberate
+  drive-around before engaging auto-steer on first startup.
+
+**Low risk of regression:**
+- Outer loop (pure pursuit) is unchanged — same code, same parameters
+- Safety systems (GPS timeout, watchdog, manual disengage) are unchanged
+- Coverage, AB lines, field management — completely unaffected
+
+**Alternatives considered:**
+- Keep sensor ESP32 and relay WAS to motor ESP32 via direct serial link between the
+  two ESP32s (rejected: adds inter-ESP32 wiring complexity and doesn't reduce USB
+  device count — the whole point is simplification)
+- Keep sensor ESP32 and relay WAS via the PC (rejected: adds latency that defeats
+  the purpose of moving the inner loop to the ESP32)
+- Keep BNO055 and add it to motor ESP32's I2C (rejected: the BNO055 calibration
+  problem is fundamental — it needs rapid angular movement the tractor doesn't
+  produce. The BA's onboard IMU solves this at the hardware level)
+- Run inner loop on PC at higher rate via a dedicated thread (rejected: still
+  limited by USB serial round-trip latency — even at 100Hz PC-side compute, the
+  command has to traverse USB twice. On-ESP32 eliminates the serial hop entirely)
+- Keep DA module and just move inner loop to ESP32 (rejected: misses the 10Hz GPS
+  upgrade and heading fusion improvement. The BA boards are already purchased and
+  available — no cost barrier)

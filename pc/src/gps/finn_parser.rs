@@ -1,12 +1,15 @@
-//! Parser for FINN-protocol sentences from ESP32 modules.
+//! Parser for FINN-protocol sentences from the motor ESP32.
 //!
-//! Handles `$FINNWAS`, `$FINNIMU`, `$FINNHB`, and `$FINNMTR` sentences.
+//! Decision #026: Only `$FINNMTR` and `$FINNACK` sentences are received.
+//! The sensor ESP32 has been removed — WAS data now comes embedded in
+//! the extended `$FINNMTR` status sentence from the motor controller.
+//!
 //! Each sentence uses NMEA-style framing: `$<body>*<hex_checksum>\r\n`
 //!
 //! Standard NMEA sentences (GPS) are handled by `parser.rs` — this module
 //! only deals with FINN-prefixed messages.
 
-use finn_guidance_common::types::{ImuData, WasReading, EspHeartbeat, MotorStatus};
+use finn_guidance_common::types::{MotorStatus, ConfigAck};
 use finn_guidance_common::protocol::{FinnMessage, nmea_checksum};
 
 /// Try to parse a single line as a FINN sentence.
@@ -38,14 +41,10 @@ pub fn parse_finn_sentence(line: &str) -> Option<FinnMessage> {
     }
 
     // Route by sentence type
-    if let Some(fields) = body.strip_prefix("FINNWAS,") {
-        parse_was(fields)
-    } else if let Some(fields) = body.strip_prefix("FINNIMU,") {
-        parse_imu(fields)
-    } else if let Some(fields) = body.strip_prefix("FINNHB,") {
-        parse_heartbeat(fields)
-    } else if let Some(fields) = body.strip_prefix("FINNMTR,") {
+    if let Some(fields) = body.strip_prefix("FINNMTR,") {
         parse_motor_status(fields)
+    } else if let Some(fields) = body.strip_prefix("FINNACK,") {
+        parse_config_ack(fields)
     } else {
         tracing::debug!("Unknown FINN sentence: {}", body);
         None
@@ -61,67 +60,42 @@ fn split_checksum(s: &str) -> Option<(&str, u8)> {
     Some((body, cs))
 }
 
-/// Parse `$FINNWAS,<raw_adc>,<voltage_mv>*XX`
-fn parse_was(fields: &str) -> Option<FinnMessage> {
+/// Parse `$FINNMTR,<pwm>,<was_raw>,<angle_x100>,<enabled>,<uptime_ms>*XX`
+///
+/// Decision #026 extended format: includes WAS raw ADC and calibrated angle
+/// so the PC can display steering feedback without a separate sensor port.
+fn parse_motor_status(fields: &str) -> Option<FinnMessage> {
+    let parts: Vec<&str> = fields.split(',').collect();
+    if parts.len() != 5 {
+        return None;
+    }
+    let current_pwm = parts[0].parse::<i16>().ok()?;
+    let was_raw = parts[1].parse::<u16>().ok()?;
+    let angle_x100 = parts[2].parse::<i16>().ok()?;
+    let enabled = parts[3] == "1";
+    let uptime_ms = parts[4].parse::<u64>().ok()?;
+
+    Some(FinnMessage::MotorStatus(MotorStatus {
+        current_pwm,
+        was_raw,
+        actual_angle: angle_x100 as f64 / 100.0,
+        enabled,
+        uptime_ms,
+    }))
+}
+
+/// Parse `$FINNACK,<param>,<OK|ERR>*XX`
+fn parse_config_ack(fields: &str) -> Option<FinnMessage> {
     let parts: Vec<&str> = fields.split(',').collect();
     if parts.len() != 2 {
         return None;
     }
-    let raw_value = parts[0].parse::<u16>().ok()?;
-    let voltage_mv = parts[1].parse::<u16>().ok()?;
+    let param = parts[0].to_string();
+    let success = parts[1] == "OK";
 
-    Some(FinnMessage::Was(WasReading {
-        raw_value,
-        voltage_mv,
-        angle_deg: 0.0, // Uncalibrated — PID controller will apply calibration
-    }))
-}
-
-/// Parse `$FINNIMU,<roll>,<pitch>,<heading>,<cal_sys>,<cal_gyro>,<cal_accel>,<cal_mag>*XX`
-fn parse_imu(fields: &str) -> Option<FinnMessage> {
-    let parts: Vec<&str> = fields.split(',').collect();
-    if parts.len() != 7 {
-        return None;
-    }
-    let roll = parts[0].parse::<f64>().ok()?;
-    let pitch = parts[1].parse::<f64>().ok()?;
-    let heading = parts[2].parse::<f64>().ok()?;
-    let cal_sys = parts[3].parse::<u8>().ok()?;
-    let cal_gyro = parts[4].parse::<u8>().ok()?;
-    let cal_accel = parts[5].parse::<u8>().ok()?;
-    let cal_mag = parts[6].parse::<u8>().ok()?;
-
-    Some(FinnMessage::Imu(ImuData {
-        roll,
-        pitch,
-        heading,
-        cal_sys,
-        cal_gyro,
-        cal_accel,
-        cal_mag,
-    }))
-}
-
-/// Parse `$FINNHB,<uptime_ms>*XX`
-fn parse_heartbeat(fields: &str) -> Option<FinnMessage> {
-    let uptime_ms = fields.parse::<u64>().ok()?;
-    Some(FinnMessage::SensorHeartbeat(EspHeartbeat { uptime_ms }))
-}
-
-/// Parse `$FINNMTR,<current_pwm>,<enabled>,<uptime_ms>*XX`
-fn parse_motor_status(fields: &str) -> Option<FinnMessage> {
-    let parts: Vec<&str> = fields.split(',').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    let current_pwm = parts[0].parse::<i16>().ok()?;
-    let enabled = parts[1] == "1";
-    let uptime_ms = parts[2].parse::<u64>().ok()?;
-
-    Some(FinnMessage::MotorStatus(MotorStatus {
-        current_pwm,
-        enabled,
-        uptime_ms,
+    Some(FinnMessage::ConfigAck(ConfigAck {
+        param,
+        success,
     }))
 }
 
@@ -130,51 +104,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_was() {
-        let msg = parse_finn_sentence("$FINNWAS,2048,1650*4F");
-        // Checksum may not match this example — test with a real one
-        // For now just test that the parser handles the format
-    }
+    fn test_parse_motor_status() {
+        // Build a valid sentence with correct checksum
+        let body = "FINNMTR,120,1832,0,1,5000";
+        let cs = nmea_checksum(body);
+        let sentence = format!("${}*{:02X}", body, cs);
 
-    #[test]
-    fn test_parse_real_was() {
-        // From actual serial output
-        let msg = parse_finn_sentence("$FINNWAS,0,0*4A");
+        let msg = parse_finn_sentence(&sentence);
         assert!(msg.is_some());
-        if let Some(FinnMessage::Was(was)) = msg {
-            assert_eq!(was.raw_value, 0);
-            assert_eq!(was.voltage_mv, 0);
+        if let Some(FinnMessage::MotorStatus(status)) = msg {
+            assert_eq!(status.current_pwm, 120);
+            assert_eq!(status.was_raw, 1832);
+            assert!((status.actual_angle - 0.0).abs() < 0.01);
+            assert!(status.enabled);
+            assert_eq!(status.uptime_ms, 5000);
         } else {
-            panic!("Expected Was message");
+            panic!("Expected MotorStatus message");
         }
     }
 
     #[test]
-    fn test_parse_real_imu() {
-        // From actual serial output
-        let msg = parse_finn_sentence("$FINNIMU,2.2,4.4,0.2,3,3,0,0*5E");
+    fn test_parse_motor_status_with_angle() {
+        let body = "FINNMTR,-100,1900,315,1,12000";
+        let cs = nmea_checksum(body);
+        let sentence = format!("${}*{:02X}", body, cs);
+
+        let msg = parse_finn_sentence(&sentence);
         assert!(msg.is_some());
-        if let Some(FinnMessage::Imu(imu)) = msg {
-            assert!((imu.roll - 2.2).abs() < 0.01);
-            assert!((imu.pitch - 4.4).abs() < 0.01);
-            assert!((imu.heading - 0.2).abs() < 0.01);
-            assert_eq!(imu.cal_sys, 3);
-            assert_eq!(imu.cal_gyro, 3);
-            assert_eq!(imu.cal_accel, 0);
-            assert_eq!(imu.cal_mag, 0);
+        if let Some(FinnMessage::MotorStatus(status)) = msg {
+            assert_eq!(status.current_pwm, -100);
+            assert_eq!(status.was_raw, 1900);
+            assert!((status.actual_angle - 3.15).abs() < 0.01);
+            assert!(status.enabled);
         } else {
-            panic!("Expected Imu message");
+            panic!("Expected MotorStatus message");
         }
     }
 
     #[test]
-    fn test_parse_real_heartbeat() {
-        let msg = parse_finn_sentence("$FINNHB,1372057*1C");
+    fn test_parse_config_ack_ok() {
+        let body = "FINNACK,WAS,OK";
+        let cs = nmea_checksum(body);
+        let sentence = format!("${}*{:02X}", body, cs);
+
+        let msg = parse_finn_sentence(&sentence);
         assert!(msg.is_some());
-        if let Some(FinnMessage::SensorHeartbeat(hb)) = msg {
-            assert_eq!(hb.uptime_ms, 1372057);
+        if let Some(FinnMessage::ConfigAck(ack)) = msg {
+            assert_eq!(ack.param, "WAS");
+            assert!(ack.success);
         } else {
-            panic!("Expected Heartbeat message");
+            panic!("Expected ConfigAck message");
+        }
+    }
+
+    #[test]
+    fn test_parse_config_ack_err() {
+        let body = "FINNACK,PID,ERR";
+        let cs = nmea_checksum(body);
+        let sentence = format!("${}*{:02X}", body, cs);
+
+        let msg = parse_finn_sentence(&sentence);
+        assert!(msg.is_some());
+        if let Some(FinnMessage::ConfigAck(ack)) = msg {
+            assert_eq!(ack.param, "PID");
+            assert!(!ack.success);
+        } else {
+            panic!("Expected ConfigAck message");
         }
     }
 
@@ -186,7 +181,7 @@ mod tests {
 
     #[test]
     fn test_bad_checksum() {
-        let msg = parse_finn_sentence("$FINNWAS,0,0*FF");
+        let msg = parse_finn_sentence("$FINNMTR,0,0,0,0,0*FF");
         assert!(msg.is_none());
     }
 

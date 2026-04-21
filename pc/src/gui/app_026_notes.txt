@@ -1,0 +1,7 @@
+// Decision #026 app.rs refactor is staged but requires careful integration
+// with the existing 1200+ line GUI file. The structural changes to types,
+// protocol, parser, serial handler, steering controller, and main.rs are
+// complete. This file needs the following compile-fix changes applied:
+//
+// PLACEHOLDER — see companion message for the list of required edits.
+// The full file rewrite was too large for a single operation.

@@ -15,48 +15,46 @@ use std::thread;
 fn main() {
     // Initialise logging
     tracing_subscriber::fmt::init();
-    tracing::info!("FINN Guidance starting...");
+    tracing::info!("FINN Guidance starting (Decision #026 architecture)...");
 
-    // Channel for GPS data: sensor serial thread -> gui
-    let (gps_tx, gps_rx) = crossbeam_channel::bounded::<GpsFix>(16);
+    // Channel for GPS data: GPS reader thread -> GUI
+    let (gps_tx, gps_rx) = crossbeam_channel::bounded::<GpsFix>(64);
 
-    // Channel for FINN sensor data (WAS, IMU, heartbeat, motor status)
-    // Both the sensor reader and motor reader send into this channel.
+    // Channel for FINN motor data (motor status, config acks)
+    // Only the motor reader sends into this channel (no sensor ESP32).
     let (finn_tx, finn_rx) = crossbeam_channel::bounded::<FinnMessage>(128);
 
-    // Channel for the sensor reader to report which COM port it claimed,
+    // Channel for the GPS reader to report which COM port it claimed,
     // so the motor reader can avoid it during auto-detect.
     let (port_tx, port_rx) = crossbeam_channel::bounded::<String>(1);
 
     // Motor handle — shared between the motor reader thread and the GUI
     let motor_handle = MotorHandle::new();
 
-    // Start sensor serial reader thread
-    let finn_tx_sensor = finn_tx.clone();
+    // Start GPS serial reader thread
+    // Decision #026: reads directly from LC29H BA (no sensor ESP32)
     thread::spawn(move || {
         gps::reader::run_gps_reader(
             gps::reader::GpsConfig::default(),
             gps_tx,
-            finn_tx_sensor,
             port_tx,
         );
     });
-    tracing::info!("Sensor serial reader thread launched");
+    tracing::info!("GPS serial reader thread launched");
 
     // Start motor serial reader thread
     let motor_handle_thread = motor_handle.clone();
-    let finn_tx_motor = finn_tx.clone();
     thread::spawn(move || {
-        // Wait for the sensor reader to report its port
-        let sensor_port = port_rx.recv().unwrap_or_default();
-        if sensor_port.is_empty() {
-            tracing::warn!("Sensor port unknown — motor auto-detect may conflict");
+        // Wait for the GPS reader to report its port
+        let gps_port = port_rx.recv().unwrap_or_default();
+        if gps_port.is_empty() {
+            tracing::warn!("GPS port unknown — motor auto-detect may conflict");
         }
         comms::serial::run_motor_reader(
-            sensor_port,
+            gps_port,
             115200,
             motor_handle_thread,
-            finn_tx_motor,
+            finn_tx,
         );
     });
     tracing::info!("Motor serial reader thread launched");

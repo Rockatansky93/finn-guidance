@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use eframe::egui;
 use crossbeam_channel::Receiver;
-use finn_guidance_common::types::{GpsFix, CrossTrackError, FixQuality, ImuData, WasReading, MotorStatus};
+use finn_guidance_common::types::{GpsFix, CrossTrackError, FixQuality, MotorStatus};
 use finn_guidance_common::protocol::FinnMessage;
 use crate::comms::serial::MotorHandle;
 use crate::guidance::ab_line::AbLineGuide;
@@ -20,7 +20,6 @@ use crate::guidance::steering::SteeringController;
 use crate::coverage::logger::CoverageLogger;
 use crate::coverage::db::{CoverageDb, SavedField, SavedAbLine};
 use crate::position::interpolator::PositionInterpolator;
-use crate::position::heading_filter::HeadingFilter;
 use super::field_view::FieldView;
 
 /// Target frame interval — 30fps is smooth for guidance display while
@@ -50,12 +49,8 @@ pub struct GuidanceApp {
     finn_rx: Receiver<FinnMessage>,
     /// Latest real GPS fix (from the module, not interpolated)
     current_fix: Option<GpsFix>,
-    /// Position interpolator for smooth GUI updates between 1Hz fixes
+    /// Position interpolator for smooth GUI updates between GPS fixes
     interpolator: PositionInterpolator,
-    /// Fused heading filter — blends IMU yaw with GPS COG for a clean heading
-    /// at 10 Hz (vs GPS COG alone at 1 Hz with low-speed noise). Overrides
-    /// `fix.heading` everywhere downstream.
-    heading_filter: HeadingFilter,
     /// The display fix — either interpolated (when moving) or real (when stopped).
     /// Used for field view, guidance, lightbar. Updated every frame.
     display_fix: Option<GpsFix>,
@@ -78,15 +73,9 @@ pub struct GuidanceApp {
     /// Lightbar sensitivity: how many centimetres of error each segment represents.
     lightbar_cm_per_seg: f64,
 
-    // --- ESP32 sensor state ---
-    /// Latest wheel angle sensor reading (from sensor ESP32, 20Hz)
-    latest_was: Option<WasReading>,
-    /// Latest IMU reading (from sensor ESP32, 20Hz)
-    latest_imu: Option<ImuData>,
-    /// Latest motor controller status (from motor ESP32, 5Hz)
+    // --- ESP32 motor state ---
+    /// Latest motor controller status (from motor ESP32, 10Hz — includes WAS)
     latest_motor: Option<MotorStatus>,
-    /// Sensor ESP32 uptime from last heartbeat (ms)
-    sensor_uptime_ms: Option<u64>,
     /// Handle for sending steer commands to the motor ESP32
     motor_handle: MotorHandle,
     /// Current test PWM value for manual motor testing (Setup page)
@@ -233,7 +222,6 @@ impl GuidanceApp {
             finn_rx,
             current_fix: None,
             interpolator: PositionInterpolator::new(),
-            heading_filter: HeadingFilter::new(),
             display_fix: None,
             guide,
             current_error: None,
@@ -244,10 +232,7 @@ impl GuidanceApp {
             auto_pass_notification: None,
             active_page: ActivePage::Working,
             lightbar_cm_per_seg,
-            latest_was: None,
-            latest_imu: None,
             latest_motor: None,
-            sensor_uptime_ms: None,
             motor_handle,
             test_pwm: 0,
             motor_test_msg: None,
@@ -257,7 +242,6 @@ impl GuidanceApp {
                 s.lookahead_speed_factor = lookahead_speed_factor;
                 s.wheelbase_m = steer_wheelbase;
                 s.max_steer_angle = steer_max_angle;
-                s.kp_angle = steer_kp_angle;
                 s.kd_xte = steer_kd_xte;
                 s
             },
@@ -341,10 +325,6 @@ impl eframe::App for GuidanceApp {
             // Feed the interpolator with the true position
             self.interpolator.update_fix(&fix);
 
-            // Feed the heading filter with the GPS course-over-ground (speed-gated
-            // internally — ignored at low speed where COG is noise).
-            self.heading_filter.update_gps_fix(&fix);
-
             // Add real fix to trail (1Hz is fine for the breadcrumb path)
             self.position_trail.push_back((fix.latitude, fix.longitude));
             if self.position_trail.len() > self.max_trail {
@@ -368,87 +348,61 @@ impl eframe::App for GuidanceApp {
             self.current_fix = Some(fix);
         }
 
-        // === Process FINN sensor messages from ESP32 ===
-        // These arrive at 10Hz (WAS + IMU) plus heartbeat every 2s.
-        // We only keep the latest value of each type — drain the entire
-        // queue but only the final message of each kind matters.
+        // === Process FINN messages from motor ESP32 ===
         while let Ok(msg) = self.finn_rx.try_recv() {
             match msg {
-                FinnMessage::Was(was) => {
-                    self.latest_was = Some(was);
-                }
-                FinnMessage::Imu(imu) => {
-                    // Feed the heading filter — gated by cal_sys internally
-                    self.heading_filter.update_imu(&imu);
-                    self.latest_imu = Some(imu);
-                }
-                FinnMessage::SensorHeartbeat(hb) => {
-                    self.sensor_uptime_ms = Some(hb.uptime_ms);
-                }
                 FinnMessage::MotorStatus(mtr) => {
+                    self.steering.update_motor_feedback(mtr.current_pwm, mtr.actual_angle);
                     self.latest_motor = Some(mtr);
+                }
+                FinnMessage::ConfigAck(ack) => {
+                    let status = if ack.success { "OK" } else { "FAILED" };
+                    self.was_cal_msg = Some((
+                        format!("ESP32 {} config: {}", ack.param, status), 180
+                    ));
                 }
             }
         }
-        // Notify steering controller once per frame if we got any WAS data
-        // (not per-message — avoids redundant timestamp updates)
-        if self.latest_was.is_some() {
-            self.steering.notify_was_reading();
-        }
 
         // === Interpolate position for smooth display (every frame, ~30fps) ===
-        // Between 1Hz real fixes, the interpolator dead-reckons the position
-        // using speed × heading. This makes the vehicle triangle, trail, lightbar,
-        // and XTE readout update smoothly instead of jumping once per second.
-        //
-        // The fused IMU+GPS heading from `heading_filter` is passed in as an
-        // override — this replaces the stale 1 Hz VTG heading with a clean 10 Hz
-        // estimate for both the dead-reckon projection and the guidance
-        // calculation downstream.
-        let fused_heading = self.heading_filter.current_heading();
-        if let Some(interp_fix) = self.interpolator.interpolate(fused_heading) {
+        // At 10Hz GPS from the LC29H BA, the interpolator bridges 100ms gaps.
+        // No external heading filter needed — the BA handles IMU fusion internally.
+        if let Some(interp_fix) = self.interpolator.interpolate(None) {
             let interp_fix = interp_fix.clone();
 
             // Recalculate guidance error with interpolated position (smooth lightbar/XTE)
             self.current_error = self.guide.calculate_error(&interp_fix);
 
-            // === Auto-steer: compute and send motor command ===
-            // Throttled to ~20Hz — matches WAS update rate and avoids flooding
-            // the serial bus. The ESP32 watchdog is 500ms so 50ms is well within.
+            // === Auto-steer: compute desired angle and send to ESP32 ===
+            // Throttled to ~10Hz. The ESP32 runs the inner loop at 100Hz locally.
             if self.steering.engaged {
                 let now = Instant::now();
                 let should_send = now.duration_since(self.last_steer_send) >= STEER_SEND_INTERVAL;
 
                 if let Some(error) = &self.current_error {
-                    // Get current steering angle from WAS (if calibrated and available)
-                    let actual_angle = self.latest_was.as_ref()
-                        .and_then(|was| self.was_calibrated_angle(was.raw_value));
-
-                    let (raw_pwm, disengaged) = self.steering.compute(
+                    let (desired_angle, disengaged) = self.steering.compute(
                         error.distance_m,
                         error.heading_error,
                         interp_fix.speed,
-                        actual_angle,
                     );
                     if disengaged {
-                        // Safety disengage — send stop immediately (bypass throttle)
-                        let _ = self.motor_handle.send_steer(0);
+                        // Safety disengage — send zero angle immediately
+                        let _ = self.motor_handle.send_steer_angle(0.0);
                         self.last_steer_send = now;
                         let reason = self.steering.disengage_reason.clone()
                             .unwrap_or_else(|| "Unknown".to_string());
                         self.steer_status_msg = Some((
                             format!("Auto-steer OFF: {}", reason),
-                            300, // ~10 seconds at 30fps
+                            300,
                         ));
                     } else if should_send {
-                        let pwm = self.apply_motor_direction(raw_pwm);
-                        let _ = self.motor_handle.send_steer(pwm);
+                        let _ = self.motor_handle.send_steer_angle(desired_angle);
                         self.last_steer_send = now;
                     }
                 } else {
-                    // No guidance error (no AB line?) — send zero (throttled)
+                    // No guidance error (no AB line?) — send zero angle (throttled)
                     if should_send {
-                        let _ = self.motor_handle.send_steer(0);
+                        let _ = self.motor_handle.send_steer_angle(0.0);
                         self.last_steer_send = now;
                     }
                 }
@@ -580,7 +534,7 @@ impl GuidanceApp {
                     if steer_resp.clicked() {
                         if self.steering.engaged {
                             self.steering.disengage(Some("Manual disengage".to_string()));
-                            let _ = self.motor_handle.send_steer(0);
+                            let _ = self.motor_handle.send_steer_angle(0.0);
                             self.steer_status_msg = Some(("Auto-steer OFF".to_string(), 180));
                         } else {
                             self.steering.engage();
@@ -748,11 +702,7 @@ impl GuidanceApp {
                         self.steering.last_lookahead_m,
                     );
                     let steer_pos = egui::pos2(overlay_rect.left() + 20.0, overlay_rect.top() + 55.0);
-                    let indicator_colour = if self.steering.was_stale {
-                        egui::Color32::from_rgb(255, 200, 60) // amber when WAS stale
-                    } else {
-                        egui::Color32::from_rgb(100, 255, 100) // green normally
-                    };
+                    let indicator_colour = egui::Color32::from_rgb(100, 255, 100);
                     let steer_galley = painter.layout_no_wrap(
                         steer_text,
                         egui::FontId::proportional(16.0),
@@ -1570,78 +1520,27 @@ impl GuidanceApp {
                     ui.separator();
                     ui.add_space(10.0);
 
-                    // === Sensors Section (ESP32 data) ===
+                    // === Sensors Section (Motor ESP32 data) ===
                     ui.label(egui::RichText::new("SENSORS").size(14.0).strong());
                     ui.add_space(4.0);
 
-                    // WAS — show raw + calibrated angle if calibrated
-                    if let Some(was) = &self.latest_was {
-                        ui.label(format!("WAS:  {} raw  ({} mV)", was.raw_value, was.voltage_mv));
-                        if let Some(angle) = self.was_calibrated_angle(was.raw_value) {
-                            let dir = if angle < -0.5 { "LEFT" } else if angle > 0.5 { "RIGHT" } else { "CENTRE" };
-                            ui.label(
-                                egui::RichText::new(format!("Angle: {:.1}° {}", angle, dir))
-                                    .size(14.0).strong()
-                            );
-                        }
-                    } else {
-                        ui.label(egui::RichText::new("WAS: no data").size(12.0).weak());
-                    }
-
-                    // IMU
-                    if let Some(imu) = &self.latest_imu {
-                        ui.label(format!("IMU:  R{:.1}° P{:.1}° H{:.1}°", imu.roll, imu.pitch, imu.heading));
-                        let cal_colour = if imu.cal_sys >= 2 {
-                            egui::Color32::GREEN
-                        } else if imu.cal_sys >= 1 {
-                            egui::Color32::YELLOW
-                        } else {
-                            egui::Color32::from_rgb(255, 120, 60)
-                        };
-                        ui.colored_label(cal_colour, format!(
-                            "Cal: S{} G{} A{} M{}",
-                            imu.cal_sys, imu.cal_gyro, imu.cal_accel, imu.cal_mag
-                        ));
-                    } else {
-                        ui.label(egui::RichText::new("IMU: no data").size(12.0).weak());
-                    }
-
-                    // Fused heading — shows the output of the heading filter
-                    // (IMU + GPS COG blend). If the IMU isn't trusted yet (cal_sys < 2)
-                    // the filter is running on GPS COG alone, which is noisy at low
-                    // speed — signal this clearly.
-                    if let Some(fused) = self.heading_filter.current_heading() {
-                        if self.heading_filter.imu_trusted {
-                            ui.colored_label(
-                                egui::Color32::GREEN,
-                                format!("Fused heading: {:.1}° (IMU+GPS)", fused),
-                            );
-                        } else {
-                            ui.colored_label(
-                                egui::Color32::from_rgb(255, 200, 60),
-                                format!("Fused heading: {:.1}° (GPS only — IMU not calibrated)", fused),
-                            );
-                        }
-                    } else {
-                        ui.label(egui::RichText::new(
-                            "Fused heading: waiting for data"
-                        ).size(11.0).weak());
-                    }
-
-                    // Motor
+                    // WAS + Motor status from motor ESP32
                     if let Some(mtr) = &self.latest_motor {
+                        ui.label(format!("WAS:  {} raw", mtr.was_raw));
+                        let dir = if mtr.actual_angle < -0.5 { "LEFT" } else if mtr.actual_angle > 0.5 { "RIGHT" } else { "CENTRE" };
+                        ui.label(
+                            egui::RichText::new(format!("Angle: {:.1}deg {}", mtr.actual_angle, dir))
+                                .size(14.0).strong()
+                        );
                         let en_label = if mtr.enabled { "ON" } else { "OFF" };
                         ui.label(format!("Motor: PWM {} [{}]", mtr.current_pwm, en_label));
-                    }
-
-                    // Heartbeat
-                    if let Some(uptime) = self.sensor_uptime_ms {
-                        let secs = uptime / 1000;
-                        let mins = secs / 60;
+                        let secs = mtr.uptime_ms / 1000;
                         ui.label(
-                            egui::RichText::new(format!("ESP32 uptime: {}m {}s", mins, secs % 60))
+                            egui::RichText::new(format!("ESP32 uptime: {}m {}s", secs / 60, secs % 60))
                                 .size(11.0).weak()
                         );
+                    } else {
+                        ui.label(egui::RichText::new("Motor ESP32: no data").size(12.0).weak());
                     }
 
                     ui.add_space(10.0);
@@ -1655,7 +1554,7 @@ impl GuidanceApp {
                     ui.label(egui::RichText::new("WAS CALIBRATION").size(14.0).strong());
                     ui.add_space(4.0);
 
-                    let has_was_data = self.latest_was.is_some();
+                    let has_was_data = self.latest_motor.is_some();
                     let is_calibrated = self.was_centre.is_some()
                         && self.was_left_lock.is_some()
                         && self.was_right_lock.is_some();
@@ -1676,9 +1575,9 @@ impl GuidanceApp {
                     ui.add_space(4.0);
 
                     // Live WAS readout for feedback during calibration
-                    if let Some(was) = &self.latest_was {
+                    if let Some(mtr) = &self.latest_motor {
                         ui.label(
-                            egui::RichText::new(format!("Current: {} raw", was.raw_value))
+                            egui::RichText::new(format!("Current: {} raw", mtr.was_raw))
                                 .size(14.0).strong()
                         );
                     }
@@ -1691,13 +1590,13 @@ impl GuidanceApp {
                         egui::RichText::new("Set Centre").size(13.0)
                     ).min_size(egui::vec2(120.0, 30.0));
                     if ui.add_enabled(has_was_data, centre_btn).clicked() {
-                        if let Some(was) = &self.latest_was {
-                            self.was_centre = Some(was.raw_value);
+                        if let Some(mtr) = &self.latest_motor {
+                            self.was_centre = Some(mtr.was_raw);
                             if let Some(db) = &self.db {
-                                let _ = db.set_config("was_centre", &was.raw_value.to_string());
+                                let _ = db.set_config("was_centre", &mtr.was_raw.to_string());
                             }
                             self.was_cal_msg = Some((
-                                format!("Centre set: {}", was.raw_value), 180
+                                format!("Centre set: {}", mtr.was_raw), 180
                             ));
                         }
                     }
@@ -1710,13 +1609,13 @@ impl GuidanceApp {
                         egui::RichText::new("Set Left Lock").size(13.0)
                     ).min_size(egui::vec2(120.0, 30.0));
                     if ui.add_enabled(has_was_data, left_btn).clicked() {
-                        if let Some(was) = &self.latest_was {
-                            self.was_left_lock = Some(was.raw_value);
+                        if let Some(mtr) = &self.latest_motor {
+                            self.was_left_lock = Some(mtr.was_raw);
                             if let Some(db) = &self.db {
-                                let _ = db.set_config("was_left_lock", &was.raw_value.to_string());
+                                let _ = db.set_config("was_left_lock", &mtr.was_raw.to_string());
                             }
                             self.was_cal_msg = Some((
-                                format!("Left lock set: {}", was.raw_value), 180
+                                format!("Left lock set: {}", mtr.was_raw), 180
                             ));
                         }
                     }
@@ -1729,13 +1628,13 @@ impl GuidanceApp {
                         egui::RichText::new("Set Right Lock").size(13.0)
                     ).min_size(egui::vec2(120.0, 30.0));
                     if ui.add_enabled(has_was_data, right_btn).clicked() {
-                        if let Some(was) = &self.latest_was {
-                            self.was_right_lock = Some(was.raw_value);
+                        if let Some(mtr) = &self.latest_motor {
+                            self.was_right_lock = Some(mtr.was_raw);
                             if let Some(db) = &self.db {
-                                let _ = db.set_config("was_right_lock", &was.raw_value.to_string());
+                                let _ = db.set_config("was_right_lock", &mtr.was_raw.to_string());
                             }
                             self.was_cal_msg = Some((
-                                format!("Right lock set: {}", was.raw_value), 180
+                                format!("Right lock set: {}", mtr.was_raw), 180
                             ));
                         }
                     }
@@ -1834,14 +1733,6 @@ impl GuidanceApp {
                             "Lookahead: {:.1} m",
                             self.steering.last_lookahead_m,
                         )).size(12.0).color(egui::Color32::from_rgb(100, 200, 255)));
-
-                        // WAS stale warning
-                        if self.steering.was_stale {
-                            ui.colored_label(
-                                egui::Color32::from_rgb(255, 200, 60),
-                                egui::RichText::new("⚠ WAS data stale — using last known angle").size(11.0)
-                            );
-                        }
                     } else {
                         ui.colored_label(egui::Color32::GRAY, "● Disengaged");
                         if let Some(ref reason) = self.steering.disengage_reason {
@@ -1982,26 +1873,6 @@ impl GuidanceApp {
 
                     ui.add_space(6.0);
 
-                    // Inner loop: Kp_angle (angle error → PWM)
-                    ui.label(egui::RichText::new("Inner loop — wheel position:").size(12.0).strong());
-                    ui.add_space(2.0);
-                    ui.label(egui::RichText::new("Kp angle (PWM/°):").size(12.0));
-                    let old_kp_angle = self.steering.kp_angle;
-                    ui.add(egui::Slider::new(&mut self.steering.kp_angle, 1.0..=15.0)
-                        .step_by(0.5)
-                        .suffix(" PWM/°")
-                    );
-                    if (self.steering.kp_angle - old_kp_angle).abs() > 0.1 {
-                        if let Some(db) = &self.db {
-                            let _ = db.set_config("steer_kp_angle", &format!("{:.1}", self.steering.kp_angle));
-                        }
-                    }
-                    ui.label(egui::RichText::new(
-                        format!("10° error → {} PWM (motor threshold: {})", (self.steering.kp_angle * 10.0) as i32, self.steering.min_pwm)
-                    ).size(11.0).weak());
-
-                    ui.add_space(4.0);
-
                     // XTE rate damping — waveform amplitude reduction
                     ui.label(egui::RichText::new("XTE damping (Kd):").size(12.0));
                     let old_kd = self.steering.kd_xte;
@@ -2019,42 +1890,7 @@ impl GuidanceApp {
 
                     ui.add_space(4.0);
 
-                    // Max PWM slider
-                    ui.label(egui::RichText::new("Max PWM:").size(12.0));
-                    let mut max_pwm_f = self.steering.max_pwm as f64;
-                    ui.add(egui::Slider::new(&mut max_pwm_f, 50.0..=255.0)
-                        .step_by(5.0)
-                    );
-                    self.steering.max_pwm = max_pwm_f as i16;
-
-                    ui.add_space(4.0);
-
-                    // Min PWM slider (motor stall torque)
-                    ui.label(egui::RichText::new("Min PWM (stall torque):").size(12.0));
-                    let mut min_pwm_f = self.steering.min_pwm as f64;
-                    ui.add(egui::Slider::new(&mut min_pwm_f, 0.0..=150.0)
-                        .step_by(5.0)
-                    );
-                    self.steering.min_pwm = min_pwm_f as i16;
-                    ui.label(egui::RichText::new(
-                        "Motor can't overcome steering resistance below this"
-                    ).size(11.0).weak());
-
-                    ui.add_space(4.0);
-
-                    // Angle deadband slider (inner loop)
-                    ui.label(egui::RichText::new("Angle deadband:").size(12.0));
-                    ui.add(egui::Slider::new(&mut self.steering.angle_deadband_deg, 0.5..=5.0)
-                        .step_by(0.5)
-                        .suffix("°")
-                    );
-                    ui.label(egui::RichText::new(
-                        "Motor stops when within this angle of target — prevents hunting"
-                    ).size(11.0).weak());
-
-                    ui.add_space(4.0);
-
-                    // Deadband slider
+                    // Deadband slider (outer loop smooth taper zone)
                     let mut deadband_cm = self.steering.deadband_m * 100.0;
                     ui.label(egui::RichText::new("Deadband:").size(12.0));
                     ui.add(egui::Slider::new(&mut deadband_cm, 0.0..=20.0)
@@ -2075,36 +1911,36 @@ impl GuidanceApp {
                         ui.colored_label(egui::Color32::GREEN, "● Motor ESP32 connected");
                         ui.add_space(4.0);
 
-                        // Current test PWM display
+                        // Current test angle display
                         ui.label(
-                            egui::RichText::new(format!("PWM: {}", self.test_pwm))
+                            egui::RichText::new(format!("Test angle: {}deg", self.test_pwm))
                                 .size(18.0).strong()
                         );
 
                         ui.add_space(4.0);
 
-                        // Preset buttons
-                        ui.label(egui::RichText::new("Presets:").size(11.0).weak());
+                        // Preset angle buttons (degrees x10 for resolution)
+                        ui.label(egui::RichText::new("Presets (degrees):").size(11.0).weak());
                         ui.horizontal(|ui| {
-                            for &pwm in &[-100i16, -50, -25, 0, 25, 50, 100] {
-                                let label = if pwm == 0 {
+                            for &angle in &[-10i16, -5, -2, 0, 2, 5, 10] {
+                                let label = if angle == 0 {
                                     "STOP".to_string()
                                 } else {
-                                    format!("{}", pwm)
+                                    format!("{}deg", angle)
                                 };
-                                let colour = if pwm == 0 {
+                                let colour = if angle == 0 {
                                     egui::Color32::from_rgb(255, 60, 60)
                                 } else {
                                     egui::Color32::LIGHT_GRAY
                                 };
                                 if ui.add(egui::Button::new(
                                     egui::RichText::new(&label).size(12.0).color(colour)
-                                ).min_size(egui::vec2(38.0, 28.0))).clicked() {
-                                    self.test_pwm = pwm;
-                                    match self.motor_handle.send_steer(pwm) {
+                                ).min_size(egui::vec2(42.0, 28.0))).clicked() {
+                                    self.test_pwm = angle;
+                                    match self.motor_handle.send_steer_angle(angle as f64) {
                                         Ok(_) => {
                                             self.motor_test_msg = Some((
-                                                format!("Sent PWM {}", pwm), 120
+                                                format!("Sent {}deg", angle), 120
                                             ));
                                         }
                                         Err(e) => {
@@ -2121,21 +1957,21 @@ impl GuidanceApp {
 
                         // Fine adjust
                         ui.horizontal(|ui| {
-                            if ui.add(egui::Button::new("−10").min_size(egui::vec2(40.0, 28.0))).clicked() {
-                                self.test_pwm = (self.test_pwm - 10).max(-255);
-                                let _ = self.motor_handle.send_steer(self.test_pwm);
+                            if ui.add(egui::Button::new("-1deg").min_size(egui::vec2(44.0, 28.0))).clicked() {
+                                self.test_pwm = (self.test_pwm - 1).max(-45);
+                                let _ = self.motor_handle.send_steer_angle(self.test_pwm as f64);
                             }
-                            if ui.add(egui::Button::new("+10").min_size(egui::vec2(40.0, 28.0))).clicked() {
-                                self.test_pwm = (self.test_pwm + 10).min(255);
-                                let _ = self.motor_handle.send_steer(self.test_pwm);
+                            if ui.add(egui::Button::new("+1deg").min_size(egui::vec2(44.0, 28.0))).clicked() {
+                                self.test_pwm = (self.test_pwm + 1).min(45);
+                                let _ = self.motor_handle.send_steer_angle(self.test_pwm as f64);
                             }
                             // Emergency stop
                             if ui.add(egui::Button::new(
-                                egui::RichText::new("⏹ STOP").size(14.0).strong()
+                                egui::RichText::new("STOP").size(14.0).strong()
                                     .color(egui::Color32::from_rgb(255, 60, 60))
                             ).min_size(egui::vec2(70.0, 28.0))).clicked() {
                                 self.test_pwm = 0;
-                                let _ = self.motor_handle.send_steer(0);
+                                let _ = self.motor_handle.send_steer_angle(0.0);
                                 self.motor_test_msg = Some(("Motor stopped".to_string(), 120));
                             }
                         });
@@ -2156,9 +1992,9 @@ impl GuidanceApp {
                             ));
                         }
 
-                        // WAS feedback for verifying motor→steering→WAS loop
-                        if let Some(was) = &self.latest_was {
-                            ui.label(format!("WAS feedback: {} raw ({} mV)", was.raw_value, was.voltage_mv));
+                        // WAS feedback for verifying motor->steering->WAS loop
+                        if let Some(mtr) = &self.latest_motor {
+                            ui.label(format!("WAS feedback: {} raw  Angle: {:.1}deg", mtr.was_raw, mtr.actual_angle));
                         }
                     } else {
                         ui.colored_label(egui::Color32::GRAY, "● Motor ESP32 not connected");

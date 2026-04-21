@@ -50,12 +50,29 @@ pub struct EspHeartbeat {
     pub uptime_ms: u64,
 }
 
-/// Motor controller status
+/// Motor controller status (from motor ESP32, includes WAS feedback)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MotorStatus {
     pub current_pwm: i16,   // -255 to 255
+    pub was_raw: u16,       // Raw ADC value from WAS pot
+    pub actual_angle: f64,  // Calibrated angle in degrees (from ESP32)
     pub enabled: bool,
     pub uptime_ms: u64,
+}
+
+/// DR (dead reckoning) calibration state from LC29H BA
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum DrCalState {
+    Uncalibrated,  // CalState 0 — drive >3 m/s with turns to calibrate
+    Calibrating,   // CalState 1 — calibration in progress
+    Calibrated,    // CalState 2 — DR fully operational
+}
+
+/// Config acknowledgement from motor ESP32
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigAck {
+    pub param: String,   // "WAS", "PID", "INVERT"
+    pub success: bool,
 }
 
 /// Combined vehicle state used for guidance calculations
