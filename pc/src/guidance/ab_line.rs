@@ -277,12 +277,33 @@ impl AbLineGuide {
                 // Apply pass offset and nudge
                 let adjusted_xtd = raw_xtd - self.pass_offset_m - self.nudge_m;
 
-                // Heading error: difference between current heading and line bearing
+                // Heading error: difference between current heading and line bearing.
+                //
+                // The AB line defines a direction (A→B), but the tractor drives
+                // both ways — north on one pass, south on the return. We detect
+                // which direction the vehicle is traveling by checking if the raw
+                // heading error exceeds 90°. If so, the vehicle is on a return
+                // pass and we flip the reference bearing by 180° so heading_error
+                // stays small and pure pursuit steers correctly.
+                //
+                // The XTE sign is defined relative to the A→B bearing. When we
+                // flip the bearing for a return pass, the "right of line" / "left
+                // of line" sense inverts, so we also negate the XTE to keep the
+                // sign convention consistent with the flipped bearing.
                 let line_bearing = coords::bearing(a.0, a.1, b.0, b.1);
-                let heading_error = normalise_angle(fix.heading - line_bearing);
+                let raw_heading_error = normalise_angle(fix.heading - line_bearing);
+
+                let (heading_error, final_xtd) = if raw_heading_error.abs() > 90.0 {
+                    // Return pass: flip bearing and negate XTE
+                    let return_error = normalise_angle(raw_heading_error - 180.0);
+                    (return_error, -adjusted_xtd)
+                } else {
+                    // Forward pass: use as-is
+                    (raw_heading_error, adjusted_xtd)
+                };
 
                 Some(CrossTrackError {
-                    distance_m: adjusted_xtd,
+                    distance_m: final_xtd,
                     heading_error,
                 })
             }
