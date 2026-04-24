@@ -6,6 +6,11 @@
 //!
 //! Auto-detection scans for ports sending $FINNMTR sentences, excluding
 //! the GPS port (which sends $GNGGA/$GNVTG from the LC29H BA).
+//!
+//! Decision #027: channel sends to GUI / steer thread are non-blocking
+//! (`try_send`) — a slow consumer will lose a motor status update rather
+//! than backpressure the whole reader thread. Drop counters are logged
+//! every ~5s so consumer stalls are visible in field logs.
 
 use std::io::{BufRead, BufReader, Write};
 use std::sync::{Arc, Mutex};
@@ -134,6 +139,10 @@ fn auto_detect_motor_port(baud_rate: u32, exclude_port: &str) -> Option<String> 
 /// Opens the motor ESP32's COM port, reads $FINNMTR and $FINNACK messages,
 /// and sends them to the GUI via `finn_tx`. Also stores the write half
 /// of the port in `handle` so the GUI can send steer and config commands.
+///
+/// Decision #027: channel sends are non-blocking — if a consumer falls
+/// behind, motor messages are dropped rather than backpressuring the
+/// reader (which would also stall the second consumer via shared thread).
 pub fn run_motor_reader(
     gps_port: String,
     baud_rate: u32,
@@ -173,9 +182,16 @@ pub fn run_motor_reader(
     }
     tracing::info!("Motor ESP32 connected — steer and config commands available");
 
-    // Read loop — parse $FINNMTR and $FINNACK, forward to GUI
+    // Read loop — parse $FINNMTR and $FINNACK, forward to GUI + steer thread.
+    // Decision #027: drop-on-full to prevent consumer stalls cascading back
+    // through this reader thread.
     let reader = BufReader::new(port);
     let mut line_count: u64 = 0;
+    let mut gui_drops: u64 = 0;
+    let mut steer_drops: u64 = 0;
+    let mut gui_closed = false;
+    let mut steer_closed = false;
+    let mut last_drop_log = std::time::Instant::now();
 
     for line in reader.lines() {
         match line {
@@ -187,13 +203,44 @@ pub fn run_motor_reader(
 
                 if sentence.starts_with("$FINN") {
                     if let Some(msg) = finn_parser::parse_finn_sentence(&sentence) {
-                        // Send to GUI channel
-                        let gui_closed = finn_tx.send(msg.clone()).is_err();
-                        // Send to steer thread channel
-                        let steer_closed = finn_tx_steer.send(msg).is_err();
+                        // Send to GUI channel (drop if full).
+                        match finn_tx.try_send(msg.clone()) {
+                            Ok(()) => {}
+                            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                                gui_drops += 1;
+                            }
+                            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                                gui_closed = true;
+                            }
+                        }
+
+                        // Send to steer thread channel (drop if full).
+                        match finn_tx_steer.try_send(msg) {
+                            Ok(()) => {}
+                            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                                steer_drops += 1;
+                            }
+                            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                                steer_closed = true;
+                            }
+                        }
+
                         if gui_closed && steer_closed {
                             tracing::warn!("All FINN channels closed, stopping motor reader");
                             return;
+                        }
+
+                        // Log drop counters periodically.
+                        if last_drop_log.elapsed() >= Duration::from_secs(5) {
+                            if gui_drops > 0 || steer_drops > 0 {
+                                tracing::warn!(
+                                    "Motor msg drops in last ~5s: gui={} steer={} (consumer stalled)",
+                                    gui_drops, steer_drops
+                                );
+                                gui_drops = 0;
+                                steer_drops = 0;
+                            }
+                            last_drop_log = std::time::Instant::now();
                         }
                     }
                 }

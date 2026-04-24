@@ -16,6 +16,16 @@
 //! On startup, sends PAIR commands to:
 //! - Disable unnecessary NMEA sentences (GLL, GSA, GSV, RMC)
 //! - Set the fix rate to 10Hz (100ms interval)
+//!
+//! ## Decision #027 — drop-on-full channel sends
+//!
+//! Previously both channel sends used blocking `send()`, which coupled the
+//! GPS reader thread to the slowest consumer. A GUI hiccup could fill
+//! `gps_tx` (bounded 64), block the reader, and starve the steer thread of
+//! fixes via the same blocked thread — producing cascading multi-second
+//! freezes in the field. Guidance wants latest-value semantics, not backlog
+//! catch-up, so we `try_send` and drop on full, logging drop counts so
+//! consumer stalls are visible in field logs.
 
 use crossbeam_channel::Sender;
 use serialport::{self, SerialPortType};
@@ -277,6 +287,10 @@ fn format_pair_command(body: &str) -> String {
 /// intermediary). Only GPS NMEA sentences are processed here — FINN messages
 /// from the motor ESP32 are handled by the motor reader in comms/serial.rs.
 ///
+/// Decision #027: channel sends are non-blocking (`try_send`) — if a
+/// consumer is slow, fixes are dropped rather than backpressured. Drop
+/// counters are logged every ~5s so stalls are visible in field logs.
+///
 /// Once the port is opened, the port name is sent via `port_name_tx` so the
 /// motor reader thread knows which port to exclude during auto-detect.
 pub fn run_gps_reader(
@@ -328,6 +342,20 @@ pub fn run_gps_reader(
     let mut nmea_parser = parser::NmeaState::new();
     let mut line_count: u64 = 0;
 
+    // Decision #027: drop-on-full channel sends with rolling drop counters.
+    // Blocking sends on bounded channels previously coupled the GPS reader
+    // thread to the slowest consumer — a GUI hiccup filled `gps_tx`, blocked
+    // the reader, and starved the steer thread through the same blocked
+    // thread, producing multi-second cascading freezes. `try_send` + drop
+    // gives guidance the latest-value semantics it actually wants (a stale
+    // 3s-old fix is worse than no fix), and the periodic drop-count WARN
+    // makes consumer stalls visible in field logs.
+    let mut gui_drops: u64 = 0;
+    let mut steer_drops: u64 = 0;
+    let mut gui_closed = false;
+    let mut steer_closed = false;
+    let mut last_drop_log = std::time::Instant::now();
+
     for line in reader.lines() {
         match line {
             Ok(sentence) => {
@@ -344,13 +372,47 @@ pub fn run_gps_reader(
                             fix.latitude, fix.longitude, fix.satellites, fix.fix_quality
                         );
                     }
-                    // Send to GUI channel
-                    let gui_closed = gps_tx.send(fix.clone()).is_err();
-                    // Send to steer thread channel
-                    let steer_closed = gps_tx_steer.send(fix).is_err();
+
+                    // Send to GUI channel (drop if full — GUI will get the next fix).
+                    match gps_tx.try_send(fix.clone()) {
+                        Ok(()) => {}
+                        Err(crossbeam_channel::TrySendError::Full(_)) => {
+                            gui_drops += 1;
+                        }
+                        Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                            gui_closed = true;
+                        }
+                    }
+
+                    // Send to steer thread channel (drop if full — steer thread
+                    // will compute off the next fix, which is what we want).
+                    match gps_tx_steer.try_send(fix) {
+                        Ok(()) => {}
+                        Err(crossbeam_channel::TrySendError::Full(_)) => {
+                            steer_drops += 1;
+                        }
+                        Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                            steer_closed = true;
+                        }
+                    }
+
                     if gui_closed && steer_closed {
                         tracing::warn!("All GPS channels closed, stopping reader");
                         return;
+                    }
+
+                    // Log drop counters periodically so consumer stalls are
+                    // visible in field logs without flooding the output.
+                    if last_drop_log.elapsed() >= Duration::from_secs(5) {
+                        if gui_drops > 0 || steer_drops > 0 {
+                            tracing::warn!(
+                                "GPS fix drops in last ~5s: gui={} steer={} (consumer stalled)",
+                                gui_drops, steer_drops
+                            );
+                            gui_drops = 0;
+                            steer_drops = 0;
+                        }
+                        last_drop_log = std::time::Instant::now();
                     }
                 }
             }
