@@ -14,11 +14,13 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use crossbeam_channel::Sender;
 use serialport::{self, SerialPortType};
 use finn_guidance_common::protocol::{self, FinnMessage};
 use crate::gps::finn_parser;
+use crate::telemetry::SharedDropCounters;
 
 /// Thread-safe handle for sending commands to the motor ESP32.
 /// Cloneable — the GUI thread holds one, the motor reader thread holds another.
@@ -149,6 +151,7 @@ pub fn run_motor_reader(
     handle: MotorHandle,
     finn_tx: Sender<FinnMessage>,
     finn_tx_steer: Sender<FinnMessage>,
+    drop_counters: SharedDropCounters,
 ) {
     // Brief delay to let the GPS reader claim its port first
     std::thread::sleep(Duration::from_secs(2));
@@ -184,11 +187,12 @@ pub fn run_motor_reader(
 
     // Read loop — parse $FINNMTR and $FINNACK, forward to GUI + steer thread.
     // Decision #027: drop-on-full to prevent consumer stalls cascading back
-    // through this reader thread.
+    // through this reader thread. Drop counts tracked via shared atomics
+    // for telemetry, plus local counters for the tracing WARN log.
     let reader = BufReader::new(port);
     let mut line_count: u64 = 0;
-    let mut gui_drops: u64 = 0;
-    let mut steer_drops: u64 = 0;
+    let mut local_gui_drops: u64 = 0;
+    let mut local_steer_drops: u64 = 0;
     let mut gui_closed = false;
     let mut steer_closed = false;
     let mut last_drop_log = std::time::Instant::now();
@@ -207,7 +211,8 @@ pub fn run_motor_reader(
                         match finn_tx.try_send(msg.clone()) {
                             Ok(()) => {}
                             Err(crossbeam_channel::TrySendError::Full(_)) => {
-                                gui_drops += 1;
+                                drop_counters.mtr_gui.fetch_add(1, Ordering::Relaxed);
+                                local_gui_drops += 1;
                             }
                             Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
                                 gui_closed = true;
@@ -218,7 +223,8 @@ pub fn run_motor_reader(
                         match finn_tx_steer.try_send(msg) {
                             Ok(()) => {}
                             Err(crossbeam_channel::TrySendError::Full(_)) => {
-                                steer_drops += 1;
+                                drop_counters.mtr_steer.fetch_add(1, Ordering::Relaxed);
+                                local_steer_drops += 1;
                             }
                             Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
                                 steer_closed = true;
@@ -232,13 +238,13 @@ pub fn run_motor_reader(
 
                         // Log drop counters periodically.
                         if last_drop_log.elapsed() >= Duration::from_secs(5) {
-                            if gui_drops > 0 || steer_drops > 0 {
+                            if local_gui_drops > 0 || local_steer_drops > 0 {
                                 tracing::warn!(
                                     "Motor msg drops in last ~5s: gui={} steer={} (consumer stalled)",
-                                    gui_drops, steer_drops
+                                    local_gui_drops, local_steer_drops
                                 );
-                                gui_drops = 0;
-                                steer_drops = 0;
+                                local_gui_drops = 0;
+                                local_steer_drops = 0;
                             }
                             last_drop_log = std::time::Instant::now();
                         }

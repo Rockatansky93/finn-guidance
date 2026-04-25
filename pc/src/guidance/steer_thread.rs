@@ -29,6 +29,14 @@
 //! The GUI communicates commands (engage, disengage, tuning changes, AB line
 //! updates) by writing to `SharedSteerState`. The steer thread picks them up
 //! on the next loop iteration.
+//!
+//! ## Telemetry (Phase D.1)
+//!
+//! When auto-steer is engaged, a `TelemetryLogger` writes every iteration's
+//! control state to a `.jsonl` file at 10Hz, plus 1Hz summary records. The
+//! logger is created on engage and dropped on disengage. Log files live in
+//! `logs/` next to the executable and are designed for post-run analysis —
+//! either manually or via a FINN Core worker node for tuning recommendations.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -39,6 +47,10 @@ use crate::comms::serial::MotorHandle;
 use crate::guidance::ab_line::AbLineGuide;
 use crate::guidance::steering::SteeringController;
 use crate::position::interpolator::PositionInterpolator;
+use crate::telemetry::logger::{
+    TelemetryLogger, TuningSnapshot, IterRecord, DropCounts, fix_quality_to_u8,
+};
+use crate::telemetry::SharedDropCounters;
 
 /// Fixed loop interval — 10Hz matches the LC29H BA GPS output rate.
 const STEER_LOOP_INTERVAL: Duration = Duration::from_millis(100);
@@ -165,11 +177,15 @@ pub type SteerStateHandle = Arc<Mutex<SharedSteerState>>;
 /// guidance + steering at a fixed 10Hz, and sends steer commands
 /// directly to the motor ESP32. All display state is written to
 /// `shared` for the GUI to read.
+///
+/// Telemetry logging is active while auto-steer is engaged — a new
+/// `.jsonl` file is created on each engage and closed on disengage.
 pub fn run_steer_thread(
     gps_rx: Receiver<GpsFix>,
     finn_rx: Receiver<FinnMessage>,
     motor_handle: MotorHandle,
     shared: SteerStateHandle,
+    drop_counters: SharedDropCounters,
 ) {
     tracing::info!("Steer thread started (10Hz fixed loop)");
 
@@ -179,8 +195,20 @@ pub fn run_steer_thread(
 
     // Latest fix and motor state (local to this thread)
     let mut _latest_fix: Option<GpsFix> = None;
+    let mut latest_fix_time: Option<Instant> = None;
     let mut latest_motor_angle: f64 = 0.0;
     let mut latest_motor_pwm: i16 = 0;
+
+    // Telemetry logger — created on engage, dropped on disengage.
+    let mut telemetry: Option<TelemetryLogger> = None;
+    // Track the run start time for telemetry t_ms calculation.
+    let mut run_start: Option<Instant> = None;
+    // Track pass number for change detection.
+    let mut last_logged_pass: i32 = 0;
+    // Accumulated drop counts for the current 1Hz summary window.
+    // The steer thread swaps the shared atomics each second.
+    let mut pending_drops = DropCounts::default();
+    let mut last_drop_swap = Instant::now();
 
     loop {
         let loop_start = Instant::now();
@@ -189,6 +217,7 @@ pub fn run_steer_thread(
         while let Ok(fix) = gps_rx.try_recv() {
             interpolator.update_fix(&fix);
             steering.notify_gps_fix();
+            latest_fix_time = Some(Instant::now());
             _latest_fix = Some(fix);
         }
 
@@ -206,6 +235,7 @@ pub fn run_steer_thread(
         }
 
         // ── 3. Process commands and sync tuning from GUI ────────────
+        let (current_pass, current_implement_w, current_overlap);
         {
             let mut state = shared.lock().unwrap();
 
@@ -216,11 +246,39 @@ pub fn run_steer_thread(
                     SteerCommand::Engage => {
                         steering.engage();
                         tracing::info!("Steer thread: ENGAGED");
+
+                        // Create telemetry logger with current tuning snapshot
+                        let tuning = TuningSnapshot {
+                            lookahead_base: state.lookahead_base,
+                            lookahead_speed_factor: state.lookahead_speed_factor,
+                            wheelbase_m: state.wheelbase_m,
+                            max_steer_angle: state.max_steer_angle,
+                            kd_xte: state.kd_xte,
+                            deadband_m: state.deadband_m,
+                            implement_width_m: state.implement_width_m,
+                            overlap_m: state.overlap_m,
+                        };
+                        telemetry = TelemetryLogger::new(&tuning);
+                        run_start = Some(Instant::now());
+                        last_logged_pass = state.pass_number;
+
+                        if let Some(ref mut tl) = telemetry {
+                            tl.log_event("engage", Some(format!(
+                                "pass={}", state.pass_number
+                            )));
+                        }
                     }
                     SteerCommand::Disengage => {
                         steering.disengage(Some("Manual disengage".to_string()));
                         let _ = motor_handle.send_steer_angle(0.0);
                         tracing::info!("Steer thread: DISENGAGED");
+
+                        // Log disengage event and close telemetry
+                        if let Some(ref mut tl) = telemetry {
+                            tl.log_event("disengage", Some("Manual".to_string()));
+                        }
+                        telemetry = None;
+                        run_start = None;
                     }
                 }
             }
@@ -254,6 +312,21 @@ pub fn run_steer_thread(
                 guide.implement_width_m = state.implement_width_m;
                 guide.overlap_m = state.overlap_m;
             }
+
+            // Capture current values for telemetry (outside the lock)
+            current_pass = state.pass_number;
+            current_implement_w = state.implement_width_m;
+            current_overlap = state.overlap_m;
+        }
+
+        // Log pass changes
+        if current_pass != last_logged_pass {
+            if let Some(ref mut tl) = telemetry {
+                tl.log_event("pass_change", Some(format!(
+                    "from={} to={}", last_logged_pass, current_pass
+                )));
+            }
+            last_logged_pass = current_pass;
         }
 
         // ── 4. Interpolate position and compute steering ────────────
@@ -277,6 +350,13 @@ pub fn run_steer_thread(
                             .unwrap_or_else(|| "Unknown".to_string());
                         tracing::warn!("Steer thread: safety disengage — {}", reason);
 
+                        // Log safety disengage and close telemetry
+                        if let Some(ref mut tl) = telemetry {
+                            tl.log_event("disengage", Some(format!("safety: {}", reason)));
+                        }
+                        telemetry = None;
+                        run_start = None;
+
                         // Update shared state
                         let mut state = shared.lock().unwrap();
                         state.display.engaged = false;
@@ -286,6 +366,56 @@ pub fn run_steer_thread(
                     } else {
                         // Send steer command to ESP32
                         let _ = motor_handle.send_steer_angle(desired_angle);
+
+                        // ── Telemetry: log this iteration ────────────
+                        if let Some(ref mut tl) = telemetry {
+                            let t_ms = run_start
+                                .map(|s| s.elapsed().as_millis() as u64)
+                                .unwrap_or(0);
+
+                            let fix_age_ms = latest_fix_time
+                                .map(|t| t.elapsed().as_millis() as u64)
+                                .unwrap_or(9999);
+
+                            // Swap drop counters once per second and
+                            // accumulate into pending_drops for the summary.
+                            if last_drop_swap.elapsed().as_secs_f64() >= 1.0 {
+                                let fresh = drop_counters.swap_all();
+                                pending_drops.gps_gui += fresh.gps_gui;
+                                pending_drops.gps_steer += fresh.gps_steer;
+                                pending_drops.mtr_gui += fresh.mtr_gui;
+                                pending_drops.mtr_steer += fresh.mtr_steer;
+                                last_drop_swap = Instant::now();
+                            }
+
+                            let record = IterRecord {
+                                record_type: "iter",
+                                t_ms,
+                                loop_us: loop_start.elapsed().as_micros() as u64,
+                                fix_age_ms,
+                                lat: interp_fix.latitude,
+                                lon: interp_fix.longitude,
+                                speed: interp_fix.speed,
+                                heading: interp_fix.heading,
+                                fix_quality: fix_quality_to_u8(interp_fix.fix_quality),
+                                sats: interp_fix.satellites,
+                                hdop: interp_fix.hdop,
+                                pass: current_pass,
+                                xte_m: err.distance_m,
+                                heading_err: err.heading_error,
+                                desired_angle,
+                                actual_angle: latest_motor_angle,
+                                pwm: latest_motor_pwm,
+                                lookahead_m: steering.last_lookahead_m,
+                            };
+
+                            // Pass drop counts — the logger's 1Hz summary
+                            // will consume them. Reset when summary emitted.
+                            let summary_emitted = tl.log_iteration(&record, Some(&pending_drops));
+                            if summary_emitted {
+                                pending_drops = DropCounts::default();
+                            }
+                        }
 
                         // Update shared state
                         let mut state = shared.lock().unwrap();

@@ -4,6 +4,7 @@ mod gui;
 mod comms;
 mod position;
 mod coverage;
+mod telemetry;
 
 use tracing_subscriber;
 use crossbeam_channel;
@@ -11,6 +12,7 @@ use finn_guidance_common::types::GpsFix;
 use finn_guidance_common::protocol::FinnMessage;
 use crate::comms::serial::MotorHandle;
 use crate::guidance::steer_thread::{SharedSteerState, SteerStateHandle};
+use crate::telemetry::SharedDropCounters;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -48,15 +50,20 @@ fn main() {
         0.0,   // overlap_m
     )));
 
+    // Shared drop counters — incremented by reader threads, consumed by steer thread telemetry
+    let drop_counters = SharedDropCounters::new();
+
     // Start GPS serial reader thread
     // Decision #026: reads directly from LC29H BA (no sensor ESP32)
     // Sends fixes to BOTH the GUI and steer thread channels.
+    let drop_counters_gps = drop_counters.clone();
     thread::spawn(move || {
         gps::reader::run_gps_reader(
             gps::reader::GpsConfig::default(),
             gps_tx_gui,
             gps_tx_steer,
             port_tx,
+            drop_counters_gps,
         );
     });
     tracing::info!("GPS serial reader thread launched");
@@ -64,6 +71,7 @@ fn main() {
     // Start motor serial reader thread
     // Sends motor status to BOTH the GUI and steer thread channels.
     let motor_handle_thread = motor_handle.clone();
+    let drop_counters_mtr = drop_counters.clone();
     thread::spawn(move || {
         // Wait for the GPS reader to report its port
         let gps_port = port_rx.recv().unwrap_or_default();
@@ -76,6 +84,7 @@ fn main() {
             motor_handle_thread,
             finn_tx_gui,
             finn_tx_steer,
+            drop_counters_mtr,
         );
     });
     tracing::info!("Motor serial reader thread launched");
@@ -83,12 +92,14 @@ fn main() {
     // Start dedicated steering thread (10Hz fixed loop)
     let motor_handle_steer = motor_handle.clone();
     let steer_state_thread = steer_state.clone();
+    let drop_counters_steer = drop_counters.clone();
     thread::spawn(move || {
         guidance::steer_thread::run_steer_thread(
             gps_rx_steer,
             finn_rx_steer,
             motor_handle_steer,
             steer_state_thread,
+            drop_counters_steer,
         );
     });
     tracing::info!("Steering thread launched (10Hz fixed loop)");

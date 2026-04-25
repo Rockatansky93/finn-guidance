@@ -31,11 +31,13 @@ use crossbeam_channel::Sender;
 use serialport::{self, SerialPortType};
 use std::io::{BufRead, Read, Write};
 use std::io::BufReader;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tracing;
 
 use finn_guidance_common::types::GpsFix;
 use super::parser;
+use crate::telemetry::SharedDropCounters;
 
 /// Configuration for the GPS serial connection
 pub struct GpsConfig {
@@ -298,6 +300,7 @@ pub fn run_gps_reader(
     gps_tx: Sender<GpsFix>,
     gps_tx_steer: Sender<GpsFix>,
     port_name_tx: Sender<String>,
+    drop_counters: SharedDropCounters,
 ) {
     // === Step 1: Resolve port name ===
     let port_name = if config.port_name == "auto" {
@@ -342,16 +345,19 @@ pub fn run_gps_reader(
     let mut nmea_parser = parser::NmeaState::new();
     let mut line_count: u64 = 0;
 
-    // Decision #027: drop-on-full channel sends with rolling drop counters.
+    // Decision #027: drop-on-full channel sends with shared atomic counters.
     // Blocking sends on bounded channels previously coupled the GPS reader
     // thread to the slowest consumer — a GUI hiccup filled `gps_tx`, blocked
     // the reader, and starved the steer thread through the same blocked
     // thread, producing multi-second cascading freezes. `try_send` + drop
     // gives guidance the latest-value semantics it actually wants (a stale
-    // 3s-old fix is worse than no fix), and the periodic drop-count WARN
-    // makes consumer stalls visible in field logs.
-    let mut gui_drops: u64 = 0;
-    let mut steer_drops: u64 = 0;
+    // 3s-old fix is worse than no fix).
+    //
+    // Drop counts are tracked via shared AtomicU64 counters that the steer
+    // thread reads-and-resets each second for telemetry. A local rolling
+    // WARN log is kept as well for tracing output.
+    let mut local_gui_drops: u64 = 0;
+    let mut local_steer_drops: u64 = 0;
     let mut gui_closed = false;
     let mut steer_closed = false;
     let mut last_drop_log = std::time::Instant::now();
@@ -377,7 +383,8 @@ pub fn run_gps_reader(
                     match gps_tx.try_send(fix.clone()) {
                         Ok(()) => {}
                         Err(crossbeam_channel::TrySendError::Full(_)) => {
-                            gui_drops += 1;
+                            drop_counters.gps_gui.fetch_add(1, Ordering::Relaxed);
+                            local_gui_drops += 1;
                         }
                         Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
                             gui_closed = true;
@@ -389,7 +396,8 @@ pub fn run_gps_reader(
                     match gps_tx_steer.try_send(fix) {
                         Ok(()) => {}
                         Err(crossbeam_channel::TrySendError::Full(_)) => {
-                            steer_drops += 1;
+                            drop_counters.gps_steer.fetch_add(1, Ordering::Relaxed);
+                            local_steer_drops += 1;
                         }
                         Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
                             steer_closed = true;
@@ -401,16 +409,17 @@ pub fn run_gps_reader(
                         return;
                     }
 
-                    // Log drop counters periodically so consumer stalls are
-                    // visible in field logs without flooding the output.
+                    // Log drop counters periodically via tracing (human-readable).
+                    // The atomic counters are the source of truth for telemetry;
+                    // these local counters are just for the WARN log.
                     if last_drop_log.elapsed() >= Duration::from_secs(5) {
-                        if gui_drops > 0 || steer_drops > 0 {
+                        if local_gui_drops > 0 || local_steer_drops > 0 {
                             tracing::warn!(
                                 "GPS fix drops in last ~5s: gui={} steer={} (consumer stalled)",
-                                gui_drops, steer_drops
+                                local_gui_drops, local_steer_drops
                             );
-                            gui_drops = 0;
-                            steer_drops = 0;
+                            local_gui_drops = 0;
+                            local_steer_drops = 0;
                         }
                         last_drop_log = std::time::Instant::now();
                     }
