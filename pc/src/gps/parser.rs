@@ -35,6 +35,18 @@ pub struct NmeaState {
     pub dr_cal_state: DrCalState,
     /// Track the last GGA timestamp to detect new epochs.
     last_gga_time_ms: u64,
+
+    // === Heading offset calibration ===
+    /// User-configurable heading offset in degrees, added to the heading
+    /// before it enters the fix. Corrects for GPS antenna/module mounting
+    /// misalignment. Positive = clockwise correction (rotate heading right).
+    pub heading_offset_deg: f64,
+
+    // === Diagnostic heading sources (for GUI comparison display) ===
+    /// Last raw VTG heading before offset applied (NaN if no VTG received)
+    pub last_vtg_heading: f64,
+    /// Last raw PQTMINS heading before offset applied (NaN if no INS received)
+    pub last_ins_heading: f64,
 }
 
 impl NmeaState {
@@ -46,6 +58,9 @@ impl NmeaState {
             heading_from_ins: false,
             dr_cal_state: DrCalState::Uncalibrated,
             last_gga_time_ms: 0,
+            heading_offset_deg: 0.0,
+            last_vtg_heading: f64::NAN,
+            last_ins_heading: f64::NAN,
         }
     }
 
@@ -93,8 +108,9 @@ impl NmeaState {
         let parts: Vec<&str> = sentence.split(',').collect();
         if parts.len() >= 8 {
             // Field 1: heading (true north) — only use if no INS heading
-            if !self.heading_from_ins {
-                if let Ok(heading) = parts[1].parse::<f64>() {
+            if let Ok(heading) = parts[1].parse::<f64>() {
+                self.last_vtg_heading = heading;
+                if !self.heading_from_ins {
                     self.last_heading = heading;
                 }
             }
@@ -145,6 +161,7 @@ impl NmeaState {
 
         // Field 12 (index 12): Heading in degrees (0-360)
         if let Ok(heading) = parts[12].parse::<f64>() {
+            self.last_ins_heading = heading;
             self.last_heading = heading;
             self.heading_from_ins = true;
         }
@@ -192,20 +209,42 @@ impl NmeaState {
         // Reset the INS heading flag after building the fix —
         // next epoch starts fresh, VTG will be used unless a new
         // PQTMINS arrives before the next GGA.
+
+        // Apply heading offset calibration. This corrects for GPS
+        // antenna/module mounting misalignment. The offset is added
+        // to the raw heading so all downstream consumers (guidance,
+        // steering, field view) see the corrected value.
+        let corrected_heading = normalise_heading(
+            self.last_heading + self.heading_offset_deg
+        );
+
         let fix = GpsFix {
             latitude: lat,
             longitude: lon,
             altitude: self.nmea.altitude.unwrap_or(0.0) as f64,
             speed: self.last_speed,
-            heading: self.last_heading,
+            heading: corrected_heading,
             fix_quality,
             satellites: self.nmea.num_of_fix_satellites.unwrap_or(0) as u8,
             hdop: self.nmea.hdop.unwrap_or(99.9) as f64,
             timestamp_ms: now_ms,
+            diag_vtg_heading: self.last_vtg_heading,
+            diag_ins_heading: self.last_ins_heading,
         };
 
         self.heading_from_ins = false;
 
         Some(fix)
     }
+}
+
+/// Normalise a heading to 0..360 range
+fn normalise_heading(mut heading: f64) -> f64 {
+    while heading >= 360.0 {
+        heading -= 360.0;
+    }
+    while heading < 0.0 {
+        heading += 360.0;
+    }
+    heading
 }

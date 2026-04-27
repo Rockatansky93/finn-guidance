@@ -20,6 +20,7 @@ use crate::guidance::steer_thread::{SteerStateHandle, SteerCommand, SteerDisplay
 use crate::coverage::logger::CoverageLogger;
 use crate::coverage::db::{CoverageDb, SavedField, SavedAbLine};
 use crate::position::interpolator::PositionInterpolator;
+use crate::gps::reader::SharedHeadingOffset;
 use super::field_view::FieldView;
 
 /// Target frame interval — 30fps is smooth for guidance display while
@@ -98,6 +99,12 @@ pub struct GuidanceApp {
     /// Status message for WAS calibration actions
     was_cal_msg: Option<(String, u32)>,
 
+    // --- Heading offset calibration ---
+    /// Shared atomic heading offset — updated here, polled by GPS reader thread.
+    heading_offset_shared: SharedHeadingOffset,
+    /// Local copy of the heading offset for the slider (degrees).
+    heading_offset_deg: f64,
+
     // --- AB line persistence ---
     /// SQLite database (opened once, held for the session)
     db: Option<CoverageDb>,
@@ -124,7 +131,7 @@ pub struct GuidanceApp {
 }
 
 impl GuidanceApp {
-    pub fn new(gps_rx: Receiver<GpsFix>, finn_rx: Receiver<FinnMessage>, motor_handle: MotorHandle, steer_state: SteerStateHandle, implement_width: f64) -> Self {
+    pub fn new(gps_rx: Receiver<GpsFix>, finn_rx: Receiver<FinnMessage>, motor_handle: MotorHandle, steer_state: SteerStateHandle, implement_width: f64, heading_offset_shared: SharedHeadingOffset) -> Self {
         // Open the coverage database.  `CoverageLogger` also holds a reference
         // in some configurations; here we open a second handle for persistence.
         let db = CoverageDb::open(std::path::Path::new("data/coverage.db")).ok();
@@ -167,6 +174,17 @@ impl GuidanceApp {
             .and_then(|d| d.get_config("motor_invert"))
             .map(|v| v == "true")
             .unwrap_or(false);
+
+        // Load heading offset calibration from database
+        let heading_offset_deg = db.as_ref()
+            .and_then(|d| d.get_config("heading_offset_deg"))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        // Push the loaded value to the shared atomic so the GPS reader uses it
+        heading_offset_shared.store(
+            (heading_offset_deg * 100.0).round() as i32,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         // Load pure-pursuit steering parameters from database.
         // Note: pre-pure-pursuit databases may have `steer_kp` / `steer_kh`
@@ -265,6 +283,8 @@ impl GuidanceApp {
             was_right_lock,
             motor_invert,
             was_cal_msg: None,
+            heading_offset_shared,
+            heading_offset_deg,
             db,
             saved_fields,
             saved_ab_lines,
@@ -345,6 +365,18 @@ impl GuidanceApp {
     /// means "steer right" from the PID's perspective.
     fn apply_motor_direction(&self, pwm: i16) -> i16 {
         if self.motor_invert { -pwm } else { pwm }
+    }
+
+    /// Push the current heading offset to the shared atomic (for the GPS
+    /// reader thread) and persist to SQLite.
+    fn apply_heading_offset(&self) {
+        self.heading_offset_shared.store(
+            (self.heading_offset_deg * 100.0).round() as i32,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if let Some(db) = &self.db {
+            let _ = db.set_config("heading_offset_deg", &format!("{:.1}", self.heading_offset_deg));
+        }
     }
 }
 
@@ -489,7 +521,11 @@ impl GuidanceApp {
                     ui.separator();
                     ui.label(format!("{:.1} km/h", fix.speed * 3.6));
                     ui.separator();
-                    ui.label(format!("{:.0}°", fix.heading));
+                    if self.heading_offset_deg.abs() > 0.05 {
+                        ui.label(format!("{:.0}° ({:+.1}°)", fix.heading, self.heading_offset_deg));
+                    } else {
+                        ui.label(format!("{:.0}°", fix.heading));
+                    }
                 } else {
                     ui.colored_label(egui::Color32::RED, "● No GPS data");
                 }
@@ -1468,6 +1504,10 @@ impl GuidanceApp {
                         ui.label("Not recording");
                     }
                     ui.label(format!("Points: {}", self.coverage.total_points()));
+                    let hectares = self.coverage.covered_hectares();
+                    if hectares >= 0.01 {
+                        ui.label(format!("Area: {:.2} ha", hectares));
+                    }
 
                     ui.add_space(4.0);
 
@@ -1575,6 +1615,46 @@ impl GuidanceApp {
                         );
                     } else {
                         ui.label(egui::RichText::new("Motor ESP32: no data").size(12.0).weak());
+                    }
+
+                    ui.add_space(6.0);
+
+                    // Diagnostic heading comparison — shows raw VTG vs INS vs corrected
+                    // to help identify heading offset. Only shown when we have GPS data.
+                    if let Some(fix) = &self.current_fix {
+                        ui.label(egui::RichText::new("Heading sources:").size(12.0).strong());
+                        let vtg = fix.diag_vtg_heading;
+                        let ins = fix.diag_ins_heading;
+                        let corrected = fix.heading;
+
+                        if !vtg.is_nan() {
+                            ui.label(egui::RichText::new(format!("  VTG:  {:.1}°", vtg)).size(12.0));
+                        } else {
+                            ui.label(egui::RichText::new("  VTG:  --").size(12.0).weak());
+                        }
+                        if !ins.is_nan() {
+                            ui.label(egui::RichText::new(format!("  INS:  {:.1}°", ins)).size(12.0));
+                        } else {
+                            ui.label(egui::RichText::new("  INS:  --").size(12.0).weak());
+                        }
+                        ui.label(egui::RichText::new(format!("  Used: {:.1}° (offset {:+.1}°)", corrected, self.heading_offset_deg)).size(12.0)
+                            .color(egui::Color32::from_rgb(100, 200, 255)));
+
+                        // Show delta between VTG and INS when both are available
+                        if !vtg.is_nan() && !ins.is_nan() {
+                            let mut delta = ins - vtg;
+                            if delta > 180.0 { delta -= 360.0; }
+                            if delta < -180.0 { delta += 360.0; }
+                            let delta_colour = if delta.abs() < 2.0 {
+                                egui::Color32::GREEN
+                            } else if delta.abs() < 5.0 {
+                                egui::Color32::YELLOW
+                            } else {
+                                egui::Color32::from_rgb(255, 120, 60)
+                            };
+                            ui.label(egui::RichText::new(format!("  INS−VTG: {:+.1}°", delta)).size(12.0)
+                                .color(delta_colour));
+                        }
                     }
 
                     ui.add_space(10.0);
@@ -1711,6 +1791,66 @@ impl GuidanceApp {
                         ui.label(egui::RichText::new(msg).size(11.0)
                             .color(egui::Color32::from_rgb(100, 220, 100)));
                     }
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+
+                    // === Heading Offset Calibration Section ===
+                    // Corrects for GPS antenna/module mounting misalignment.
+                    // The arrow in the field view should point exactly in the
+                    // direction of travel — if it's pointing slightly left or
+                    // right, adjust this offset until it aligns.
+                    ui.label(egui::RichText::new("HEADING OFFSET").size(14.0).strong());
+                    ui.add_space(4.0);
+
+                    let offset_colour = if self.heading_offset_deg.abs() < 0.05 {
+                        egui::Color32::GRAY
+                    } else {
+                        egui::Color32::from_rgb(255, 200, 60) // amber when active
+                    };
+                    ui.label(
+                        egui::RichText::new(format!("{:+.1}°", self.heading_offset_deg))
+                            .size(24.0).strong().color(offset_colour)
+                    );
+
+                    ui.add_space(4.0);
+
+                    // Fine adjustment buttons (±0.5° and ±0.1°)
+                    ui.label(egui::RichText::new("Coarse (±0.5°):").size(11.0).weak());
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new("◄◄ -0.5").min_size(egui::vec2(65.0, 30.0))).clicked() {
+                            self.heading_offset_deg = (self.heading_offset_deg - 0.5).clamp(-15.0, 15.0);
+                            self.apply_heading_offset();
+                        }
+                        if ui.add(egui::Button::new("Reset").min_size(egui::vec2(50.0, 30.0))).clicked() {
+                            self.heading_offset_deg = 0.0;
+                            self.apply_heading_offset();
+                        }
+                        if ui.add(egui::Button::new("+0.5 ►►").min_size(egui::vec2(65.0, 30.0))).clicked() {
+                            self.heading_offset_deg = (self.heading_offset_deg + 0.5).clamp(-15.0, 15.0);
+                            self.apply_heading_offset();
+                        }
+                    });
+
+                    ui.add_space(2.0);
+                    ui.label(egui::RichText::new("Fine (±0.1°):").size(11.0).weak());
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new("◄ -0.1").min_size(egui::vec2(65.0, 30.0))).clicked() {
+                            self.heading_offset_deg = (self.heading_offset_deg - 0.1).clamp(-15.0, 15.0);
+                            self.apply_heading_offset();
+                        }
+                        ui.add_space(50.0);
+                        if ui.add(egui::Button::new("+0.1 ►").min_size(egui::vec2(65.0, 30.0))).clicked() {
+                            self.heading_offset_deg = (self.heading_offset_deg + 0.1).clamp(-15.0, 15.0);
+                            self.apply_heading_offset();
+                        }
+                    });
+
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(
+                        "Adjust until the arrow aligns with\ndirection of travel. + = rotate CW."
+                    ).size(11.0).weak());
 
                     ui.add_space(10.0);
                     ui.separator();

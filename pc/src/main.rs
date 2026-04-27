@@ -53,10 +53,17 @@ fn main() {
     // Shared drop counters — incremented by reader threads, consumed by steer thread telemetry
     let drop_counters = SharedDropCounters::new();
 
+    // Shared heading offset — GPS reader applies it to each fix,
+    // GUI can adjust it in real time via the setup page slider.
+    // Initial value loaded from SQLite in the app constructor;
+    // for now start at 0.0 and let the app update it.
+    let heading_offset = gps::reader::new_shared_heading_offset(0.0);
+
     // Start GPS serial reader thread
     // Decision #026: reads directly from LC29H BA (no sensor ESP32)
     // Sends fixes to BOTH the GUI and steer thread channels.
     let drop_counters_gps = drop_counters.clone();
+    let heading_offset_gps = heading_offset.clone();
     thread::spawn(move || {
         gps::reader::run_gps_reader(
             gps::reader::GpsConfig::default(),
@@ -64,6 +71,7 @@ fn main() {
             gps_tx_steer,
             port_tx,
             drop_counters_gps,
+            heading_offset_gps,
         );
     });
     tracing::info!("GPS serial reader thread launched");
@@ -122,6 +130,7 @@ fn main() {
                 motor_handle,
                 steer_state,
                 12.0,
+                heading_offset,
             )))
         }),
     );

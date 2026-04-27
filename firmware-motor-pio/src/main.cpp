@@ -92,12 +92,12 @@ bool wasCalibrated = false;  // True if all three values loaded from NVS
 
 // ── Inner loop parameters (from NVS) ─────────────────────────────────
 float kpAngle   = 10.0f;    // Additional PWM per degree of error beyond deadband
-int16_t minPwm  = 100;      // Motor stall floor (minimum PWM that moves wheels)
+int16_t minPwm  = 80;      // Motor stall floor (minimum PWM that moves wheels)
 int16_t maxPwm  = 180;      // Maximum PWM output
 bool motorInvert = false;   // Flip PWM sign after control calc
 
 // ── Inner loop constants ─────────────────────────────────────────────
-#define ANGLE_DEADBAND  1.0f // Degrees of error below which motor is not driven
+#define ANGLE_DEADBAND  0.3f // Degrees of error below which motor is not driven
 
 // ── Inner loop state ─────────────────────────────────────────────────
 float desiredAngle = 0.0f;   // From PC via $FINNSTEER (degrees)
@@ -150,7 +150,7 @@ void loadNvsConfig() {
                     && (wasLeft != wasRight);
 
     kpAngle     = prefs.getFloat("kp", 10.0f);
-    minPwm      = prefs.getShort("min_pwm", 100);
+    minPwm      = prefs.getShort("min_pwm", 80);
     maxPwm      = prefs.getShort("max_pwm", 180);
     motorInvert = prefs.getBool("invert", false);
 

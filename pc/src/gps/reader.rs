@@ -31,7 +31,8 @@ use crossbeam_channel::Sender;
 use serialport::{self, SerialPortType};
 use std::io::{BufRead, Read, Write};
 use std::io::BufReader;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing;
 
@@ -46,6 +47,9 @@ pub struct GpsConfig {
     pub baud_rate: u32,
     /// Desired fix rate in Hz (1-10). Default 10 for LC29H BA.
     pub fix_rate_hz: u8,
+    /// Initial heading offset in degrees. Applied to raw heading before
+    /// emitting the fix. Positive = clockwise correction.
+    pub heading_offset_deg: f64,
 }
 
 impl Default for GpsConfig {
@@ -54,8 +58,19 @@ impl Default for GpsConfig {
             port_name: String::from("auto"),
             baud_rate: 115200,
             fix_rate_hz: 10,
+            heading_offset_deg: 0.0,
         }
     }
+}
+
+/// Shared atomic for the heading offset so the GUI can adjust it at runtime.
+/// Stored as offset_deg × 100 (i.e. centidegrees) to fit in an AtomicI32.
+/// Range: ±180° = ±18000.
+pub type SharedHeadingOffset = Arc<AtomicI32>;
+
+/// Create a new shared heading offset, initialised to the given value.
+pub fn new_shared_heading_offset(initial_deg: f64) -> SharedHeadingOffset {
+    Arc::new(AtomicI32::new((initial_deg * 100.0).round() as i32))
 }
 
 /// Scan all available serial ports and return the first one that produces
@@ -301,6 +316,7 @@ pub fn run_gps_reader(
     gps_tx_steer: Sender<GpsFix>,
     port_name_tx: Sender<String>,
     drop_counters: SharedDropCounters,
+    heading_offset: SharedHeadingOffset,
 ) {
     // === Step 1: Resolve port name ===
     let port_name = if config.port_name == "auto" {
@@ -343,6 +359,7 @@ pub fn run_gps_reader(
 
     let reader = BufReader::new(port);
     let mut nmea_parser = parser::NmeaState::new();
+    nmea_parser.heading_offset_deg = config.heading_offset_deg;
     let mut line_count: u64 = 0;
 
     // Decision #027: drop-on-full channel sends with shared atomic counters.
@@ -369,6 +386,12 @@ pub fn run_gps_reader(
                 if line_count <= 10 {
                     tracing::info!("GPS serial [{}]: {}", line_count, sentence);
                 }
+
+                // Poll the shared heading offset in case the GUI changed it.
+                // This is cheap (one atomic read) and ensures the parser
+                // always uses the latest user-configured value.
+                nmea_parser.heading_offset_deg =
+                    heading_offset.load(Ordering::Relaxed) as f64 / 100.0;
 
                 // Parse NMEA GPS sentences only — no FINN sentences on this port
                 if let Some(fix) = nmea_parser.parse_sentence(&sentence) {

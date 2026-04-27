@@ -406,6 +406,37 @@ impl CoverageLogger {
         self.implement_width_m
     }
 
+    /// Estimate covered area in hectares.
+    ///
+    /// Sums the haversine distance between consecutive points within each
+    /// segment, multiplies by implement width, and converts to hectares.
+    /// Points from different segments are not connected (headland turns).
+    pub fn covered_hectares(&self) -> f64 {
+        if self.render_cache.len() < 2 {
+            return 0.0;
+        }
+
+        let mut total_area_m2 = 0.0;
+
+        for i in 1..self.render_cache.len() {
+            let prev = &self.render_cache[i - 1];
+            let curr = &self.render_cache[i];
+
+            // Only sum within the same segment (skip headland gaps)
+            if curr.segment != prev.segment {
+                continue;
+            }
+
+            let dist = coords::haversine_distance(
+                prev.latitude, prev.longitude,
+                curr.latitude, curr.longitude,
+            );
+            total_area_m2 += dist * self.implement_width_m;
+        }
+
+        total_area_m2 / 10_000.0
+    }
+
     /// Update implement width.
     pub fn set_implement_width(&mut self, width: f64) {
         self.implement_width_m = width;

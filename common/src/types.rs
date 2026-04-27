@@ -17,12 +17,22 @@ pub struct GpsFix {
     pub longitude: f64,      // Degrees (negative = west)
     pub altitude: f64,       // Metres above sea level
     pub speed: f64,          // m/s
-    pub heading: f64,        // Degrees from true north (0-360)
+    pub heading: f64,        // Degrees from true north (0-360), with offset applied
     pub fix_quality: FixQuality,
     pub satellites: u8,
     pub hdop: f64,           // Horizontal dilution of precision
     pub timestamp_ms: u64,   // Milliseconds since epoch
+
+    // === Diagnostic heading sources (for GUI comparison display) ===
+    /// Raw VTG course-over-ground before offset (NaN if unavailable)
+    #[serde(default = "f64_nan")]
+    pub diag_vtg_heading: f64,
+    /// Raw PQTMINS DR-fused heading before offset (NaN if unavailable)
+    #[serde(default = "f64_nan")]
+    pub diag_ins_heading: f64,
 }
+
+fn f64_nan() -> f64 { f64::NAN }
 
 /// IMU orientation data from BNO055
 #[derive(Debug, Clone, Serialize, Deserialize)]
