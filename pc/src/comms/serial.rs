@@ -75,6 +75,13 @@ impl MotorHandle {
         self.send_raw(&cmd)
     }
 
+    /// Send WAS filtering parameters to the ESP32 NVS.
+    /// All values are x100 integers (e.g. alpha=15 means 0.15).
+    pub fn send_wasf_config(&self, ema_alpha_x100: u16, deadzone_x100: u16, curve_exp_x100: u16) -> Result<(), String> {
+        let cmd = protocol::format_wasf_config(ema_alpha_x100, deadzone_x100, curve_exp_x100);
+        self.send_raw(&cmd)
+    }
+
     /// Check if the motor port is connected.
     pub fn is_connected(&self) -> bool {
         self.port.lock().map(|g| g.is_some()).unwrap_or(false)

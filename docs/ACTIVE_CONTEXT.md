@@ -5,16 +5,40 @@
 > Updated at the end of each working session.
 
 ## Last updated
-Session 24 — 27 April 2026 (Heading offset calibration implemented;
-diagnostic heading source comparison display added to address systematic
-right-side XTE bias from field test 8 telemetry analysis)
+Session 25 — 27 April 2026 (Field notes from seeding; GUI fixes for
+touchscreen, working view controls, implement width precision)
 
 ## What we're working on
-**Phase D — Investigating and fixing intermittent 3-second PC-side stalls
-during auto-steer.** Phase A, B, and C of Decision #026 are complete and
-field-validated. Test 7 (initial, without implement) showed the new
-architecture works as designed — auto-steer was responsive and clean,
-resolving the sluggishness from test 6.
+**Seeding is underway.** Development changes must be stable and not break
+what's working. Tom provided field notes from the tractor cab (Session 25)
+which drove a round of GUI improvements and identified ESP32 firmware
+changes needed for the next session.
+
+**Session 25 GUI changes (applied, ready to build):**
+- Align Grid to Here button: removed `show_tooltip_text` overlay that was
+  eating first-touch events on the Dell 7390 touchscreen. Added diagnostic
+  status messages on all code paths (Some/None/no-fix) so failures are
+  always visible.
+- Working view bottom bar: added second row with Set A / Set B buttons,
+  nudge controls (◄5 ◄1 [value] 1► 5► Rst), and ⊕ Align button. Uses
+  `ui.horizontal` (not `horizontal_centered`) for correct two-row stacking.
+  Status messages route to `steer_status_msg` for field-view overlay display.
+- Implement width: changed from ±0.5m steps to ±10cm / ±1cm buttons.
+  Display now shows two decimal places. DB persistence updated to `{:.2}`.
+- Old nudge indicator removed from row 1 right side (nudge value now
+  always visible in row 2 button group).
+
+**Field observations from cab (Session 25):**
+1. Seeding started — stability is priority
+2. Align Grid button didn't work (tooltip was consuming touch — fixed)
+3. WAS fluctuates around zero — needs smoothing + dead zone
+4. VTG heading offset ~9° — existing offset parameter worked well
+5. Nudge buttons needed in working view — added
+6. Implement width needed cm precision — added
+7. WAS centre calibration is impractical on articulated 4WD — needs
+   dead zone + non-linear curve
+8. Coverage logging works well
+9. PWM floor of 80 is below motor stall — stall line is ~90 PWM
 
 **The intermittent freeze diagnosis is done.** An audit of `gps/reader.rs`
 and `main.rs` identified the root cause: all four channels between the
@@ -337,15 +361,29 @@ planned integration path:
 
 ## Next session should
 1. Read this file and DECISIONS.md #026
-2. **Priority: field test 9 with heading offset calibration**:
-   a. Drive a known straight line (fence, road), observe VTG vs INS vs Used
-      heading in the SENSORS diagnostic display
-   b. Adjust heading offset until the arrow aligns with direction of travel
-   c. Verify the right-side XTE bias is reduced/eliminated with the offset
-   d. If bias persists after heading correction, investigate antenna offset
-      (try -0.5m nudge as per finding 1)
+2. **ESP32 firmware changes (priority — all in `firmware-motor-pio/`):**
+   a. **Bump PWM floor from 80 to 90** — trivial constant change. Motor
+      stalls below ~90 PWM, producing useless buzzing.
+   b. **Add EMA smoothing to WAS ADC reads** — exponential moving average
+      with configurable alpha (~0.1–0.2). One multiply + one add per
+      reading, essentially free on ESP32. Kills jitter without adding
+      meaningful lag.
+      `smoothed = (alpha * raw) + ((1 - alpha) * smoothed)`
+   c. **Add configurable dead zone around WAS centre** — within ±2–3° of
+      centre, output zero steering angle. Prevents the inner loop from
+      chasing noise when wheels are approximately straight. Parameter
+      should be stored in NVS alongside existing WAS calibration.
+   d. **Add non-linear centre curve for WAS** — outside the dead zone,
+      apply a gentle power curve (e.g. square the normalised value,
+      preserve sign) so small physical movements near centre produce
+      proportionally smaller angle outputs. This addresses the
+      articulated 4WD tractor problem where the WAS is mechanically
+      difficult to calibrate to a precise centre point. The curve
+      makes the system tolerant of a few degrees of centre error.
+   e. All four changes (b–d) should be configurable via `$FINNCFG`
+      commands and persisted in NVS, following the existing pattern.
 3. **Remaining field test 8 findings to address**:
-   a. Increase `max_steer_angle` from 7° to 12-15° (finding 2)
+   a. Increase `max_steer_angle` from 7° to 12–15° (finding 2)
    b. Increase ESP32 `Kp_angle` from 10 to 15+ (finding 3)
    c. Lower `min_pwm` or tune sub-stall pulsing (finding 4)
 4. Write up Decision #027 in DECISIONS.md — fix is verified

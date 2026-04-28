@@ -99,6 +99,14 @@ pub struct GuidanceApp {
     /// Status message for WAS calibration actions
     was_cal_msg: Option<(String, u32)>,
 
+    // --- WAS filtering (ESP32-side, configured from GUI) ---
+    /// EMA smoothing alpha (0.01–1.0, lower = smoother)
+    was_ema_alpha: f64,
+    /// Dead zone half-width in degrees around centre
+    was_deadzone_deg: f64,
+    /// Non-linear curve exponent (1.0 = linear, 2.0 = squared)
+    was_curve_exp: f64,
+
     // --- Heading offset calibration ---
     /// Shared atomic heading offset — updated here, polled by GPS reader thread.
     heading_offset_shared: SharedHeadingOffset,
@@ -174,6 +182,20 @@ impl GuidanceApp {
             .and_then(|d| d.get_config("motor_invert"))
             .map(|v| v == "true")
             .unwrap_or(false);
+
+        // Load WAS filtering parameters from database
+        let was_ema_alpha = db.as_ref()
+            .and_then(|d| d.get_config("was_ema_alpha"))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.15);
+        let was_deadzone_deg = db.as_ref()
+            .and_then(|d| d.get_config("was_deadzone_deg"))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(2.0);
+        let was_curve_exp = db.as_ref()
+            .and_then(|d| d.get_config("was_curve_exp"))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(2.0);
 
         // Load heading offset calibration from database
         let heading_offset_deg = db.as_ref()
@@ -283,6 +305,9 @@ impl GuidanceApp {
             was_right_lock,
             motor_invert,
             was_cal_msg: None,
+            was_ema_alpha,
+            was_deadzone_deg,
+            was_curve_exp,
             heading_offset_shared,
             heading_offset_deg,
             db,
@@ -545,11 +570,128 @@ impl GuidanceApp {
     /// Working page: full-screen field view with overlaid guidance readouts.
     /// Designed for tractor cab — big numbers, minimal controls, glanceable.
     fn draw_working_page(&mut self, ctx: &egui::Context) {
-        // Bottom bar: just ENGAGE and page switch — big touch targets
+        // Bottom bar: two rows for tractor cab use.
+        // Row 1: Set A/B, Nudge buttons, Align Grid
+        // Row 2: ENGAGE, AUTO-STEER, Auto-pass, Pass indicator, Setup
         egui::TopBottomPanel::bottom("working_controls")
-            .min_height(50.0)
             .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
+                // === Row 1: Set A/B, Nudge, Align ===
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+
+                    // Set A / Set B buttons
+                    let has_fix = self.current_fix.is_some();
+                    let set_a_btn = egui::Button::new(
+                        egui::RichText::new("Set A").size(14.0).strong()
+                    ).min_size(egui::vec2(64.0, 32.0));
+                    if ui.add_enabled(has_fix, set_a_btn).clicked() {
+                        if let Some(fix) = &self.current_fix {
+                            self.guide.set_point_a(fix);
+                            self.sync_guide_to_steer_thread();
+                            self.steer_status_msg = Some(("Point A set".to_string(), 120));
+                        }
+                    }
+                    let set_b_btn = egui::Button::new(
+                        egui::RichText::new("Set B").size(14.0).strong()
+                    ).min_size(egui::vec2(64.0, 32.0));
+                    let can_set_b = has_fix && self.guide.line.is_some();
+                    if ui.add_enabled(can_set_b, set_b_btn).clicked() {
+                        if let Some(fix) = &self.current_fix {
+                            self.guide.set_point_b(fix);
+                            self.sync_guide_to_steer_thread();
+                            self.steer_status_msg = Some(("Point B set — line active".to_string(), 180));
+                        }
+                    }
+
+                    ui.separator();
+
+                    // Nudge buttons: ◄5  ◄1  [value]  1►  5►  Reset
+                    if ui.add(egui::Button::new(
+                        egui::RichText::new("◄5").size(14.0)
+                    ).min_size(egui::vec2(36.0, 32.0))).clicked() {
+                        self.guide.nudge_left(0.05);
+                        self.sync_guide_to_steer_thread();
+                    }
+                    if ui.add(egui::Button::new(
+                        egui::RichText::new("◄1").size(14.0)
+                    ).min_size(egui::vec2(36.0, 32.0))).clicked() {
+                        self.guide.nudge_left(0.01);
+                        self.sync_guide_to_steer_thread();
+                    }
+
+                    let nudge_cm = (self.guide.nudge_m * 100.0).round() as i32;
+                    let nudge_colour = if nudge_cm == 0 {
+                        egui::Color32::GRAY
+                    } else {
+                        egui::Color32::from_rgb(255, 200, 60)
+                    };
+                    let nudge_text = if nudge_cm == 0 {
+                        "0".to_string()
+                    } else if nudge_cm > 0 {
+                        format!("{}R", nudge_cm)
+                    } else {
+                        format!("{}L", nudge_cm.abs())
+                    };
+                    ui.label(
+                        egui::RichText::new(nudge_text)
+                            .size(14.0).strong().color(nudge_colour),
+                    );
+
+                    if ui.add(egui::Button::new(
+                        egui::RichText::new("1►").size(14.0)
+                    ).min_size(egui::vec2(36.0, 32.0))).clicked() {
+                        self.guide.nudge_right(0.01);
+                        self.sync_guide_to_steer_thread();
+                    }
+                    if ui.add(egui::Button::new(
+                        egui::RichText::new("5►").size(14.0)
+                    ).min_size(egui::vec2(36.0, 32.0))).clicked() {
+                        self.guide.nudge_right(0.05);
+                        self.sync_guide_to_steer_thread();
+                    }
+                    if nudge_cm != 0 {
+                        if ui.add(egui::Button::new(
+                            egui::RichText::new("Rst").size(12.0)
+                        ).min_size(egui::vec2(40.0, 32.0))).clicked() {
+                            self.guide.nudge_reset();
+                            self.sync_guide_to_steer_thread();
+                        }
+                    }
+
+                    ui.separator();
+
+                    // Align Grid to Here
+                    let can_align = self.guide.has_complete_line() && self.current_fix.is_some();
+                    let align_btn = egui::Button::new(
+                        egui::RichText::new("⊕ Align").size(14.0)
+                    ).min_size(egui::vec2(70.0, 32.0));
+                    if ui.add_enabled(can_align, align_btn).clicked() {
+                        if let Some(fix) = self.current_fix.clone() {
+                            match self.guide.align_grid_to_position(&fix) {
+                                Some(new_pass) => {
+                                    self.sync_guide_to_steer_thread();
+                                    let xtd_info = self.current_error.as_ref()
+                                        .map(|e| format!("{:.1}cm", e.distance_m * 100.0))
+                                        .unwrap_or_else(|| "??".to_string());
+                                    self.steer_status_msg = Some((
+                                        format!("Grid aligned — Pass {} (XTE {})", new_pass, xtd_info),
+                                        360,
+                                    ));
+                                }
+                                None => {
+                                    self.steer_status_msg = Some((
+                                        "Align failed".to_string(), 300,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                });
+
+                ui.add_space(2.0);
+
+                // === Row 2: main action buttons ===
+                ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 12.0;
 
                     // Large engage button
@@ -628,18 +770,6 @@ impl GuidanceApp {
                                 .size(16.0)
                                 .color(egui::Color32::from_rgb(80, 160, 255)),
                         );
-
-                        // Nudge indicator — only shown when nudge is non-zero
-                        let nudge_cm = (self.guide.nudge_m * 100.0).round() as i32;
-                        if nudge_cm != 0 {
-                            ui.separator();
-                            let dir = if nudge_cm > 0 { "→R" } else { "←L" };
-                            ui.label(
-                                egui::RichText::new(format!("Nudge {} cm {}", nudge_cm.abs(), dir))
-                                    .size(14.0)
-                                    .color(egui::Color32::from_rgb(255, 200, 60)),
-                            );
-                        }
                     });
                 });
             });
@@ -985,23 +1115,32 @@ impl GuidanceApp {
                         egui::RichText::new("⊕ Align Grid to Here").size(13.0)
                     ).min_size(egui::vec2(150.0, 32.0));
                     let align_resp = ui.add_enabled(can_align, align_btn);
-                    if align_resp.hovered() {
-                        egui::show_tooltip_text(
-                            ui.ctx(),
-                            egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("align_tooltip_layer")),
-                            egui::Id::new("align_tooltip"),
-                            "Snap the pass grid so your current position\nfalls on the nearest whole pass line.\nNudge is reset to zero.",
-                        );
-                    }
                     if align_resp.clicked() {
                         if let Some(fix) = self.current_fix.clone() {
-                            if let Some(new_pass) = self.guide.align_grid_to_position(&fix) {
-                                self.sync_guide_to_steer_thread();
-                                self.ab_status_msg = Some((
-                                    format!("Grid aligned — now on Pass {}", new_pass),
-                                    240,
-                                ));
+                            match self.guide.align_grid_to_position(&fix) {
+                                Some(new_pass) => {
+                                    self.sync_guide_to_steer_thread();
+                                    let xtd_info = self.current_error.as_ref()
+                                        .map(|e| format!("{:.1}cm", e.distance_m * 100.0))
+                                        .unwrap_or_else(|| "??".to_string());
+                                    self.ab_status_msg = Some((
+                                        format!("Grid aligned — Pass {} (XTE now {})", new_pass, xtd_info),
+                                        360,
+                                    ));
+                                }
+                                None => {
+                                    self.ab_status_msg = Some((
+                                        format!("Align failed — line incomplete? has_line={}",
+                                            self.guide.has_complete_line()),
+                                        300,
+                                    ));
+                                }
                             }
+                        } else {
+                            self.ab_status_msg = Some((
+                                "Align failed — no GPS fix available".to_string(),
+                                300,
+                            ));
                         }
                     }
                     if !can_align && self.guide.has_complete_line() {
@@ -1316,31 +1455,55 @@ impl GuidanceApp {
                     // Width control
                     ui.label("Width");
                     ui.horizontal(|ui| {
-                        if ui.add(egui::Button::new("−").min_size(egui::vec2(36.0, 30.0))).clicked() {
-                            let new_width = (self.guide.implement_width_m - 0.5).max(0.5);
+                        if ui.add(egui::Button::new("−10").min_size(egui::vec2(40.0, 30.0))).clicked() {
+                            let new_width = (self.guide.implement_width_m - 0.10).max(0.1);
                             self.guide.implement_width_m = new_width;
                             self.coverage.set_implement_width(new_width);
                             self.guide.pass_offset_m = self.guide.pass_spacing() * self.guide.pass_number as f64;
                             self.sync_guide_to_steer_thread();
                             if let Some(db) = &self.db {
-                                let _ = db.set_config("implement_width_m", &format!("{:.1}", new_width));
+                                let _ = db.set_config("implement_width_m", &format!("{:.2}", new_width));
+                            }
+                        }
+                        if ui.add(egui::Button::new("−1").min_size(egui::vec2(36.0, 30.0))).clicked() {
+                            let new_width = (self.guide.implement_width_m - 0.01).max(0.1);
+                            self.guide.implement_width_m = new_width;
+                            self.coverage.set_implement_width(new_width);
+                            self.guide.pass_offset_m = self.guide.pass_spacing() * self.guide.pass_number as f64;
+                            self.sync_guide_to_steer_thread();
+                            if let Some(db) = &self.db {
+                                let _ = db.set_config("implement_width_m", &format!("{:.2}", new_width));
                             }
                         }
                         ui.label(
-                            egui::RichText::new(format!("{:.1} m", self.guide.implement_width_m))
+                            egui::RichText::new(format!("{:.2} m", self.guide.implement_width_m))
                                 .size(18.0).strong()
                         );
-                        if ui.add(egui::Button::new("+").min_size(egui::vec2(36.0, 30.0))).clicked() {
-                            let new_width = (self.guide.implement_width_m + 0.5).min(36.0);
+                        if ui.add(egui::Button::new("+1").min_size(egui::vec2(36.0, 30.0))).clicked() {
+                            let new_width = (self.guide.implement_width_m + 0.01).min(36.0);
                             self.guide.implement_width_m = new_width;
                             self.coverage.set_implement_width(new_width);
                             self.guide.pass_offset_m = self.guide.pass_spacing() * self.guide.pass_number as f64;
                             self.sync_guide_to_steer_thread();
                             if let Some(db) = &self.db {
-                                let _ = db.set_config("implement_width_m", &format!("{:.1}", new_width));
+                                let _ = db.set_config("implement_width_m", &format!("{:.2}", new_width));
+                            }
+                        }
+                        if ui.add(egui::Button::new("+10").min_size(egui::vec2(40.0, 30.0))).clicked() {
+                            let new_width = (self.guide.implement_width_m + 0.10).min(36.0);
+                            self.guide.implement_width_m = new_width;
+                            self.coverage.set_implement_width(new_width);
+                            self.guide.pass_offset_m = self.guide.pass_spacing() * self.guide.pass_number as f64;
+                            self.sync_guide_to_steer_thread();
+                            if let Some(db) = &self.db {
+                                let _ = db.set_config("implement_width_m", &format!("{:.2}", new_width));
                             }
                         }
                     });
+                    ui.label(
+                        egui::RichText::new("cm steps: ±10 coarse, ±1 fine")
+                            .size(11.0).weak()
+                    );
 
                     ui.add_space(4.0);
 
@@ -1790,6 +1953,107 @@ impl GuidanceApp {
                     if let Some((ref msg, _)) = self.was_cal_msg {
                         ui.label(egui::RichText::new(msg).size(11.0)
                             .color(egui::Color32::from_rgb(100, 220, 100)));
+                    }
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+
+                    // === WAS Filtering Section ===
+                    // Controls for EMA smoothing, dead zone, and non-linear curve
+                    // on the ESP32. These reduce WAS jitter and make the system
+                    // tolerant of imprecise centre calibration on articulated 4WD.
+                    ui.label(egui::RichText::new("WAS FILTERING").size(14.0).strong());
+                    ui.add_space(4.0);
+
+                    let has_motor = self.motor_handle.is_connected();
+
+                    // EMA Alpha
+                    ui.label(egui::RichText::new("EMA Smoothing:").size(12.0));
+                    let old_alpha = self.was_ema_alpha;
+                    // Invert the slider so left = smooth, right = responsive
+                    let mut alpha_slider = (self.was_ema_alpha * 100.0).round() as i32;
+                    ui.add(egui::Slider::new(&mut alpha_slider, 1..=100)
+                        .step_by(1.0)
+                        .custom_formatter(|v, _| format!("{:.2}", v / 100.0))
+                    );
+                    self.was_ema_alpha = alpha_slider as f64 / 100.0;
+                    if (self.was_ema_alpha - old_alpha).abs() > 0.001 {
+                        if let Some(db) = &self.db {
+                            let _ = db.set_config("was_ema_alpha", &format!("{:.2}", self.was_ema_alpha));
+                        }
+                    }
+                    ui.label(egui::RichText::new(
+                        "Lower = smoother (0.10–0.20 recommended)"
+                    ).size(11.0).weak());
+
+                    ui.add_space(6.0);
+
+                    // Dead Zone
+                    ui.label(egui::RichText::new("Dead Zone:").size(12.0));
+                    let old_dz = self.was_deadzone_deg;
+                    let mut dz_slider = (self.was_deadzone_deg * 10.0).round() as i32;
+                    ui.add(egui::Slider::new(&mut dz_slider, 0..=100)
+                        .step_by(1.0)
+                        .custom_formatter(|v, _| format!("{:.1}°", v / 10.0))
+                    );
+                    self.was_deadzone_deg = dz_slider as f64 / 10.0;
+                    if (self.was_deadzone_deg - old_dz).abs() > 0.01 {
+                        if let Some(db) = &self.db {
+                            let _ = db.set_config("was_deadzone_deg", &format!("{:.1}", self.was_deadzone_deg));
+                        }
+                    }
+                    ui.label(egui::RichText::new(
+                        "± degrees around centre treated as zero (2–3° typical)"
+                    ).size(11.0).weak());
+
+                    ui.add_space(6.0);
+
+                    // Curve Exponent
+                    ui.label(egui::RichText::new("Centre Curve:").size(12.0));
+                    let old_crv = self.was_curve_exp;
+                    let mut crv_slider = (self.was_curve_exp * 10.0).round() as i32;
+                    ui.add(egui::Slider::new(&mut crv_slider, 5..=40)
+                        .step_by(1.0)
+                        .custom_formatter(|v, _| format!("{:.1}", v / 10.0))
+                    );
+                    self.was_curve_exp = crv_slider as f64 / 10.0;
+                    if (self.was_curve_exp - old_crv).abs() > 0.01 {
+                        if let Some(db) = &self.db {
+                            let _ = db.set_config("was_curve_exp", &format!("{:.1}", self.was_curve_exp));
+                        }
+                    }
+                    ui.label(egui::RichText::new(
+                        "1.0 = linear, 2.0 = squared (softens near centre)"
+                    ).size(11.0).weak());
+
+                    ui.add_space(6.0);
+
+                    // Send to ESP32 button
+                    let send_btn = egui::Button::new(
+                        egui::RichText::new("▶ Send to ESP32").size(13.0)
+                    ).min_size(egui::vec2(150.0, 30.0));
+                    if ui.add_enabled(has_motor, send_btn).clicked() {
+                        let alpha_x100 = (self.was_ema_alpha * 100.0).round() as u16;
+                        let dz_x100 = (self.was_deadzone_deg * 100.0).round() as u16;
+                        let crv_x100 = (self.was_curve_exp * 100.0).round() as u16;
+                        match self.motor_handle.send_wasf_config(alpha_x100, dz_x100, crv_x100) {
+                            Ok(_) => {
+                                self.was_cal_msg = Some((
+                                    format!("WAS filter sent: α={:.2} dz={:.1}° crv={:.1}",
+                                        self.was_ema_alpha, self.was_deadzone_deg, self.was_curve_exp),
+                                    240,
+                                ));
+                            }
+                            Err(e) => {
+                                self.was_cal_msg = Some((
+                                    format!("Send failed: {}", e), 240,
+                                ));
+                            }
+                        }
+                    }
+                    if !has_motor {
+                        ui.label(egui::RichText::new("Motor ESP32 not connected").size(11.0).weak());
                     }
 
                     ui.add_space(10.0);

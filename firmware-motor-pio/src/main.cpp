@@ -24,29 +24,42 @@
  *       Three-point WAS calibration. Stored in NVS. Values are raw ADC counts.
  *
  *     $FINNCFG,PID,<kp_x100>,<min_pwm>,<max_pwm>*<checksum>\r\n
- *       Inner loop tuning. kp_x100 = kp_angle x 100 (e.g. 1000 = 10.0 PWM/deg).
+ *       Inner loop tuning. kp_x100 = kp_angle x 100 (e.g. 1500 = 15.0 PWM/deg).
  *
  *     $FINNCFG,INVERT,<0|1>*<checksum>\r\n
  *       Motor direction invert flag. 1 = flip PWM sign after PID.
  *
+ *     $FINNCFG,WASF,<ema_alpha_x100>,<deadzone_x100>,<curve_exp_x100>*<checksum>\r\n
+ *       WAS filtering parameters. All values are x100 integers:
+ *         ema_alpha_x100:  EMA smoothing factor (10 = 0.10, 20 = 0.20). 100 = no smoothing.
+ *         deadzone_x100:   Dead zone half-width in degrees x100 (200 = 2.00 deg).
+ *                          Within ±deadzone of centre, angle output is zero.
+ *         curve_exp_x100:  Non-linear curve exponent x100 (100 = linear, 200 = squared).
+ *                          Applied after dead zone. Softens small angles near centre.
+ *
  *   Send:
  *     $FINNMTR,<pwm>,<was_raw>,<angle_x100>,<enabled>,<uptime_ms>*<checksum>\r\n
- *       Status at 10Hz. angle_x100 = calibrated angle x 100.
+ *       Status at 10Hz. angle_x100 = calibrated angle x 100 (after filtering).
  *
  *     $FINNACK,<param>,<status>*<checksum>\r\n
  *       Acknowledgement after $FINNCFG. status = "OK" or "ERR".
  *
+ * WAS signal conditioning pipeline:
+ *   1. Raw ADC read (12-bit, 4-sample oversample)
+ *   2. EMA smoothing: smoothed = alpha * raw + (1 - alpha) * smoothed
+ *   3. Piecewise linear mapping to angle (using 3-point calibration)
+ *   4. Dead zone: if |angle| < deadzone_deg, output 0
+ *   5. Non-linear curve: outside dead zone, apply power curve to compress
+ *      small angles near centre. This makes the system tolerant of WAS
+ *      centre calibration error on articulated 4WD tractors.
+ *
  * Inner loop (runs at ~100Hz):
- *   1. Read WAS ADC -> piecewise-linear map to angle using NVS calibration
+ *   1. Read WAS ADC -> EMA smooth -> piecewise-linear map -> dead zone ->
+ *      non-linear curve -> final angle
  *   2. angle_error = desired_angle - actual_angle
- *   3. If |error| < deadband (1.0°): output 0 (on target)
+ *   3. If |error| < deadband (0.3°): output 0 (on target)
  *   4. If |error| >= deadband: output = minPwm + kpAngle * (|error| - deadband)
  *   5. Clamp to minPwm..maxPwm, apply sign and motor_invert, drive IBT-2
- *
- *   This eliminates the sub-stall pulsing accumulator. Any error above the
- *   deadband immediately drives at least minPwm, which is the minimum PWM
- *   that actually moves the wheels against hydraulic resistance. kpAngle
- *   adds proportional effort above minPwm for larger errors.
  *
  * Safety:
  *   - Motor stops if no valid $FINNSTEER for 500ms (watchdog)
@@ -57,6 +70,7 @@
 
 #include <Arduino.h>
 #include <Preferences.h>
+#include <math.h>
 
 // ── Pin assignments ──────────────────────────────────────────────────
 #define RPWM_PIN       25   // IBT-2 RPWM — steer right
@@ -90,19 +104,28 @@ int16_t wasLeft   = 1617;    // ADC count at full left lock
 int16_t wasRight  = 2031;    // ADC count at full right lock
 bool wasCalibrated = false;  // True if all three values loaded from NVS
 
+// ── WAS filtering parameters (from NVS) ──────────────────────────────
+float wasEmaAlpha     = 0.15f;  // EMA smoothing factor (0.0–1.0). Lower = smoother.
+float wasDeadzoneDeg  = 2.0f;   // Dead zone half-width in degrees around centre
+float wasCurveExp     = 2.0f;   // Non-linear exponent (1.0 = linear, 2.0 = squared)
+
+// ── WAS EMA state ────────────────────────────────────────────────────
+float wasEmaSmoothed  = -1.0f;  // -1 sentinel = uninitialised (takes first reading)
+
 // ── Inner loop parameters (from NVS) ─────────────────────────────────
-float kpAngle   = 10.0f;    // Additional PWM per degree of error beyond deadband
-int16_t minPwm  = 80;      // Motor stall floor (minimum PWM that moves wheels)
+float kpAngle   = 15.0f;    // PWM per degree of error beyond deadband (was 10, bumped per field test 8 finding 3)
+int16_t minPwm  = 90;       // Motor stall floor — bumped from 80, motor stalls below ~90 (field test 8 finding)
 int16_t maxPwm  = 180;      // Maximum PWM output
-bool motorInvert = false;   // Flip PWM sign after control calc
+bool motorInvert = false;    // Flip PWM sign after control calc
 
 // ── Inner loop constants ─────────────────────────────────────────────
 #define ANGLE_DEADBAND  0.3f // Degrees of error below which motor is not driven
 
 // ── Inner loop state ─────────────────────────────────────────────────
 float desiredAngle = 0.0f;   // From PC via $FINNSTEER (degrees)
-float actualAngle  = 0.0f;   // From local WAS (degrees)
-int16_t wasRaw     = 0;      // Latest raw ADC reading
+float actualAngle  = 0.0f;   // From local WAS (degrees), after full pipeline
+float actualAngleRaw = 0.0f; // Before dead zone / curve (for diagnostics)
+int16_t wasRaw     = 0;      // Latest raw ADC reading (before EMA)
 int16_t currentPwm = 0;      // PWM currently applied to motor
 
 // ── Control state ────────────────────────────────────────────────────
@@ -149,16 +172,23 @@ void loadNvsConfig() {
     wasCalibrated = (wasCentre != wasLeft) && (wasCentre != wasRight)
                     && (wasLeft != wasRight);
 
-    kpAngle     = prefs.getFloat("kp", 10.0f);
-    minPwm      = prefs.getShort("min_pwm", 80);
+    kpAngle     = prefs.getFloat("kp", 15.0f);
+    minPwm      = prefs.getShort("min_pwm", 90);
     maxPwm      = prefs.getShort("max_pwm", 180);
     motorInvert = prefs.getBool("invert", false);
+
+    // WAS filtering params
+    wasEmaAlpha    = prefs.getFloat("ema_a", 0.15f);
+    wasDeadzoneDeg = prefs.getFloat("dz_deg", 2.0f);
+    wasCurveExp    = prefs.getFloat("crv_e", 2.0f);
 
     prefs.end();
 
     Serial.printf("NVS loaded — WAS C:%d L:%d R:%d cal:%s | Kp:%.1f min:%d max:%d inv:%d\r\n",
                   wasCentre, wasLeft, wasRight, wasCalibrated ? "YES" : "NO",
                   kpAngle, minPwm, maxPwm, motorInvert ? 1 : 0);
+    Serial.printf("NVS loaded — WAS filter: EMA_alpha:%.2f deadzone:%.1f° curve_exp:%.2f\r\n",
+                  wasEmaAlpha, wasDeadzoneDeg, wasCurveExp);
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -175,6 +205,10 @@ void saveWasCal(int16_t c, int16_t l, int16_t r) {
     prefs.putShort("was_l", l);
     prefs.putShort("was_r", r);
     prefs.end();
+
+    // Reset EMA state when calibration changes — stale smoothed value
+    // from old calibration would cause a transient
+    wasEmaSmoothed = -1.0f;
 
     Serial.printf("NVS saved WAS — C:%d L:%d R:%d\r\n", c, l, r);
 }
@@ -210,18 +244,53 @@ void saveMotorInvert(bool inv) {
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// WAS: read raw ADC with oversampling
+// NVS: save WAS filtering parameters
 // ═════════════════════════════════════════════════════════════════════
-int16_t readWasRaw() {
+void saveWasFilterConfig(float alpha, float deadzone, float curveExp) {
+    wasEmaAlpha    = alpha;
+    wasDeadzoneDeg = deadzone;
+    wasCurveExp    = curveExp;
+
+    prefs.begin("finn", false);
+    prefs.putFloat("ema_a", alpha);
+    prefs.putFloat("dz_deg", deadzone);
+    prefs.putFloat("crv_e", curveExp);
+    prefs.end();
+
+    Serial.printf("NVS saved WASF — EMA_alpha:%.2f deadzone:%.1f° curve_exp:%.2f\r\n",
+                  alpha, deadzone, curveExp);
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// WAS: read raw ADC with oversampling + EMA smoothing
+//
+// The 4-sample oversample kills single-read noise. The EMA on top of
+// that provides temporal smoothing across successive 100Hz reads.
+// Combined, this produces a stable signal without meaningful lag —
+// at alpha=0.15 and 100Hz, the step response settles in ~150ms which
+// is well within the hydraulic response time of the steering system.
+// ═════════════════════════════════════════════════════════════════════
+int16_t readWasSmoothed() {
+    // Oversample: average N raw reads
     int32_t sum = 0;
     for (int i = 0; i < WAS_SAMPLES; i++) {
         sum += analogRead(WAS_PIN);
     }
-    return (int16_t)(sum / WAS_SAMPLES);
+    float raw = (float)(sum / WAS_SAMPLES);
+
+    // EMA smoothing
+    if (wasEmaSmoothed < 0.0f) {
+        // First read — initialise to current value (no lag on startup)
+        wasEmaSmoothed = raw;
+    } else {
+        wasEmaSmoothed = (wasEmaAlpha * raw) + ((1.0f - wasEmaAlpha) * wasEmaSmoothed);
+    }
+
+    return (int16_t)roundf(wasEmaSmoothed);
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// WAS: convert raw ADC to calibrated angle (degrees)
+// WAS: convert raw ADC to calibrated angle (degrees) — linear mapping
 //
 // Piecewise linear mapping:
 //   wasLeft   -> -MAX_STEER_ANGLE (full left)
@@ -229,21 +298,65 @@ int16_t readWasRaw() {
 //   wasRight  -> +MAX_STEER_ANGLE (full right)
 //
 // This handles asymmetric steering geometry (left range != right range).
+// Returns the raw linear angle BEFORE dead zone and curve processing.
 // ═════════════════════════════════════════════════════════════════════
-float wasToAngle(int16_t raw) {
+float wasToAngleLinear(int16_t smoothed) {
     if (!wasCalibrated) return 0.0f;
 
-    if (raw <= wasCentre) {
+    if (smoothed <= wasCentre) {
         // Left half: map [wasLeft, wasCentre] -> [-MAX, 0]
         int16_t range = wasCentre - wasLeft;
         if (range == 0) return 0.0f;
-        return -MAX_STEER_ANGLE * (float)(wasCentre - raw) / (float)range;
+        return -MAX_STEER_ANGLE * (float)(wasCentre - smoothed) / (float)range;
     } else {
         // Right half: map [wasCentre, wasRight] -> [0, +MAX]
         int16_t range = wasRight - wasCentre;
         if (range == 0) return 0.0f;
-        return MAX_STEER_ANGLE * (float)(raw - wasCentre) / (float)range;
+        return MAX_STEER_ANGLE * (float)(smoothed - wasCentre) / (float)range;
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// WAS: apply dead zone and non-linear centre curve
+//
+// Dead zone: angles within ±wasDeadzoneDeg of centre are clamped to 0.
+// This prevents the inner loop from chasing noise/calibration error
+// when the wheels are approximately straight.
+//
+// Non-linear curve (applied outside dead zone):
+//   The angle is normalised to 0..1 (relative to MAX_STEER_ANGLE),
+//   raised to wasCurveExp, then scaled back to degrees. Sign preserved.
+//   With exponent=2.0, a 5° input becomes (5/45)^2 * 45 = 0.56° output.
+//   This compresses small angles near centre, making the system tolerant
+//   of WAS centre calibration error on articulated 4WD tractors where
+//   the WAS is mechanically difficult to calibrate to a precise zero.
+//
+//   At larger angles (>~15°) the curve approaches linear, so full-lock
+//   behaviour is minimally affected.
+// ═════════════════════════════════════════════════════════════════════
+float applyWasDeadzoneAndCurve(float linearAngle) {
+    float absAngle = fabsf(linearAngle);
+    float sign = (linearAngle >= 0.0f) ? 1.0f : -1.0f;
+
+    // Dead zone
+    if (absAngle < wasDeadzoneDeg) {
+        return 0.0f;
+    }
+
+    // Subtract dead zone so the curve starts from zero at the dead zone edge.
+    // This avoids a discontinuous jump from 0 to some value at the boundary.
+    float shifted = absAngle - wasDeadzoneDeg;
+    float maxShifted = MAX_STEER_ANGLE - wasDeadzoneDeg;
+    if (maxShifted <= 0.0f) maxShifted = 1.0f;  // safety
+
+    // Normalise to 0..1, apply power curve, scale back
+    float normalised = shifted / maxShifted;
+    if (normalised > 1.0f) normalised = 1.0f;
+
+    float curved = powf(normalised, wasCurveExp);
+
+    // Scale back to degrees — output range is 0..MAX_STEER_ANGLE
+    return sign * curved * MAX_STEER_ANGLE;
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -290,18 +403,22 @@ void killMotor() {
 // ~10Hz; between PC updates, the inner loop keeps driving the motor
 // toward the last received desired angle using local WAS feedback.
 //
+// WAS signal pipeline: ADC -> oversample -> EMA -> linear map ->
+//                      dead zone -> non-linear curve -> actualAngle
+//
 // Deadband + minPwm clamp strategy:
 //   - Error below ANGLE_DEADBAND: motor off (we're close enough).
 //   - Error above deadband: immediately drive at minPwm + proportional
 //     boost. minPwm is set to the minimum PWM that actually moves the
-//     wheels against hydraulic resistance (~100). No accumulation delay.
+//     wheels against hydraulic resistance (~90). No accumulation delay.
 //   - kpAngle adds extra PWM per degree of error beyond the deadband,
 //     so larger errors get faster correction.
 // ═════════════════════════════════════════════════════════════════════
 void runInnerLoop() {
-    // Read WAS
-    wasRaw = readWasRaw();
-    actualAngle = wasToAngle(wasRaw);
+    // Read WAS through full pipeline
+    wasRaw = readWasSmoothed();
+    actualAngleRaw = wasToAngleLinear(wasRaw);
+    actualAngle = applyWasDeadzoneAndCurve(actualAngleRaw);
 
     // If motor not enabled (watchdog tripped or never started), don't drive
     if (!motorEnabled) {
@@ -391,6 +508,35 @@ bool handleSentence(const char* body, unsigned long now) {
         return true;
     }
 
+    // $FINNCFG,WASF,<ema_alpha_x100>,<deadzone_x100>,<curve_exp_x100>
+    if (strncmp(body, "FINNCFG,WASF,", 13) == 0) {
+        int alphaX100, dzX100, crvX100;
+        if (sscanf(body + 13, "%d,%d,%d", &alphaX100, &dzX100, &crvX100) == 3) {
+            // Validate ranges
+            float alpha = (float)alphaX100 / 100.0f;
+            float dz    = (float)dzX100 / 100.0f;
+            float crv   = (float)crvX100 / 100.0f;
+
+            // Clamp alpha to 0.01..1.0 (0 would freeze EMA, >1 is nonsensical)
+            if (alpha < 0.01f) alpha = 0.01f;
+            if (alpha > 1.0f)  alpha = 1.0f;
+
+            // Clamp dead zone to 0..10 degrees
+            if (dz < 0.0f)  dz = 0.0f;
+            if (dz > 10.0f) dz = 10.0f;
+
+            // Clamp exponent to 0.5..4.0 (0.5 = sqrt = expansion, 4.0 = very aggressive compression)
+            if (crv < 0.5f) crv = 0.5f;
+            if (crv > 4.0f) crv = 4.0f;
+
+            saveWasFilterConfig(alpha, dz, crv);
+            sendSentence("FINNACK,WASF,OK");
+        } else {
+            sendSentence("FINNACK,WASF,ERR");
+        }
+        return true;
+    }
+
     return false;  // Unrecognised sentence
 }
 
@@ -434,7 +580,7 @@ void setup() {
     while (!Serial && millis() < 2000) {
         // Wait up to 2s for USB serial connection
     }
-    Serial.println("FINN Motor Controller v2 starting (Decision #026)...");
+    Serial.println("FINN Motor Controller v3 starting (#026 + WAS filtering)...");
 
     // WAS pot power — drive GPIO 33 HIGH to provide 3.3V reference
     pinMode(WAS_POWER_PIN, OUTPUT);
@@ -513,7 +659,7 @@ void loop() {
     }
 
     // ── Status report at 10Hz ────────────────────────────────────────
-    // Reports: PWM, raw WAS ADC, calibrated angle x 100, enabled, uptime
+    // Reports: PWM, raw WAS ADC (smoothed), calibrated angle x 100, enabled, uptime
     if (now - lastStatusMs >= STATUS_INTERVAL_MS) {
         lastStatusMs = now;
 

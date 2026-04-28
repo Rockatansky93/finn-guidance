@@ -10,6 +10,7 @@
 //! - `$FINNCFG,WAS,<centre>,<left>,<right>*<checksum>`  (WAS calibration)
 //! - `$FINNCFG,PID,<kp_x100>,<min_pwm>,<max_pwm>*<checksum>`  (inner loop tuning)
 //! - `$FINNCFG,INVERT,<0|1>*<checksum>`  (motor direction)
+//! - `$FINNCFG,WASF,<ema_alpha_x100>,<deadzone_x100>,<curve_exp_x100>*<checksum>`  (WAS filtering)
 //!
 //! ## Motor ESP32 -> PC
 //! - `$FINNMTR,<pwm>,<was_raw>,<angle_x100>,<enabled>,<uptime_ms>*<checksum>` (10Hz)
@@ -74,5 +75,15 @@ pub fn format_pid_config(kp_x100: u16, min_pwm: u16, max_pwm: u16) -> String {
 /// Format a motor invert config command.
 pub fn format_invert_config(invert: bool) -> String {
     let body = format!("FINNCFG,INVERT,{}", if invert { 1 } else { 0 });
+    format_finn_sentence(&body)
+}
+
+/// Format a WAS filtering config command.
+/// All values are x100 integers:
+///   ema_alpha_x100:  EMA smoothing factor (e.g. 15 = 0.15)
+///   deadzone_x100:   Dead zone half-width in degrees (e.g. 200 = 2.00°)
+///   curve_exp_x100:  Non-linear curve exponent (e.g. 200 = 2.00)
+pub fn format_wasf_config(ema_alpha_x100: u16, deadzone_x100: u16, curve_exp_x100: u16) -> String {
+    let body = format!("FINNCFG,WASF,{},{},{}", ema_alpha_x100, deadzone_x100, curve_exp_x100);
     format_finn_sentence(&body)
 }
