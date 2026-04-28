@@ -27,7 +27,7 @@ pub struct AbLineGuide {
     /// Positive = shift right, negative = shift left.
     /// Applied on top of pass_offset — use for inter-row sowing alignment
     /// or correcting overlap/underlap without changing the pass number.
-    /// Typical range: ±0.05–0.20 m (5–20 cm). Hard cap: ±2.0 m.
+    /// Typical range: ±0.05–0.20 m (5–20 cm). Hard cap: ±implement_width_m.
     pub nudge_m: f64,
 
     // --- Auto-pass state ---
@@ -152,8 +152,9 @@ impl AbLineGuide {
                 let old_nudge = self.nudge_m;
                 self.nudge_m = raw_xtd - self.pass_offset_m;
 
-                // Clamp to hard cap (±2m covers realistic GPS drift).
-                self.nudge_m = self.nudge_m.clamp(-2.0, 2.0);
+                // Clamp to hard cap (±implement width covers full pass shifts).
+                let cap = self.implement_width_m;
+                self.nudge_m = self.nudge_m.clamp(-cap, cap);
 
                 let shift = self.nudge_m - old_nudge;
                 Some(shift)
@@ -164,14 +165,16 @@ impl AbLineGuide {
 
     /// Shift the AB line to the right by `amount_m` metres.
     /// This nudges the entire system (all passes shift with it).
-    /// Hard cap at ±2.0 m to prevent accidental large shifts.
+    /// Hard cap at ±implement_width_m to allow full pass-width shifts.
     pub fn nudge_right(&mut self, amount_m: f64) {
-        self.nudge_m = (self.nudge_m + amount_m).clamp(-2.0, 2.0);
+        let cap = self.implement_width_m;
+        self.nudge_m = (self.nudge_m + amount_m).clamp(-cap, cap);
     }
 
     /// Shift the AB line to the left by `amount_m` metres.
     pub fn nudge_left(&mut self, amount_m: f64) {
-        self.nudge_m = (self.nudge_m - amount_m).clamp(-2.0, 2.0);
+        let cap = self.implement_width_m;
+        self.nudge_m = (self.nudge_m - amount_m).clamp(-cap, cap);
     }
 
     /// Reset nudge back to zero.

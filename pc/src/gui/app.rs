@@ -560,7 +560,7 @@ impl GuidanceApp {
                     ui.separator();
                     ui.colored_label(
                         egui::Color32::from_rgb(255, 60, 60),
-                        format!("● REC {}", self.coverage.total_points()),
+                        format!("● REC {:.2} ha", self.coverage.covered_hectares()),
                     );
                 }
             });
@@ -938,10 +938,10 @@ impl GuidanceApp {
 
     /// Draw the lightbar overlay across the top of the field view.
     ///
-    /// The lightbar is a row of segments that light up to show how far off-line
-    /// you are and which direction to steer. Segments light up on the side you
-    /// need to steer TOWARDS — if you're left of the line, the right segments
-    /// light up telling you to steer right.
+    /// Three-dot style: three adjacent segments represent the AB line position
+    /// and slide across the bar. The fixed centre tick mark represents the
+    /// tractor. When the dots are left of centre, the line is to your left —
+    /// steer left to chase them. When centred, you're on the line.
     ///
     /// Layout: 15 segments left + 1 centre + 15 segments right = 31 total.
     /// Colour ramp: green (close) → yellow (moderate) → red (far off).
@@ -970,18 +970,25 @@ impl GuidanceApp {
         let seg_height = bar_height - gap * 2.0;
         let seg_y = bar_rect.top() + gap;
 
-        // Determine how many segments to light up and in which direction
+        // Calculate where the three "line" dots should sit.
+        // XTE positive = vehicle is RIGHT of line, so the line is to the LEFT
+        // of the vehicle → dots shift left (negative segment index).
+        // XTE negative = vehicle is LEFT of line → dots shift right.
         let xtd_cm = self.current_error.as_ref()
-            .map(|e| (e.distance_m * 100.0) as i32)
-            .unwrap_or(0);
+            .map(|e| (e.distance_m * 100.0) as f64)
+            .unwrap_or(0.0);
 
-        // Number of segments to light (capped at SEGS_PER_SIDE)
-        let lit_count = if self.current_error.is_some() && self.guide.line.is_some() {
-            ((xtd_cm.abs() as f64) / self.lightbar_cm_per_seg).ceil() as i32
+        // Full scale = SEGS_PER_SIDE segments × cm_per_seg.
+        // Dot position in fractional segments from centre (negative = left).
+        // Sign: negative XTE (left of line) → line is right → positive dot pos.
+        let dot_pos_segs: f64 = if self.current_error.is_some() && self.guide.line.is_some() {
+            (-xtd_cm / self.lightbar_cm_per_seg).clamp(-SEGS_PER_SIDE as f64, SEGS_PER_SIDE as f64)
         } else {
-            0
+            0.0
         };
-        let lit_count = lit_count.min(SEGS_PER_SIDE);
+
+        // The centre segment index where the dots sit (rounded to nearest)
+        let dot_centre: i32 = dot_pos_segs.round() as i32;
 
         // Draw each segment
         for i in 0..TOTAL_SEGS {
@@ -993,34 +1000,29 @@ impl GuidanceApp {
                 egui::vec2(seg_width, seg_height),
             );
 
-            // Determine if this segment should be lit
-            let is_lit = if self.current_error.is_none() || self.guide.line.is_none() {
-                false
-            } else if seg_index == 0 {
-                // Centre segment: always lit when we have guidance
-                true
-            } else if xtd_cm < 0 {
-                // Vehicle is LEFT of line → light up RIGHT segments (positive)
-                // to tell operator to steer right
-                seg_index > 0 && seg_index <= lit_count
-            } else {
-                // Vehicle is RIGHT of line → light up LEFT segments (negative)
-                // to tell operator to steer left
-                seg_index < 0 && seg_index >= -lit_count
-            };
+            // The three dots light up: dot_centre-1, dot_centre, dot_centre+1
+            let is_dot = self.current_error.is_some()
+                && self.guide.line.is_some()
+                && (seg_index >= dot_centre - 1 && seg_index <= dot_centre + 1);
 
-            let colour = if is_lit {
-                let distance_from_centre = seg_index.unsigned_abs() as f32;
-                lightbar_colour(distance_from_centre, SEGS_PER_SIDE as f32)
+            // Fixed centre tick — always drawn as a reference point
+            let is_centre_tick = seg_index == 0;
+
+            if is_dot {
+                let distance_from_centre = dot_centre.unsigned_abs() as f32;
+                let colour = lightbar_colour(distance_from_centre, SEGS_PER_SIDE as f32);
+                painter.rect_filled(seg_rect, 2.0, colour);
+            } else if is_centre_tick {
+                // Fixed centre reference — dim white so you can see "home"
+                painter.rect_filled(
+                    seg_rect,
+                    2.0,
+                    egui::Color32::from_rgba_premultiplied(180, 180, 180, 120),
+                );
             } else {
                 // Unlit segment — very dim outline
-                egui::Color32::from_rgba_premultiplied(60, 60, 60, 100)
-            };
-
-            if is_lit {
-                painter.rect_filled(seg_rect, 2.0, colour);
-            } else {
-                painter.rect_stroke(seg_rect, 2.0, egui::Stroke::new(1.0, colour));
+                let dim = egui::Color32::from_rgba_premultiplied(60, 60, 60, 100);
+                painter.rect_stroke(seg_rect, 2.0, egui::Stroke::new(1.0, dim));
             }
         }
     }
