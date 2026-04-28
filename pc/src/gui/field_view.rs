@@ -469,7 +469,12 @@ impl FieldView {
             // Vehicle always faces up in heading-up mode
             0.0_f64
         } else {
-            -fix.heading * std::f64::consts::PI / 180.0
+            // Positive rotation: heading clockwise from north.
+            // The vertex math already accounts for screen-Y-down,
+            // so we need a positive angle here (the map rotation in
+            // field_projection uses negative because it rotates the
+            // *world*, not the icon).
+            fix.heading * std::f64::consts::PI / 180.0
         };
 
         let size = 12.0_f32;

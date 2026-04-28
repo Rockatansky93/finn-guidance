@@ -5,38 +5,89 @@
 > Updated at the end of each working session.
 
 ## Last updated
-Session 26 — 28 April 2026 (Cab feedback: button naming fix, max_steer_angle
-slider range fix)
+Session 27 — 28 April 2026 (Telemetry log analysis of field test 9,
+steering diagnostic session)
 
 ## What we're working on
 **Seeding is underway.** Development changes must be stable and not break
 what's working.
 
-**Session 26 GUI changes (applied, ready to build):**
-- **Snap button completely reworked**: renamed from "Align Grid to Here" to
-  "Snap Passes to Here" / "⊚ Snap". More importantly, the *behaviour* changed:
-  old version picked the nearest whole pass number (useless for GPS drift);
-  new version absorbs the current XTE into `nudge_m` so the line shifts to
-  exactly where you are. Works correctly on both forward and return passes
-  by computing in the raw A→B frame, avoiding the direction-dependent sign
-  flip. Status message now shows the shift applied and total nudge.
-- Max steer angle slider: range changed from 5–30° to 1–30° with 0.5°
-  steps (was 1° steps). Field testing showed only 1.5° of actual
-  steering angle was being reached, so the old 5° minimum was far too
-  high. Persistence format updated from `{:.0}` to `{:.1}` to store
-  half-degree values.
+**Session 27 — Field test 9 telemetry analysis (28 April 2026):**
 
-**Field observations from cab (Session 25):**
-1. Seeding started — stability is priority
-2. Align Grid button didn't work (tooltip was consuming touch — fixed)
-3. WAS fluctuates around zero — needs smoothing + dead zone
-4. VTG heading offset ~9° — existing offset parameter worked well
-5. Nudge buttons needed in working view — added
-6. Implement width needed cm precision — added
-7. WAS centre calibration is impractical on articulated 4WD — needs
-   dead zone + non-linear curve
-8. Coverage logging works well
-9. PWM floor of 80 is below motor stall — stall line is ~90 PWM
+Three steering logs captured: `steer_20260428_124724.jsonl` (motor
+engaged), `steer_20260428_130411.jsonl` and `steer_20260428_130629.jsonl`
+(motor disengaged from steering wheel — lightbar-only, Tom hand-steering
+using the guidance display).
+
+### Field test 9 findings
+
+**Finding FT9-1: Motor runaway in Run 1 (motor engaged, 7s, aborted)**
+max_steer_angle was 1.0°. The controller commanded -0.33° to -1.0°
+(steer left), but the WAS reported actual angle climbing from +4.5° to
++24° — the motor was driving the wheels hard RIGHT while the controller
+wanted LEFT. PWM pegged at +180 the entire run with zero sign changes.
+This is a classic positive-feedback runaway: either the **motor direction
+is inverted** relative to the WAS sign convention, or the **WAS
+calibration centre is significantly off** so the ESP32 thinks straight-
+ahead is actually a large angle. Tom will verify motor direction with a
+bench test.
+
+**Finding FT9-2: WAS calibration may not have reached ESP32**
+Tom recalibrated WAS before these runs, but code audit shows the PC GUI
+only sends `$FINNCFG,WAS` when the calibration buttons are pressed —
+there is **no startup config push** when the app launches or the motor
+port connects. If the ESP32 was disconnected during recalibration, or
+the `$FINNACK,WAS,OK` never came back, the ESP32 NVS would still hold
+old values. **Action needed**: add a startup push of all PC-stored config
+(WAS, PID, WASF, INVERT) to the ESP32 when the motor port first connects.
+Also: check ESP32 boot log (`NVS loaded — WAS C:xxx L:xxx R:xxx`) to
+confirm what values the ESP32 is actually using.
+
+**Finding FT9-3: Lightbar runs prove the outer loop works**
+Run 2 (94s): mean |XTE| = 0.31m, max 0.62m. Run 3 (129s): mean |XTE| =
+0.16m, max 0.66m. Tom hand-steered using the lightbar at ~2.4 km/h.
+The actual steering corrections were under ±0.3° — confirming that
+line-holding corrections for broadacre work are tiny fractions of a
+degree, not the 7–15° previously recommended.
+
+**Finding FT9-4: max_steer_angle of 1.0° is reasonable for line-holding**
+Previous context recommended raising max_steer_angle to 12–15°. This is
+**wrong** for line-holding. At 2–5 km/h on a broadacre tractor already
+near the line, real corrections are <0.5°. 10° from a straight line
+would be a wild swerve. The 1.0° cap is appropriate (possibly even
+generous). The saturation seen in the telemetry (52–75%) reflects the
+pure pursuit gain being too aggressive, not the cap being too low.
+**CORRECTION**: Finding 2 from field test 8 ("increase max_steer_angle
+to 12-15°") was wrong and should be disregarded. Future tuning should
+focus on reducing pure pursuit gain so desired angles stay well within
+the 1° cap during steady-state tracking.
+
+**Finding FT9-5: Pure pursuit gain is too aggressive**
+The desired angle hits ±1.0° saturation 52–75% of the time, even with
+XTE only 0.1–0.3m off the line. The human equivalent correction for the
+same offset is ~0.1–0.2°. The lookahead and speed factor need tuning so
+that 0.3m XTE produces ~0.2° of desired angle, not 1.0°.
+
+**Finding FT9-6: WAS dead zone was too large**
+The ESP32's default `wasDeadzoneDeg` was 2.0° — far larger than the
+real steering corrections (<0.5°). The inner loop was blind to all
+corrections within ±2° of centre. Tom confirmed he had already reduced
+the dead zone after recognising this issue. The EMA smoothing alone
+is sufficient for noise rejection.
+
+**BUG REPORT: Triangle icon inverts when heading east or west**
+The heading-up triangle indicator in the field view flips/inverts when
+the tractor is heading approximately east or west. **This may be related
+to the steering issues** — if the heading-up projection has a sign error
+at certain bearings, it could feed incorrect heading into the pure pursuit
+calculation. **Investigate `field_view.rs` and `field_projection.rs`** for
+heading-dependent sign flips or trigonometric edge cases around 90°/270°.
+This should be checked before the next motor-engaged test.
+
+**Previous session context (Session 26, for reference):**
+- Snap button reworked ("Snap Passes to Here" / "⊚ Snap")
+- Max steer angle slider range changed to 1–30° with 0.5° steps
+- Session 25 cab observations (see git history for full list)
 
 **The intermittent freeze diagnosis is done.** An audit of `gps/reader.rs`
 and `main.rs` identified the root cause: all four channels between the
@@ -63,8 +114,8 @@ The fix is applied but not yet field-tested. See Phase D status below.
   logged as WARN every ~5s so stalls remain visible but don't cascade.
   Guidance gets the latest-value semantics it actually wants (a stale 3s
   fix is worse than no fix — better to skip a fix than to chase a backlog).
-- **Fix verified**: not yet. Next field test will confirm.
-- **Decision #027** to be written up after field test 8 verifies the fix.
+- **Fix verified**: YES — field tests 8 and 9 both show zero drops.
+- **Decision #027** to be written up (fix is verified).
 
 ## Phase D — Investigation & fix
 
@@ -276,6 +327,14 @@ behaviour:
 - **Field test 8** (25 April 2026, with telemetry): two runs logged.
   #027 fix verified (zero drops). Systematic right-side bias and inner
   loop lag identified from telemetry analysis. See Phase D.4 findings.
+- **Field test 9** (28 April 2026, Session 27): three runs. Run 1 motor-
+  engaged but aborted after 7s (runaway — motor driving wrong direction).
+  Runs 2 & 3: motor disengaged, lightbar-only hand-steering. Proved
+  outer loop algorithm is sound. Key learnings: max_steer_angle of 1° is
+  correct for line-holding (previous 12-15° recommendation was wrong),
+  motor direction or WAS cal needs verification, pure pursuit gain too
+  aggressive, triangle icon inverts on E/W headings (possible heading
+  sign bug).
 
 ## Current state of the code (by module)
 
@@ -333,7 +392,9 @@ behaviour:
 
 ## What's blocked
 - **RTK**: no base station or NTRIP subscription yet
-- **Implement-level testing**: resume once #027 fix is field-verified
+- **Motor-engaged steering**: blocked on verifying motor direction and
+  WAS calibration sync (FT9 findings 1 & 2), plus investigating the
+  triangle inversion bug (may affect heading sign in pure pursuit)
 
 ## FINN Core integration plan (designed Session 23)
 
@@ -359,36 +420,40 @@ planned integration path:
 
 ## Next session should
 1. Read this file and DECISIONS.md #026
-2. **ESP32 firmware changes (priority — all in `firmware-motor-pio/`):**
-   a. **Bump PWM floor from 80 to 90** — trivial constant change. Motor
-      stalls below ~90 PWM, producing useless buzzing.
-   b. **Add EMA smoothing to WAS ADC reads** — exponential moving average
-      with configurable alpha (~0.1–0.2). One multiply + one add per
-      reading, essentially free on ESP32. Kills jitter without adding
-      meaningful lag.
-      `smoothed = (alpha * raw) + ((1 - alpha) * smoothed)`
-   c. **Add configurable dead zone around WAS centre** — within ±2–3° of
-      centre, output zero steering angle. Prevents the inner loop from
-      chasing noise when wheels are approximately straight. Parameter
-      should be stored in NVS alongside existing WAS calibration.
-   d. **Add non-linear centre curve for WAS** — outside the dead zone,
-      apply a gentle power curve (e.g. square the normalised value,
-      preserve sign) so small physical movements near centre produce
-      proportionally smaller angle outputs. This addresses the
-      articulated 4WD tractor problem where the WAS is mechanically
-      difficult to calibrate to a precise centre point. The curve
-      makes the system tolerant of a few degrees of centre error.
-   e. All four changes (b–d) should be configurable via `$FINNCFG`
-      commands and persisted in NVS, following the existing pattern.
-3. **Remaining field test 8 findings to address**:
-   a. Increase `max_steer_angle` from 7° to 12–15° (finding 2)
-   b. Increase ESP32 `Kp_angle` from 10 to 15+ (finding 3)
-   c. Lower `min_pwm` or tune sub-stall pulsing (finding 4)
-4. Write up Decision #027 in DECISIONS.md — fix is verified
-5. Phase D.3 (Windows USB-serial power hardening) — investigate the
-   remaining 3.2s upstream stall (finding 6)
-6. Investigate LC29H BA actual fix output rate (finding 5)
-7. Compare field test 9 telemetry logs against test 8 baselines
+2. **CRITICAL: Investigate triangle icon inversion bug** — the heading-up
+   triangle flips when heading E/W. Check `field_view.rs` and
+   `field_projection.rs` for heading-dependent sign errors. If the same
+   heading value feeds into pure pursuit, this could explain why the
+   motor steered the wrong direction in Run 1. **Must be resolved before
+   any motor-engaged testing.**
+3. **Verify motor direction / WAS calibration sync:**
+   a. Bench test: command `$FINNSTEER,50` (+0.5° right), confirm WAS
+      reads positive. Command `$FINNSTEER,-50`, confirm WAS reads
+      negative. If inverted, toggle `$FINNCFG,INVERT`.
+   b. Check ESP32 boot log for `NVS loaded — WAS C:xxx L:xxx R:xxx` —
+      confirm values match what the PC GUI shows.
+   c. **Add startup config push**: when motor port connects in
+      `comms/serial.rs` or `gui/app.rs`, send all stored config (WAS,
+      PID, WASF, INVERT) to ESP32 to guarantee sync.
+4. **Reduce pure pursuit gain** — current tuning produces ±1° desired
+   angles for 0.1–0.3m XTE. Real corrections are <0.5° for sub-0.5m
+   offsets. Increase lookahead or reduce speed factor. Target: 0.3m XTE
+   → ~0.2° desired angle.
+5. **ESP32 firmware status** (done in previous sessions, verify deployed):
+   - EMA smoothing, dead zone, non-linear curve all implemented in
+     firmware. Tom reduced dead zone from 2.0° to near-zero. Verify
+     the deployed firmware matches `firmware-motor-pio/src/main.cpp`.
+   - min_pwm bumped to 90, kpAngle bumped to 15 — both in firmware.
+6. Write up Decision #027 in DECISIONS.md — fix is verified (FT8+FT9)
+7. Phase D.3 (Windows USB-serial power hardening) — still worth doing
+8. Investigate LC29H BA actual fix output rate (FT8 finding 5)
+
+**IMPORTANT CORRECTION for future sessions**: The field test 8 finding
+that recommended increasing max_steer_angle to 12-15° was wrong.
+For broadacre line-holding at field speeds, real steering corrections
+are <0.5°. A max_steer_angle of 1-2° is appropriate. Do not raise it
+above ~3° for line-holding. Higher values may be needed only for initial
+line acquisition from large offsets.
 
 ## File map (quick reference)
 ```
