@@ -5,28 +5,26 @@
 > Updated at the end of each working session.
 
 ## Last updated
-Session 25 — 27 April 2026 (Field notes from seeding; GUI fixes for
-touchscreen, working view controls, implement width precision)
+Session 26 — 28 April 2026 (Cab feedback: button naming fix, max_steer_angle
+slider range fix)
 
 ## What we're working on
 **Seeding is underway.** Development changes must be stable and not break
-what's working. Tom provided field notes from the tractor cab (Session 25)
-which drove a round of GUI improvements and identified ESP32 firmware
-changes needed for the next session.
+what's working.
 
-**Session 25 GUI changes (applied, ready to build):**
-- Align Grid to Here button: removed `show_tooltip_text` overlay that was
-  eating first-touch events on the Dell 7390 touchscreen. Added diagnostic
-  status messages on all code paths (Some/None/no-fix) so failures are
-  always visible.
-- Working view bottom bar: added second row with Set A / Set B buttons,
-  nudge controls (◄5 ◄1 [value] 1► 5► Rst), and ⊕ Align button. Uses
-  `ui.horizontal` (not `horizontal_centered`) for correct two-row stacking.
-  Status messages route to `steer_status_msg` for field-view overlay display.
-- Implement width: changed from ±0.5m steps to ±10cm / ±1cm buttons.
-  Display now shows two decimal places. DB persistence updated to `{:.2}`.
-- Old nudge indicator removed from row 1 right side (nudge value now
-  always visible in row 2 button group).
+**Session 26 GUI changes (applied, ready to build):**
+- **Snap button completely reworked**: renamed from "Align Grid to Here" to
+  "Snap Passes to Here" / "⊚ Snap". More importantly, the *behaviour* changed:
+  old version picked the nearest whole pass number (useless for GPS drift);
+  new version absorbs the current XTE into `nudge_m` so the line shifts to
+  exactly where you are. Works correctly on both forward and return passes
+  by computing in the raw A→B frame, avoiding the direction-dependent sign
+  flip. Status message now shows the shift applied and total nudge.
+- Max steer angle slider: range changed from 5–30° to 1–30° with 0.5°
+  steps (was 1° steps). Field testing showed only 1.5° of actual
+  steering angle was being reached, so the old 5° minimum was far too
+  high. Persistence format updated from `{:.0}` to `{:.1}` to store
+  half-degree values.
 
 **Field observations from cab (Session 25):**
 1. Seeding started — stability is priority

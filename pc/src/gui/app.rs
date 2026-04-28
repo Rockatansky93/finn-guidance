@@ -660,27 +660,26 @@ impl GuidanceApp {
 
                     ui.separator();
 
-                    // Align Grid to Here
+                    // Align Passes to Here
                     let can_align = self.guide.has_complete_line() && self.current_fix.is_some();
                     let align_btn = egui::Button::new(
-                        egui::RichText::new("⊕ Align").size(14.0)
+                        egui::RichText::new("⊚ Snap").size(14.0)
                     ).min_size(egui::vec2(70.0, 32.0));
                     if ui.add_enabled(can_align, align_btn).clicked() {
                         if let Some(fix) = self.current_fix.clone() {
                             match self.guide.align_grid_to_position(&fix) {
-                                Some(new_pass) => {
+                                Some(shift_m) => {
                                     self.sync_guide_to_steer_thread();
-                                    let xtd_info = self.current_error.as_ref()
-                                        .map(|e| format!("{:.1}cm", e.distance_m * 100.0))
-                                        .unwrap_or_else(|| "??".to_string());
+                                    let shift_cm = (shift_m * 100.0).round() as i32;
+                                    let nudge_cm = (self.guide.nudge_m * 100.0).round() as i32;
                                     self.steer_status_msg = Some((
-                                        format!("Grid aligned — Pass {} (XTE {})", new_pass, xtd_info),
+                                        format!("Line snapped {}cm (nudge now {}cm)", shift_cm, nudge_cm),
                                         360,
                                     ));
                                 }
                                 None => {
                                     self.steer_status_msg = Some((
-                                        "Align failed".to_string(), 300,
+                                        "Snap failed".to_string(), 300,
                                     ));
                                 }
                             }
@@ -1112,25 +1111,24 @@ impl GuidanceApp {
                     // Use when changing implements or starting from a fence line.
                     let can_align = self.guide.has_complete_line() && self.current_fix.is_some();
                     let align_btn = egui::Button::new(
-                        egui::RichText::new("⊕ Align Grid to Here").size(13.0)
+                        egui::RichText::new("⊚ Snap Passes to Here").size(13.0)
                     ).min_size(egui::vec2(150.0, 32.0));
                     let align_resp = ui.add_enabled(can_align, align_btn);
                     if align_resp.clicked() {
                         if let Some(fix) = self.current_fix.clone() {
                             match self.guide.align_grid_to_position(&fix) {
-                                Some(new_pass) => {
+                                Some(shift_m) => {
                                     self.sync_guide_to_steer_thread();
-                                    let xtd_info = self.current_error.as_ref()
-                                        .map(|e| format!("{:.1}cm", e.distance_m * 100.0))
-                                        .unwrap_or_else(|| "??".to_string());
+                                    let shift_cm = (shift_m * 100.0).round() as i32;
+                                    let nudge_cm = (self.guide.nudge_m * 100.0).round() as i32;
                                     self.ab_status_msg = Some((
-                                        format!("Grid aligned — Pass {} (XTE now {})", new_pass, xtd_info),
+                                        format!("Line snapped {}cm (nudge now {}cm)", shift_cm, nudge_cm),
                                         360,
                                     ));
                                 }
                                 None => {
                                     self.ab_status_msg = Some((
-                                        format!("Align failed — line incomplete? has_line={}",
+                                        format!("Snap failed — line incomplete? has_line={}",
                                             self.guide.has_complete_line()),
                                         300,
                                     ));
@@ -1138,7 +1136,7 @@ impl GuidanceApp {
                             }
                         } else {
                             self.ab_status_msg = Some((
-                                "Align failed — no GPS fix available".to_string(),
+                                "Snap failed — no GPS fix available".to_string(),
                                 300,
                             ));
                         }
@@ -2288,13 +2286,13 @@ impl GuidanceApp {
                     // Max steer angle
                     ui.label(egui::RichText::new("Max steer angle:").size(12.0));
                     let old_max_angle = cur_max_angle;
-                    ui.add(egui::Slider::new(&mut cur_max_angle, 5.0..=30.0)
-                        .step_by(1.0)
+                    ui.add(egui::Slider::new(&mut cur_max_angle, 1.0..=30.0)
+                        .step_by(0.5)
                         .suffix("°")
                     );
                     if (cur_max_angle - old_max_angle).abs() > 0.1 {
                         if let Some(db) = &self.db {
-                            let _ = db.set_config("steer_max_angle", &format!("{:.0}", cur_max_angle));
+                            let _ = db.set_config("steer_max_angle", &format!("{:.1}", cur_max_angle));
                         }
                     }
                     ui.label(egui::RichText::new(

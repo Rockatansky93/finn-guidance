@@ -121,42 +121,42 @@ impl AbLineGuide {
         self.nudge_m = 0.0;
     }
 
-    /// Align the pass grid so that the current GPS position falls exactly on the
-    /// nearest whole pass line, with zero nudge and zero fractional remainder.
+    /// Shift the AB line system laterally so the current GPS position reads
+    /// exactly zero cross-track error on the current pass line.
     ///
-    /// This is the "Shift AB line to here" function — pull up at your fence line
-    /// or tramline, tap this button, and the pass grid snaps to you.  The saved
-    /// AB line geometry is unchanged; only `pass_number` and `pass_offset_m` are
-    /// updated.  Nudge is reset to zero — the shift is absorbed cleanly into the
-    /// pass offset, so the system starts in a known tidy state.
+    /// This is the "Snap line to me" function — compensates for GPS drift.
+    /// Example: seeder is physically on the mark but XTE shows +1.0m right.
+    /// Tapping this absorbs that 1.0m into the nudge offset so XTE drops to
+    /// zero instantly.  The saved AB line geometry and pass number are both
+    /// unchanged — only `nudge_m` is adjusted.
     ///
-    /// Returns the new pass number, or None if no line is loaded.
-    pub fn align_grid_to_position(&mut self, fix: &GpsFix) -> Option<i32> {
+    /// Returns the applied shift in metres, or None if no line is loaded.
+    pub fn align_grid_to_position(&mut self, fix: &GpsFix) -> Option<f64> {
         match &self.line {
             Some(GuidanceLine::AbLine { a, b }) => {
-                // Guard against A == B (line not fully set)
                 if (a.0 - b.0).abs() < 1e-10 && (a.1 - b.1).abs() < 1e-10 {
                     return None;
                 }
 
-                // Raw cross-track distance from the base AB line (ignoring any
-                // existing pass offset or nudge — we want distance from the origin).
+                // Get raw cross-track distance in the A→B frame.
                 let raw_xtd = coords::cross_track_distance(
                     fix.latitude, fix.longitude,
                     a.0, a.1,
                     b.0, b.1,
                 );
 
-                // Round to the nearest whole pass number.
-                // This is the pass line closest to where the operator is standing.
-                let nearest_pass = (raw_xtd / self.pass_spacing()).round() as i32;
+                // The residual error in the A→B frame is:
+                //   adjusted_xtd = raw_xtd - pass_offset_m - nudge_m
+                // We want adjusted_xtd = 0, so:
+                //   nudge_m_new = raw_xtd - pass_offset_m
+                let old_nudge = self.nudge_m;
+                self.nudge_m = raw_xtd - self.pass_offset_m;
 
-                // Apply: set pass number and recalculate offset.  Nudge cleared.
-                self.pass_number = nearest_pass;
-                self.pass_offset_m = self.pass_spacing() * nearest_pass as f64;
-                self.nudge_m = 0.0;
+                // Clamp to hard cap (±2m covers realistic GPS drift).
+                self.nudge_m = self.nudge_m.clamp(-2.0, 2.0);
 
-                Some(nearest_pass)
+                let shift = self.nudge_m - old_nudge;
+                Some(shift)
             }
             _ => None,
         }
