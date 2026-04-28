@@ -577,13 +577,13 @@ impl GuidanceApp {
             .show(ctx, |ui| {
                 // === Row 1: Set A/B, Nudge, Align ===
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.spacing_mut().item_spacing.x = 8.0;
 
                     // Set A / Set B buttons
                     let has_fix = self.current_fix.is_some();
                     let set_a_btn = egui::Button::new(
-                        egui::RichText::new("Set A").size(14.0).strong()
-                    ).min_size(egui::vec2(64.0, 32.0));
+                        egui::RichText::new("Set A").size(24.0).strong()
+                    ).min_size(egui::vec2(120.0, 60.0));
                     if ui.add_enabled(has_fix, set_a_btn).clicked() {
                         if let Some(fix) = &self.current_fix {
                             self.guide.set_point_a(fix);
@@ -592,8 +592,8 @@ impl GuidanceApp {
                         }
                     }
                     let set_b_btn = egui::Button::new(
-                        egui::RichText::new("Set B").size(14.0).strong()
-                    ).min_size(egui::vec2(64.0, 32.0));
+                        egui::RichText::new("Set B").size(24.0).strong()
+                    ).min_size(egui::vec2(120.0, 60.0));
                     let can_set_b = has_fix && self.guide.line.is_some();
                     if ui.add_enabled(can_set_b, set_b_btn).clicked() {
                         if let Some(fix) = &self.current_fix {
@@ -607,14 +607,14 @@ impl GuidanceApp {
 
                     // Nudge buttons: ◄5  ◄1  [value]  1►  5►  Reset
                     if ui.add(egui::Button::new(
-                        egui::RichText::new("◄5").size(14.0)
-                    ).min_size(egui::vec2(36.0, 32.0))).clicked() {
+                        egui::RichText::new("◄5").size(24.0)
+                    ).min_size(egui::vec2(64.0, 60.0))).clicked() {
                         self.guide.nudge_left(0.05);
                         self.sync_guide_to_steer_thread();
                     }
                     if ui.add(egui::Button::new(
-                        egui::RichText::new("◄1").size(14.0)
-                    ).min_size(egui::vec2(36.0, 32.0))).clicked() {
+                        egui::RichText::new("◄1").size(24.0)
+                    ).min_size(egui::vec2(64.0, 60.0))).clicked() {
                         self.guide.nudge_left(0.01);
                         self.sync_guide_to_steer_thread();
                     }
@@ -634,25 +634,25 @@ impl GuidanceApp {
                     };
                     ui.label(
                         egui::RichText::new(nudge_text)
-                            .size(14.0).strong().color(nudge_colour),
+                            .size(24.0).strong().color(nudge_colour),
                     );
 
                     if ui.add(egui::Button::new(
-                        egui::RichText::new("1►").size(14.0)
-                    ).min_size(egui::vec2(36.0, 32.0))).clicked() {
+                        egui::RichText::new("1►").size(24.0)
+                    ).min_size(egui::vec2(64.0, 60.0))).clicked() {
                         self.guide.nudge_right(0.01);
                         self.sync_guide_to_steer_thread();
                     }
                     if ui.add(egui::Button::new(
-                        egui::RichText::new("5►").size(14.0)
-                    ).min_size(egui::vec2(36.0, 32.0))).clicked() {
+                        egui::RichText::new("5►").size(24.0)
+                    ).min_size(egui::vec2(64.0, 60.0))).clicked() {
                         self.guide.nudge_right(0.05);
                         self.sync_guide_to_steer_thread();
                     }
                     if nudge_cm != 0 {
                         if ui.add(egui::Button::new(
-                            egui::RichText::new("Rst").size(12.0)
-                        ).min_size(egui::vec2(40.0, 32.0))).clicked() {
+                            egui::RichText::new("Rst").size(20.0)
+                        ).min_size(egui::vec2(70.0, 60.0))).clicked() {
                             self.guide.nudge_reset();
                             self.sync_guide_to_steer_thread();
                         }
@@ -663,8 +663,8 @@ impl GuidanceApp {
                     // Align Passes to Here
                     let can_align = self.guide.has_complete_line() && self.current_fix.is_some();
                     let align_btn = egui::Button::new(
-                        egui::RichText::new("⊚ Snap").size(14.0)
-                    ).min_size(egui::vec2(70.0, 32.0));
+                        egui::RichText::new("⊚ Snap").size(24.0)
+                    ).min_size(egui::vec2(130.0, 60.0));
                     if ui.add_enabled(can_align, align_btn).clicked() {
                         if let Some(fix) = self.current_fix.clone() {
                             match self.guide.align_grid_to_position(&fix) {
@@ -687,7 +687,7 @@ impl GuidanceApp {
                     }
                 });
 
-                ui.add_space(2.0);
+                ui.add_space(4.0);
 
                 // === Row 2: main action buttons ===
                 ui.horizontal(|ui| {
@@ -701,8 +701,8 @@ impl GuidanceApp {
                         egui::Color32::from_rgb(60, 200, 60)
                     };
                     let engage_btn = egui::Button::new(
-                        egui::RichText::new(engage_text).size(20.0).strong().color(engage_colour)
-                    ).min_size(egui::vec2(160.0, 40.0));
+                        egui::RichText::new(engage_text).size(28.0).strong().color(engage_colour)
+                    ).min_size(egui::vec2(220.0, 70.0));
                     if ui.add(engage_btn).clicked() {
                         self.coverage.toggle_engage(self.db.as_ref());
                     }
@@ -720,8 +720,8 @@ impl GuidanceApp {
                         ("⊕ AUTO-STEER", egui::Color32::from_rgb(100, 200, 255))
                     };
                     let steer_btn = egui::Button::new(
-                        egui::RichText::new(steer_text).size(18.0).strong().color(steer_colour)
-                    ).min_size(egui::vec2(140.0, 40.0));
+                        egui::RichText::new(steer_text).size(28.0).strong().color(steer_colour)
+                    ).min_size(egui::vec2(220.0, 70.0));
                     let steer_resp = ui.add_enabled(
                         can_auto_steer || self.steer_display.engaged,
                         steer_btn,
@@ -748,8 +748,8 @@ impl GuidanceApp {
                         egui::Color32::GRAY
                     };
                     let auto_btn = egui::Button::new(
-                        egui::RichText::new(auto_label).size(18.0).color(auto_colour)
-                    ).min_size(egui::vec2(90.0, 40.0));
+                        egui::RichText::new(auto_label).size(24.0).color(auto_colour)
+                    ).min_size(egui::vec2(130.0, 70.0));
                     if ui.add(auto_btn).clicked() {
                         self.guide.auto_pass_enabled = !self.guide.auto_pass_enabled;
                     }
@@ -757,8 +757,8 @@ impl GuidanceApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Page switch: go to setup
                         let setup_btn = egui::Button::new(
-                            egui::RichText::new("⚙ Setup").size(16.0)
-                        ).min_size(egui::vec2(100.0, 40.0));
+                            egui::RichText::new("⚙ Setup").size(24.0)
+                        ).min_size(egui::vec2(140.0, 70.0));
                         if ui.add(setup_btn).clicked() {
                             self.active_page = ActivePage::Setup;
                         }
@@ -766,7 +766,7 @@ impl GuidanceApp {
                         // Pass indicator
                         ui.label(
                             egui::RichText::new(format!("Pass {}", self.guide.pass_number))
-                                .size(16.0)
+                                .size(28.0)
                                 .color(egui::Color32::from_rgb(80, 160, 255)),
                         );
                     });

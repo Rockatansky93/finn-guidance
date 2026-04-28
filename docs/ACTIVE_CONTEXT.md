@@ -5,86 +5,62 @@
 > Updated at the end of each working session.
 
 ## Last updated
-Session 27 — 28 April 2026 (Telemetry log analysis of field test 9,
-steering diagnostic session)
+Session 28 — 28 April 2026 (Usability improvements session,
+auto-steer field-validated at ~30cm accuracy)
 
 ## What we're working on
 **Seeding is underway.** Development changes must be stable and not break
 what's working.
 
-**Session 27 — Field test 9 telemetry analysis (28 April 2026):**
+**Session 28 — Usability improvements (28 April 2026):**
 
-Three steering logs captured: `steer_20260428_124724.jsonl` (motor
-engaged), `steer_20260428_130411.jsonl` and `steer_20260428_130629.jsonl`
-(motor disengaged from steering wheel — lightbar-only, Tom hand-steering
-using the guidance display).
+Auto-steer field test was successful — holding a line within ~30cm,
+performing comparably to the Trimble EZ-Steer system it replaces.
+Motor direction, WAS calibration, and pure pursuit gain issues from
+Session 27 have been resolved in the field. Focus shifted to usability
+improvements for in-cab operation during seeding.
 
-### Field test 9 findings
+### Changes made this session
 
-**Finding FT9-1: Motor runaway in Run 1 (motor engaged, 7s, aborted)**
-max_steer_angle was 1.0°. The controller commanded -0.33° to -1.0°
-(steer left), but the WAS reported actual angle climbing from +4.5° to
-+24° — the motor was driving the wheels hard RIGHT while the controller
-wanted LEFT. PWM pegged at +180 the entire run with zero sign changes.
-This is a classic positive-feedback runaway: either the **motor direction
-is inverted** relative to the WAS sign convention, or the **WAS
-calibration centre is significantly off** so the ESP32 thinks straight-
-ahead is actually a large angle. Tom will verify motor direction with a
-bench test.
+**Change 1: Nudge cap raised from ±2m to ±implement_width_m**
+The 2m hard cap on nudge distance was too restrictive for using the Snap
+function when more than 2m off the line. All three clamp points in
+`guidance/ab_line.rs` (`nudge_left`, `nudge_right`,
+`align_grid_to_position`) now use `implement_width_m` as the cap (12m
+default). This allows full pass-width shifts via nudge or Snap.
 
-**Finding FT9-2: WAS calibration may not have reached ESP32**
-Tom recalibrated WAS before these runs, but code audit shows the PC GUI
-only sends `$FINNCFG,WAS` when the calibration buttons are pressed —
-there is **no startup config push** when the app launches or the motor
-port connects. If the ESP32 was disconnected during recalibration, or
-the `$FINNACK,WAS,OK` never came back, the ESP32 NVS would still hold
-old values. **Action needed**: add a startup push of all PC-stored config
-(WAS, PID, WASF, INVERT) to the ESP32 when the motor port first connects.
-Also: check ESP32 boot log (`NVS loaded — WAS C:xxx L:xxx R:xxx`) to
-confirm what values the ESP32 is actually using.
+**Change 2: Lightbar changed to three-dot sliding style**
+Replaced the "segments light from centre outward" lightbar with a
+three-dot style matching commercial guidance systems. Three adjacent
+segments represent the AB line position and slide across the bar. A
+fixed dim white centre tick marks the tractor position. Steer towards
+the dots. Colour ramp (green→yellow→red) still indicates distance from
+centre. Same 31-segment layout, same sensitivity setting.
 
-**Finding FT9-3: Lightbar runs prove the outer loop works**
-Run 2 (94s): mean |XTE| = 0.31m, max 0.62m. Run 3 (129s): mean |XTE| =
-0.16m, max 0.66m. Tom hand-steered using the lightbar at ~2.4 km/h.
-The actual steering corrections were under ±0.3° — confirming that
-line-holding corrections for broadacre work are tiny fractions of a
-degree, not the 7–15° previously recommended.
+**Change 3: Status bar shows hectares instead of point count**
+The `● REC` indicator in the GPS status bar now shows `● REC X.XX ha`
+instead of `● REC <point_count>`. More useful at a glance during seeding.
 
-**Finding FT9-4: max_steer_angle of 1.0° is reasonable for line-holding**
-Previous context recommended raising max_steer_angle to 12–15°. This is
-**wrong** for line-holding. At 2–5 km/h on a broadacre tractor already
-near the line, real corrections are <0.5°. 10° from a straight line
-would be a wild swerve. The 1.0° cap is appropriate (possibly even
-generous). The saturation seen in the telemetry (52–75%) reflects the
-pure pursuit gain being too aggressive, not the cap being too low.
-**CORRECTION**: Finding 2 from field test 8 ("increase max_steer_angle
-to 12-15°") was wrong and should be disregarded. Future tuning should
-focus on reducing pure pursuit gain so desired angles stay well within
-the 1° cap during steady-state tracking.
+**Change 4: Working page buttons doubled in size**
+All buttons on the working page bottom bar doubled for touchscreen use
+in a bouncing tractor cab:
+- Row 1 (Set A/B, nudge, snap): buttons 120×60 / 64×60 / 130×60,
+  text 24pt
+- Row 2 (engage, auto-steer, auto-pass, setup): buttons 220×70 /
+  130×70 / 140×70, text 24-28pt
+- Pass indicator text: 28pt
+Setup page buttons unchanged (not used while moving).
 
-**Finding FT9-5: Pure pursuit gain is too aggressive**
-The desired angle hits ±1.0° saturation 52–75% of the time, even with
-XTE only 0.1–0.3m off the line. The human equivalent correction for the
-same offset is ~0.1–0.2°. The lookahead and speed factor need tuning so
-that 0.3m XTE produces ~0.2° of desired angle, not 1.0°.
+### Field status update from Tom
 
-**Finding FT9-6: WAS dead zone was too large**
-The ESP32's default `wasDeadzoneDeg` was 2.0° — far larger than the
-real steering corrections (<0.5°). The inner loop was blind to all
-corrections within ±2° of centre. Tom confirmed he had already reduced
-the dead zone after recognising this issue. The EMA smoothing alone
-is sufficient for noise rejection.
+- Auto-steer is working and holding within ~30cm, matching Trimble
+- Motor direction / WAS calibration / pure pursuit gain issues from
+  FT9 findings have been resolved
+- The triangle icon inversion bug on E/W headings is **cosmetic only**
+  — confirmed not connected to steering calculations
+- Remaining work is usability-focused, not algorithmic
 
-**BUG REPORT: Triangle icon inverts when heading east or west**
-The heading-up triangle indicator in the field view flips/inverts when
-the tractor is heading approximately east or west. **This may be related
-to the steering issues** — if the heading-up projection has a sign error
-at certain bearings, it could feed incorrect heading into the pure pursuit
-calculation. **Investigate `field_view.rs` and `field_projection.rs`** for
-heading-dependent sign flips or trigonometric edge cases around 90°/270°.
-This should be checked before the next motor-engaged test.
-
-**Previous session context (Session 26, for reference):**
+**Previous session context (Session 27, for reference):**
 - Snap button reworked ("Snap Passes to Here" / "⊚ Snap")
 - Max steer angle slider range changed to 1–30° with 0.5° steps
 - Session 25 cab observations (see git history for full list)
@@ -392,9 +368,9 @@ behaviour:
 
 ## What's blocked
 - **RTK**: no base station or NTRIP subscription yet
-- **Motor-engaged steering**: blocked on verifying motor direction and
-  WAS calibration sync (FT9 findings 1 & 2), plus investigating the
-  triangle inversion bug (may affect heading sign in pure pursuit)
+- **Hardware switch inputs**: momentary switch for auto-steer engage and
+  seed engage switch for coverage logging both require ESP32 GPIO wiring
+  and firmware + protocol additions (see "Next session" items 2 & 3)
 
 ## FINN Core integration plan (designed Session 23)
 
@@ -420,30 +396,32 @@ planned integration path:
 
 ## Next session should
 1. Read this file and DECISIONS.md #026
-2. **CRITICAL: Investigate triangle icon inversion bug** — the heading-up
-   triangle flips when heading E/W. Check `field_view.rs` and
-   `field_projection.rs` for heading-dependent sign errors. If the same
-   heading value feeds into pure pursuit, this could explain why the
-   motor steered the wrong direction in Run 1. **Must be resolved before
-   any motor-engaged testing.**
-3. **Verify motor direction / WAS calibration sync:**
-   a. Bench test: command `$FINNSTEER,50` (+0.5° right), confirm WAS
-      reads positive. Command `$FINNSTEER,-50`, confirm WAS reads
-      negative. If inverted, toggle `$FINNCFG,INVERT`.
-   b. Check ESP32 boot log for `NVS loaded — WAS C:xxx L:xxx R:xxx` —
-      confirm values match what the PC GUI shows.
-   c. **Add startup config push**: when motor port connects in
-      `comms/serial.rs` or `gui/app.rs`, send all stored config (WAS,
-      PID, WASF, INVERT) to ESP32 to guarantee sync.
-4. **Reduce pure pursuit gain** — current tuning produces ±1° desired
-   angles for 0.1–0.3m XTE. Real corrections are <0.5° for sub-0.5m
-   offsets. Increase lookahead or reduce speed factor. Target: 0.3m XTE
-   → ~0.2° desired angle.
-5. **ESP32 firmware status** (done in previous sessions, verify deployed):
-   - EMA smoothing, dead zone, non-linear curve all implemented in
-     firmware. Tom reduced dead zone from 2.0° to near-zero. Verify
-     the deployed firmware matches `firmware-motor-pio/src/main.cpp`.
-   - min_pwm bumped to 90, kpAngle bumped to 15 — both in firmware.
+2. **Hardware input: Momentary switch for auto-steer engage/disengage**
+   (hardware-dependent, plan when components available)
+   - Wire a momentary pushbutton to an ESP32 GPIO input (with pull-up)
+   - ESP32 firmware: detect press, send a new FINN sentence e.g.
+     `$FINN,STEER_BTN,1*` on press
+   - PC side: parse the button event in `comms/serial.rs`, forward to
+     steer thread as `SteerCommand::Toggle` (engage if off, disengage
+     if on)
+   - This replaces the touchscreen AUTO-STEER button for in-cab use —
+     physical button is safer and faster than a touchscreen target
+3. **Hardware input: Seed engage switch triggers coverage logging**
+   (hardware-dependent, plan when components available)
+   - Wire the air seeder’s seed-engage switch output (likely 12V) to an
+     ESP32 GPIO via a voltage divider or optocoupler
+   - ESP32 firmware: monitor the input state, send e.g.
+     `$FINN,SEED,1*` / `$FINN,SEED,0*` on state changes
+   - PC side: parse seed state in `comms/serial.rs`, auto-engage/
+     disengage coverage logging in response — no manual button press
+     needed
+   - Coverage logging then tracks actual seeding, not just driving
+4. **Triangle icon inversion bug** — cosmetic only, low priority.
+   Fix when convenient: check `field_view.rs` and `field_projection.rs`
+   for heading-dependent sign errors around 90°/270°.
+5. **Add startup config push** — when motor port connects, send all
+   stored config (WAS, PID, WASF, INVERT) to ESP32 to guarantee sync.
+   Still worth doing even though the FT9 runaway is resolved.
 6. Write up Decision #027 in DECISIONS.md — fix is verified (FT8+FT9)
 7. Phase D.3 (Windows USB-serial power hardening) — still worth doing
 8. Investigate LC29H BA actual fix output rate (FT8 finding 5)
