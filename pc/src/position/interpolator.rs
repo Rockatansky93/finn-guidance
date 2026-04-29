@@ -1,8 +1,9 @@
-//! GPS position interpolator — smooth GUI updates between 1Hz fixes.
+//! GPS position interpolator — smooth GUI updates between 10Hz fixes.
 //!
-//! The LC29H DA variant is limited to 1Hz position output, which makes the GUI
-//! feel sluggish. This module dead-reckons intermediate positions between real
-//! fixes using the last known speed and heading.
+//! The LC29H BA outputs fixes at 10Hz via onboard dead-reckoning fusion.
+//! This module dead-reckons intermediate positions between real fixes
+//! using the last known speed and heading, bridging 100ms gaps for smooth
+//! ~30fps GUI rendering.
 //!
 //! ## How it works
 //!
@@ -10,11 +11,9 @@
 //!    interpolator with the true position, speed, and heading.
 //! 2. On every GUI frame, call `interpolate(override_heading)` — this
 //!    extrapolates the position forward by `speed × dt` along the heading.
-//!    When an override heading is supplied (typically the IMU-fused heading),
-//!    it's used instead of the stale VTG heading baked into the last real fix.
 //! 3. The returned `GpsFix` is a synthetic fix suitable for display and guidance
 //!    calculations. It carries the same metadata (sats, HDOP, fix quality) as
-//!    the last real fix, but with updated position and (optionally) heading.
+//!    the last real fix, but with updated position.
 //!
 //! ## What uses interpolated vs real positions
 //!
@@ -24,11 +23,10 @@
 //!
 //! ## Accuracy
 //!
-//! At tractor speeds (10-15 km/h ≈ 3-4 m/s), one second of dead reckoning with
-//! GPS heading accumulates roughly 10-20cm of error before the next real fix
-//! corrects it. With a fused IMU heading as the `override_heading`, this
-//! improves further because the projection direction stays correct through
-//! turns instead of lagging by up to 1s.
+//! At tractor speeds (10-15 km/h ≈ 3-4 m/s), 100ms of dead reckoning
+//! between 10Hz fixes accumulates roughly 1-2cm of error before the next
+//! real fix corrects it. With the BA's DR-fused heading, projection
+//! direction stays correct through turns.
 
 use std::time::Instant;
 use finn_guidance_common::types::GpsFix;

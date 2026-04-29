@@ -123,6 +123,11 @@ pub struct SharedSteerState {
 
     /// Whether the AB line data has changed since the steer thread last read it.
     pub ab_line_dirty: bool,
+
+    /// Whether telemetry logging is enabled during auto-steer runs.
+    /// When false, no `.jsonl` files are written — reduces filesystem I/O
+    /// and CPU overhead. Persisted in SQLite config.
+    pub telemetry_enabled: bool,
 }
 
 /// Minimal AB line data for the steer thread's own AbLineGuide copy.
@@ -160,6 +165,7 @@ impl SharedSteerState {
             pass_number: 0,
             nudge_m: 0.0,
             ab_line_dirty: false,
+            telemetry_enabled: false,
         }
     }
 }
@@ -247,18 +253,23 @@ pub fn run_steer_thread(
                         steering.engage();
                         tracing::info!("Steer thread: ENGAGED");
 
-                        // Create telemetry logger with current tuning snapshot
-                        let tuning = TuningSnapshot {
-                            lookahead_base: state.lookahead_base,
-                            lookahead_speed_factor: state.lookahead_speed_factor,
-                            wheelbase_m: state.wheelbase_m,
-                            max_steer_angle: state.max_steer_angle,
-                            kd_xte: state.kd_xte,
-                            deadband_m: state.deadband_m,
-                            implement_width_m: state.implement_width_m,
-                            overlap_m: state.overlap_m,
-                        };
-                        telemetry = TelemetryLogger::new(&tuning);
+                        // Create telemetry logger only if enabled
+                        if state.telemetry_enabled {
+                            let tuning = TuningSnapshot {
+                                lookahead_base: state.lookahead_base,
+                                lookahead_speed_factor: state.lookahead_speed_factor,
+                                wheelbase_m: state.wheelbase_m,
+                                max_steer_angle: state.max_steer_angle,
+                                kd_xte: state.kd_xte,
+                                deadband_m: state.deadband_m,
+                                implement_width_m: state.implement_width_m,
+                                overlap_m: state.overlap_m,
+                            };
+                            telemetry = TelemetryLogger::new(&tuning);
+                        } else {
+                            telemetry = None;
+                            tracing::info!("Telemetry logging disabled");
+                        }
                         run_start = Some(Instant::now());
                         last_logged_pass = state.pass_number;
 
@@ -400,6 +411,7 @@ pub fn run_steer_thread(
                                 fix_quality: fix_quality_to_u8(interp_fix.fix_quality),
                                 sats: interp_fix.satellites,
                                 hdop: interp_fix.hdop,
+                                roll: interp_fix.roll,
                                 pass: current_pass,
                                 xte_m: err.distance_m,
                                 heading_err: err.heading_error,

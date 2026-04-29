@@ -68,9 +68,19 @@ impl Default for GpsConfig {
 /// Range: ±180° = ±18000.
 pub type SharedHeadingOffset = Arc<AtomicI32>;
 
+/// Shared atomic for the antenna height so the GUI can adjust it at runtime.
+/// Stored as height_m × 100 (i.e. centimetres) to fit in an AtomicI32.
+/// Range: 0–10m = 0–1000.
+pub type SharedAntennaHeight = Arc<AtomicI32>;
+
 /// Create a new shared heading offset, initialised to the given value.
 pub fn new_shared_heading_offset(initial_deg: f64) -> SharedHeadingOffset {
     Arc::new(AtomicI32::new((initial_deg * 100.0).round() as i32))
+}
+
+/// Create a new shared antenna height, initialised to the given value.
+pub fn new_shared_antenna_height(initial_m: f64) -> SharedAntennaHeight {
+    Arc::new(AtomicI32::new((initial_m * 100.0).round() as i32))
 }
 
 /// Scan all available serial ports and return the first one that produces
@@ -317,6 +327,7 @@ pub fn run_gps_reader(
     port_name_tx: Sender<String>,
     drop_counters: SharedDropCounters,
     heading_offset: SharedHeadingOffset,
+    antenna_height: SharedAntennaHeight,
 ) {
     // === Step 1: Resolve port name ===
     let port_name = if config.port_name == "auto" {
@@ -392,6 +403,10 @@ pub fn run_gps_reader(
                 // always uses the latest user-configured value.
                 nmea_parser.heading_offset_deg =
                     heading_offset.load(Ordering::Relaxed) as f64 / 100.0;
+
+                // Poll the shared antenna height for roll correction.
+                nmea_parser.antenna_height_m =
+                    antenna_height.load(Ordering::Relaxed) as f64 / 100.0;
 
                 // Parse NMEA GPS sentences only — no FINN sentences on this port
                 if let Some(fix) = nmea_parser.parse_sentence(&sentence) {

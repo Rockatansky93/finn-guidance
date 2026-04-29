@@ -55,6 +55,11 @@ pub struct IterRecord {
     pub sats: u8,
     pub hdop: f64,
 
+    // ── Attitude (from DR fusion) ──
+    /// EMA-smoothed roll in degrees (positive = right side down).
+    /// Useful for diagnosing roll correction effectiveness.
+    pub roll: f64,
+
     // ── Guidance ──
     pub pass: i32,
     pub xte_m: f64,

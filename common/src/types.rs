@@ -23,6 +23,15 @@ pub struct GpsFix {
     pub hdop: f64,           // Horizontal dilution of precision
     pub timestamp_ms: u64,   // Milliseconds since epoch
 
+    // === Roll/pitch from PQTMINS DR fusion (for roll correction) ===
+    /// Vehicle roll in degrees (positive = right side down). EMA-smoothed.
+    /// Used for lateral GPS antenna offset correction.
+    #[serde(default = "f64_zero")]
+    pub roll: f64,
+    /// Vehicle pitch in degrees (positive = nose up).
+    #[serde(default = "f64_zero")]
+    pub pitch: f64,
+
     // === Diagnostic heading sources (for GUI comparison display) ===
     /// Raw VTG course-over-ground before offset (NaN if unavailable)
     #[serde(default = "f64_nan")]
@@ -33,6 +42,7 @@ pub struct GpsFix {
 }
 
 fn f64_nan() -> f64 { f64::NAN }
+fn f64_zero() -> f64 { 0.0 }
 
 /// IMU orientation data from BNO055
 #[derive(Debug, Clone, Serialize, Deserialize)]

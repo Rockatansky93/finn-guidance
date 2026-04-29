@@ -20,7 +20,7 @@ use crate::guidance::steer_thread::{SteerStateHandle, SteerCommand, SteerDisplay
 use crate::coverage::logger::CoverageLogger;
 use crate::coverage::db::{CoverageDb, SavedField, SavedAbLine};
 use crate::position::interpolator::PositionInterpolator;
-use crate::gps::reader::SharedHeadingOffset;
+use crate::gps::reader::{SharedHeadingOffset, SharedAntennaHeight};
 use super::field_view::FieldView;
 
 /// Target frame interval — 30fps is smooth for guidance display while
@@ -113,6 +113,17 @@ pub struct GuidanceApp {
     /// Local copy of the heading offset for the slider (degrees).
     heading_offset_deg: f64,
 
+    // --- Antenna height / roll correction ---
+    /// Shared atomic antenna height — updated here, polled by GPS reader thread.
+    antenna_height_shared: SharedAntennaHeight,
+    /// Local copy of the antenna height in metres.
+    antenna_height_m: f64,
+
+    // --- Nudge step size ---
+    /// Coarse nudge step size in centimetres (persisted). The fine step is
+    /// always 1cm. Default 5cm.
+    nudge_step_cm: i32,
+
     // --- AB line persistence ---
     /// SQLite database (opened once, held for the session)
     db: Option<CoverageDb>,
@@ -136,10 +147,13 @@ pub struct GuidanceApp {
     ab_status_msg: Option<(String, u32)>,
     /// Import/export status message
     io_status_msg: Option<(String, u32)>,
+
+    /// Whether steer telemetry logging is enabled (persisted in SQLite)
+    telemetry_enabled: bool,
 }
 
 impl GuidanceApp {
-    pub fn new(gps_rx: Receiver<GpsFix>, finn_rx: Receiver<FinnMessage>, motor_handle: MotorHandle, steer_state: SteerStateHandle, implement_width: f64, heading_offset_shared: SharedHeadingOffset) -> Self {
+    pub fn new(gps_rx: Receiver<GpsFix>, finn_rx: Receiver<FinnMessage>, motor_handle: MotorHandle, steer_state: SteerStateHandle, implement_width: f64, heading_offset_shared: SharedHeadingOffset, antenna_height_shared: SharedAntennaHeight) -> Self {
         // Open the coverage database.  `CoverageLogger` also holds a reference
         // in some configurations; here we open a second handle for persistence.
         let db = CoverageDb::open(std::path::Path::new("data/coverage.db")).ok();
@@ -197,14 +211,37 @@ impl GuidanceApp {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(2.0);
 
+        // Load nudge step size from database
+        let nudge_step_cm = db.as_ref()
+            .and_then(|d| d.get_config("nudge_step_cm"))
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(5);
+
         // Load heading offset calibration from database
         let heading_offset_deg = db.as_ref()
             .and_then(|d| d.get_config("heading_offset_deg"))
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(0.0);
+
+        // Load telemetry logging toggle from database (default: off)
+        let telemetry_enabled = db.as_ref()
+            .and_then(|d| d.get_config("telemetry_enabled"))
+            .map(|v| v == "true")
+            .unwrap_or(false);
         // Push the loaded value to the shared atomic so the GPS reader uses it
         heading_offset_shared.store(
             (heading_offset_deg * 100.0).round() as i32,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        // Load antenna height for roll correction from database
+        let antenna_height_m = db.as_ref()
+            .and_then(|d| d.get_config("antenna_height_m"))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        // Push the loaded value to the shared atomic so the GPS reader uses it
+        antenna_height_shared.store(
+            (antenna_height_m * 100.0).round() as i32,
             std::sync::atomic::Ordering::Relaxed,
         );
 
@@ -290,6 +327,7 @@ impl GuidanceApp {
                 state.kd_xte = steer_kd_xte;
                 state.implement_width_m = guide_width;
                 state.overlap_m = guide_overlap;
+                state.telemetry_enabled = telemetry_enabled;
                 // Sync the loaded AB line to steer thread
                 if let Some(ab) = guide_ab_points {
                     state.ab_line = Some(ab);
@@ -310,6 +348,9 @@ impl GuidanceApp {
             was_curve_exp,
             heading_offset_shared,
             heading_offset_deg,
+            antenna_height_shared,
+            antenna_height_m,
+            nudge_step_cm,
             db,
             saved_fields,
             saved_ab_lines,
@@ -321,6 +362,7 @@ impl GuidanceApp {
             new_field_name: String::new(),
             ab_status_msg: None,
             io_status_msg: None,
+            telemetry_enabled,
         }
     }
 
@@ -401,6 +443,18 @@ impl GuidanceApp {
         );
         if let Some(db) = &self.db {
             let _ = db.set_config("heading_offset_deg", &format!("{:.1}", self.heading_offset_deg));
+        }
+    }
+
+    /// Push the current antenna height to the shared atomic (for the GPS
+    /// reader thread's roll correction) and persist to SQLite.
+    fn apply_antenna_height(&self) {
+        self.antenna_height_shared.store(
+            (self.antenna_height_m * 100.0).round() as i32,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if let Some(db) = &self.db {
+            let _ = db.set_config("antenna_height_m", &format!("{:.2}", self.antenna_height_m));
         }
     }
 }
@@ -605,11 +659,14 @@ impl GuidanceApp {
 
                     ui.separator();
 
-                    // Nudge buttons: ◄5  ◄1  [value]  1►  5►  Reset
+                    // Nudge buttons: ◄N  ◄1  [value]  1►  N►  Reset
+                    // Coarse step is configurable (nudge_step_cm), fine step is always 1cm.
+                    let step_m = self.nudge_step_cm as f64 / 100.0;
+                    let step_label = self.nudge_step_cm.to_string();
                     if ui.add(egui::Button::new(
-                        egui::RichText::new("◄5").size(24.0)
+                        egui::RichText::new(format!("◄{}", step_label)).size(24.0)
                     ).min_size(egui::vec2(64.0, 60.0))).clicked() {
-                        self.guide.nudge_left(0.05);
+                        self.guide.nudge_left(step_m);
                         self.sync_guide_to_steer_thread();
                     }
                     if ui.add(egui::Button::new(
@@ -644,9 +701,9 @@ impl GuidanceApp {
                         self.sync_guide_to_steer_thread();
                     }
                     if ui.add(egui::Button::new(
-                        egui::RichText::new("5►").size(24.0)
+                        egui::RichText::new(format!("{}►", step_label)).size(24.0)
                     ).min_size(egui::vec2(64.0, 60.0))).clicked() {
-                        self.guide.nudge_right(0.05);
+                        self.guide.nudge_right(step_m);
                         self.sync_guide_to_steer_thread();
                     }
                     if nudge_cm != 0 {
@@ -1576,19 +1633,46 @@ impl GuidanceApp {
 
                     ui.add_space(4.0);
 
-                    // Standard ±5 cm nudge buttons
-                    ui.label(egui::RichText::new("5 cm steps:").size(11.0).weak());
+                    // Step size selector
+                    ui.label(egui::RichText::new("Step size:").size(12.0));
                     ui.horizontal(|ui| {
-                        if ui.add(egui::Button::new("◄◄ 5").min_size(egui::vec2(56.0, 30.0))).clicked() {
-                            self.guide.nudge_left(0.05);
+                        for &step in &[1, 2, 5, 10, 20, 50] {
+                            let is_selected = self.nudge_step_cm == step;
+                            let label = format!("{}cm", step);
+                            let btn = egui::Button::new(
+                                egui::RichText::new(&label).size(12.0)
+                                    .color(if is_selected {
+                                        egui::Color32::from_rgb(100, 255, 100)
+                                    } else {
+                                        egui::Color32::LIGHT_GRAY
+                                    })
+                            ).min_size(egui::vec2(42.0, 28.0));
+                            if ui.add(btn).clicked() && !is_selected {
+                                self.nudge_step_cm = step;
+                                if let Some(db) = &self.db {
+                                    let _ = db.set_config("nudge_step_cm", &step.to_string());
+                                }
+                            }
+                        }
+                    });
+
+                    ui.add_space(4.0);
+
+                    // Coarse nudge buttons (use configurable step)
+                    let setup_step_m = self.nudge_step_cm as f64 / 100.0;
+                    let setup_step_label = self.nudge_step_cm.to_string();
+                    ui.label(egui::RichText::new(format!("{} cm steps:", self.nudge_step_cm)).size(11.0).weak());
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new(format!("◄◄ {}", setup_step_label)).min_size(egui::vec2(56.0, 30.0))).clicked() {
+                            self.guide.nudge_left(setup_step_m);
                             self.sync_guide_to_steer_thread();
                         }
                         if ui.add(egui::Button::new("Reset").min_size(egui::vec2(50.0, 30.0))).clicked() {
                             self.guide.nudge_reset();
                             self.sync_guide_to_steer_thread();
                         }
-                        if ui.add(egui::Button::new("5 ►►").min_size(egui::vec2(56.0, 30.0))).clicked() {
-                            self.guide.nudge_right(0.05);
+                        if ui.add(egui::Button::new(format!("{} ►►", setup_step_label)).min_size(egui::vec2(56.0, 30.0))).clicked() {
+                            self.guide.nudge_right(setup_step_m);
                             self.sync_guide_to_steer_thread();
                         }
                     });
@@ -1817,6 +1901,25 @@ impl GuidanceApp {
                             };
                             ui.label(egui::RichText::new(format!("  INS−VTG: {:+.1}°", delta)).size(12.0)
                                 .color(delta_colour));
+                        }
+
+                        // Roll/pitch from DR fusion (for roll correction verification)
+                        if fix.roll.abs() > 0.01 || fix.pitch.abs() > 0.01 {
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("Attitude (DR):").size(12.0).strong());
+                            let roll_dir = if fix.roll > 0.5 { " (R down)" } else if fix.roll < -0.5 { " (L down)" } else { "" };
+                            ui.label(egui::RichText::new(format!("  Roll:  {:+.1}°{}", fix.roll, roll_dir)).size(12.0));
+                            ui.label(egui::RichText::new(format!("  Pitch: {:+.1}°", fix.pitch)).size(12.0));
+                            if self.antenna_height_m > 0.0 {
+                                let lateral_cm = (self.antenna_height_m * fix.roll.to_radians().sin() * 100.0).round() as i32;
+                                let correction_colour = if lateral_cm.abs() > 20 {
+                                    egui::Color32::from_rgb(255, 200, 60)
+                                } else {
+                                    egui::Color32::GRAY
+                                };
+                                ui.label(egui::RichText::new(format!("  Roll correction: {} cm", lateral_cm)).size(12.0)
+                                    .color(correction_colour));
+                            }
                         }
                     }
 
@@ -2120,6 +2223,87 @@ impl GuidanceApp {
                     ui.separator();
                     ui.add_space(10.0);
 
+                    // === Antenna Height / Roll Correction Section ===
+                    // Corrects for GPS antenna being mounted high on the cab roof.
+                    // When the tractor rolls on a slope, the antenna swings
+                    // laterally by antenna_height * sin(roll). Setting the correct
+                    // height enables automatic compensation via the DR roll data.
+                    ui.label(egui::RichText::new("ROLL CORRECTION").size(14.0).strong());
+                    ui.add_space(4.0);
+
+                    let height_colour = if self.antenna_height_m < 0.01 {
+                        egui::Color32::GRAY
+                    } else {
+                        egui::Color32::from_rgb(100, 200, 255)
+                    };
+                    ui.label(
+                        egui::RichText::new(format!("{:.2} m", self.antenna_height_m))
+                            .size(24.0).strong().color(height_colour)
+                    );
+                    if self.antenna_height_m < 0.01 {
+                        ui.label(egui::RichText::new("Roll correction disabled").size(11.0).weak());
+                    }
+
+                    ui.add_space(4.0);
+
+                    // Coarse adjustment (±0.5m)
+                    ui.label(egui::RichText::new("Coarse (±0.5m):").size(11.0).weak());
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new("-0.5").min_size(egui::vec2(55.0, 30.0))).clicked() {
+                            self.antenna_height_m = (self.antenna_height_m - 0.5).max(0.0);
+                            self.apply_antenna_height();
+                        }
+                        if ui.add(egui::Button::new("Off").min_size(egui::vec2(45.0, 30.0))).clicked() {
+                            self.antenna_height_m = 0.0;
+                            self.apply_antenna_height();
+                        }
+                        if ui.add(egui::Button::new("+0.5").min_size(egui::vec2(55.0, 30.0))).clicked() {
+                            self.antenna_height_m = (self.antenna_height_m + 0.5).min(6.0);
+                            self.apply_antenna_height();
+                        }
+                    });
+
+                    ui.add_space(2.0);
+
+                    // Fine adjustment (±0.1m)
+                    ui.label(egui::RichText::new("Fine (±0.1m):").size(11.0).weak());
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new("-0.1").min_size(egui::vec2(55.0, 30.0))).clicked() {
+                            self.antenna_height_m = (self.antenna_height_m - 0.1).max(0.0);
+                            self.apply_antenna_height();
+                        }
+                        ui.add_space(45.0);
+                        if ui.add(egui::Button::new("+0.1").min_size(egui::vec2(55.0, 30.0))).clicked() {
+                            self.antenna_height_m = (self.antenna_height_m + 0.1).min(6.0);
+                            self.apply_antenna_height();
+                        }
+                    });
+
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(
+                        "Antenna height above axle. Measure from\nground to GPS antenna on the roof."
+                    ).size(11.0).weak());
+
+                    // Show live roll correction when active
+                    if self.antenna_height_m > 0.0 {
+                        if let Some(fix) = &self.current_fix {
+                            let lateral_cm = (self.antenna_height_m * fix.roll.to_radians().sin() * 100.0).round() as i32;
+                            let roll_colour = if lateral_cm.abs() > 20 {
+                                egui::Color32::from_rgb(255, 200, 60)
+                            } else {
+                                egui::Color32::from_rgb(100, 200, 100)
+                            };
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new(
+                                format!("Live: roll {:+.1}° → {} cm correction", fix.roll, lateral_cm)
+                            ).size(12.0).color(roll_colour));
+                        }
+                    }
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+
                     // === Motor Direction Section ===
                     ui.label(egui::RichText::new("MOTOR DIRECTION").size(14.0).strong());
                     ui.add_space(4.0);
@@ -2329,6 +2513,33 @@ impl GuidanceApp {
                     );
                     cur_deadband_m = deadband_cm / 100.0;
 
+                    ui.add_space(6.0);
+
+                    // Telemetry logging toggle
+                    let telem_label = if self.telemetry_enabled {
+                        "Telemetry Logging \u{2713}"
+                    } else {
+                        "Telemetry Logging \u{2717}"
+                    };
+                    let telem_colour = if self.telemetry_enabled {
+                        egui::Color32::from_rgb(60, 200, 60)
+                    } else {
+                        egui::Color32::GRAY
+                    };
+                    if ui.add(egui::Button::new(
+                        egui::RichText::new(telem_label).size(13.0).color(telem_colour)
+                    ).min_size(egui::vec2(160.0, 30.0))).clicked() {
+                        self.telemetry_enabled = !self.telemetry_enabled;
+                        if let Some(db) = &self.db {
+                            let _ = db.set_config("telemetry_enabled",
+                                if self.telemetry_enabled { "true" } else { "false" }
+                            );
+                        }
+                    }
+                    ui.label(egui::RichText::new(
+                        "Writes .jsonl steer logs when engaged\n(disable to reduce CPU/disk load)"
+                    ).size(11.0).weak());
+
                     // Write all tuning params back to shared state
                     {
                         let mut state = self.steer_state.lock().unwrap();
@@ -2338,6 +2549,7 @@ impl GuidanceApp {
                         state.max_steer_angle = cur_max_angle;
                         state.kd_xte = cur_kd_xte;
                         state.deadband_m = cur_deadband_m;
+                        state.telemetry_enabled = self.telemetry_enabled;
                     }
 
                     ui.add_space(10.0);

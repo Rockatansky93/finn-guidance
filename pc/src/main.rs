@@ -59,11 +59,17 @@ fn main() {
     // for now start at 0.0 and let the app update it.
     let heading_offset = gps::reader::new_shared_heading_offset(0.0);
 
+    // Shared antenna height — GPS reader uses it for roll correction.
+    // Initial value loaded from SQLite in the app constructor;
+    // for now start at 0.0 (disabled) and let the app update it.
+    let antenna_height = gps::reader::new_shared_antenna_height(0.0);
+
     // Start GPS serial reader thread
     // Decision #026: reads directly from LC29H BA (no sensor ESP32)
     // Sends fixes to BOTH the GUI and steer thread channels.
     let drop_counters_gps = drop_counters.clone();
     let heading_offset_gps = heading_offset.clone();
+    let antenna_height_gps = antenna_height.clone();
     thread::spawn(move || {
         gps::reader::run_gps_reader(
             gps::reader::GpsConfig::default(),
@@ -72,6 +78,7 @@ fn main() {
             port_tx,
             drop_counters_gps,
             heading_offset_gps,
+            antenna_height_gps,
         );
     });
     tracing::info!("GPS serial reader thread launched");
@@ -131,6 +138,7 @@ fn main() {
                 steer_state,
                 12.0,
                 heading_offset,
+                antenna_height,
             )))
         }),
     );

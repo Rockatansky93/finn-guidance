@@ -23,6 +23,7 @@
 use nmea::Nmea;
 use nmea::sentences::FixType;
 use finn_guidance_common::types::{DrCalState, FixQuality, GpsFix};
+use finn_guidance_common::coords;
 
 pub struct NmeaState {
     nmea: Nmea,
@@ -42,6 +43,22 @@ pub struct NmeaState {
     /// misalignment. Positive = clockwise correction (rotate heading right).
     pub heading_offset_deg: f64,
 
+    // === Roll/pitch from PQTMINS (for antenna roll correction) ===
+    /// EMA-smoothed roll in degrees (positive = right side down).
+    /// Smoothing eliminates cab bounce noise from the raw DR roll.
+    smoothed_roll: f64,
+    /// Raw pitch from last PQTMINS (positive = nose up).
+    last_pitch: f64,
+    /// Whether we've received at least one PQTMINS with valid roll/pitch.
+    has_ins_attitude: bool,
+    /// EMA alpha for roll smoothing (0..1, lower = smoother).
+    /// Default 0.15 gives ~1s settling at 10Hz updates — enough to
+    /// remove cab bounce without lagging slope transitions.
+    roll_ema_alpha: f64,
+    /// Antenna height above ground in metres. Used to compute the lateral
+    /// offset from roll: offset = antenna_height * sin(roll). Set via GUI.
+    pub antenna_height_m: f64,
+
     // === Diagnostic heading sources (for GUI comparison display) ===
     /// Last raw VTG heading before offset applied (NaN if no VTG received)
     pub last_vtg_heading: f64,
@@ -59,6 +76,11 @@ impl NmeaState {
             dr_cal_state: DrCalState::Uncalibrated,
             last_gga_time_ms: 0,
             heading_offset_deg: 0.0,
+            smoothed_roll: 0.0,
+            last_pitch: 0.0,
+            has_ins_attitude: false,
+            roll_ema_alpha: 0.15,
+            antenna_height_m: 0.0,
             last_vtg_heading: f64::NAN,
             last_ins_heading: f64::NAN,
         }
@@ -159,6 +181,24 @@ impl NmeaState {
             self.last_speed = speed;
         }
 
+        // Field 10 (index 10): Roll in degrees (positive = right side down)
+        if let Ok(roll) = parts[10].parse::<f64>() {
+            if !self.has_ins_attitude {
+                // First sample — seed the EMA directly (no smoothing on init)
+                self.smoothed_roll = roll;
+                self.has_ins_attitude = true;
+            } else {
+                // EMA: smoothed = alpha * new + (1 - alpha) * previous
+                self.smoothed_roll = self.roll_ema_alpha * roll
+                    + (1.0 - self.roll_ema_alpha) * self.smoothed_roll;
+            }
+        }
+
+        // Field 11 (index 11): Pitch in degrees (positive = nose up)
+        if let Ok(pitch) = parts[11].parse::<f64>() {
+            self.last_pitch = pitch;
+        }
+
         // Field 12 (index 12): Heading in degrees (0-360)
         if let Ok(heading) = parts[12].parse::<f64>() {
             self.last_ins_heading = heading;
@@ -206,10 +246,6 @@ impl NmeaState {
         let now_ms = chrono::Utc::now().timestamp_millis() as u64;
         self.last_gga_time_ms = now_ms;
 
-        // Reset the INS heading flag after building the fix —
-        // next epoch starts fresh, VTG will be used unless a new
-        // PQTMINS arrives before the next GGA.
-
         // Apply heading offset calibration. This corrects for GPS
         // antenna/module mounting misalignment. The offset is added
         // to the raw heading so all downstream consumers (guidance,
@@ -218,9 +254,34 @@ impl NmeaState {
             self.last_heading + self.heading_offset_deg
         );
 
+        // === Roll correction: shift antenna position to ground-truth ===
+        // The GPS antenna is mounted on the cab roof at `antenna_height_m`
+        // above the axle. When the tractor rolls, the antenna swings
+        // laterally by `antenna_height * sin(roll)`. We subtract this
+        // offset to get the position at ground/axle level.
+        //
+        // Convention: positive roll = right side down. When the right
+        // side is down, the antenna moves LEFT relative to the heading.
+        // We correct by shifting the position RIGHT (perpendicular
+        // clockwise from heading), i.e. bearing = heading + 90°.
+        let (corrected_lat, corrected_lon) = if self.has_ins_attitude
+            && self.antenna_height_m > 0.0
+            && self.smoothed_roll.abs() > 0.1  // Skip tiny roll (< 0.1°)
+        {
+            let lateral_offset_m = self.antenna_height_m
+                * self.smoothed_roll.to_radians().sin();
+            // Shift perpendicular to heading: heading + 90° = rightward.
+            // lateral_offset_m is positive when roll is positive (right down),
+            // meaning the antenna moved left, so we correct rightward.
+            let correction_bearing = normalise_heading(corrected_heading + 90.0);
+            apply_offset(lat, lon, correction_bearing, lateral_offset_m)
+        } else {
+            (lat, lon)
+        };
+
         let fix = GpsFix {
-            latitude: lat,
-            longitude: lon,
+            latitude: corrected_lat,
+            longitude: corrected_lon,
             altitude: self.nmea.altitude.unwrap_or(0.0) as f64,
             speed: self.last_speed,
             heading: corrected_heading,
@@ -228,10 +289,15 @@ impl NmeaState {
             satellites: self.nmea.num_of_fix_satellites.unwrap_or(0) as u8,
             hdop: self.nmea.hdop.unwrap_or(99.9) as f64,
             timestamp_ms: now_ms,
+            roll: self.smoothed_roll,
+            pitch: self.last_pitch,
             diag_vtg_heading: self.last_vtg_heading,
             diag_ins_heading: self.last_ins_heading,
         };
 
+        // Reset the INS heading flag after building the fix —
+        // next epoch starts fresh, VTG will be used unless a new
+        // PQTMINS arrives before the next GGA.
         self.heading_from_ins = false;
 
         Some(fix)
@@ -247,4 +313,26 @@ fn normalise_heading(mut heading: f64) -> f64 {
         heading += 360.0;
     }
     heading
+}
+
+/// Apply a lateral offset to a lat/lon position along a given bearing.
+/// Uses the same spherical earth model as the rest of our coord math.
+/// Returns (new_lat, new_lon) in degrees.
+fn apply_offset(lat: f64, lon: f64, bearing_deg: f64, distance_m: f64) -> (f64, f64) {
+    const EARTH_RADIUS: f64 = 6_371_000.0;
+
+    let lat_r = coords::deg_to_rad(lat);
+    let lon_r = coords::deg_to_rad(lon);
+    let brg_r = coords::deg_to_rad(bearing_deg);
+    let angular_dist = distance_m / EARTH_RADIUS;
+
+    let new_lat_r = (lat_r.sin() * angular_dist.cos()
+        + lat_r.cos() * angular_dist.sin() * brg_r.cos())
+    .asin();
+
+    let new_lon_r = lon_r
+        + (brg_r.sin() * angular_dist.sin() * lat_r.cos())
+            .atan2(angular_dist.cos() - lat_r.sin() * new_lat_r.sin());
+
+    (coords::rad_to_deg(new_lat_r), coords::rad_to_deg(new_lon_r))
 }
