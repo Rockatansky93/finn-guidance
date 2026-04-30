@@ -1,7 +1,12 @@
 # DR Remediation Strategy
 
+<<<<<<< HEAD
 > **Status:** Probe complete. Steps 1-3 implemented in code/docs. Ready for
 > Step 4 bench validation, then Step 5 calibration drive.
+=======
+> **Status:** Probe complete. Findings recorded in §Probe Results. Ready to
+> execute Steps 1-6.
+>>>>>>> 2d76a032fb7718830f70282e76cdd26e9539710b
 > **Date:** 30 April 2026 (drafted), 30 April 2026 (probe results added)
 > **Owner:** Tom + Claude (this session)
 > **Triggering issue:** Roll compensation read zero in the field (Jamestown,
@@ -306,8 +311,11 @@ whether the existing "Decision #026" comment block in `reader.rs` is being
 superseded (it is). This locks in the architectural choice before we touch
 code, so a future session doesn't second-guess it.
 
+<<<<<<< HEAD
 **Implemented:** Decision #028 added to `docs/DECISIONS.md`.
 
+=======
+>>>>>>> 2d76a032fb7718830f70282e76cdd26e9539710b
 ### Step 2 — Fix `pc/src/gps/reader.rs`
 
 Edits, in this order, all via `codesnip:edit_snippet`:
@@ -335,11 +343,14 @@ Edits, in this order, all via `codesnip:edit_snippet`:
 After this step, the module should be emitting PQTMINS and PQTMIMU at
 boot. Verify with the probe before touching the parser.
 
+<<<<<<< HEAD
 **Implemented:** `reader.rs` now uses numeric Type=1, enables PQTMINS and
 PQTMIMU at 10Hz, asserts `$PAIR6010,2,1`, logs known ack shapes, skips DR
 config writes when PQTMINS is already streaming, saves to NVS, and avoids
 runtime `$PAIR007`.
 
+=======
+>>>>>>> 2d76a032fb7718830f70282e76cdd26e9539710b
 ### Step 3 — Fix `pc/src/gps/parser.rs`
 
 Four changes:
@@ -383,11 +394,14 @@ Unit-test with sample sentences from the spec (§3.1.6 example) and from
 the probe's outdoor capture
 (`$PQTMINS,775312,1,-33.27565284,138.59023261,414.533028,0.378698,-0.717217,0.024944,0.00,0.00,336.60`).
 
+<<<<<<< HEAD
 **Implemented:** `parser.rs` now uses the confirmed NR11 field offsets, keeps
 position sourced from GGA, derives speed from north/east velocity, reads
 roll/pitch at SolType 0, and trusts PQTMINS heading at SolType >= 1. Unit tests
 cover the outdoor sample shape and SolType 0 attitude handling.
 
+=======
+>>>>>>> 2d76a032fb7718830f70282e76cdd26e9539710b
 ### Step 4 — Bench validation
 
 Re-run the probe and confirm:
