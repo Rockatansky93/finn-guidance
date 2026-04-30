@@ -20,12 +20,12 @@
 //! hit the filesystem. The buffer is flushed every second alongside the
 //! summary record, and on close.
 
+use chrono::Local;
+use serde::Serialize;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::time::Instant;
-use chrono::Local;
-use serde::Serialize;
 
 // ─────────────────────────────────────────────────────────────────────
 // Log record types — serialised as JSON, one per line
@@ -230,8 +230,16 @@ impl SummaryAccumulator {
             t_ms,
             mean_xte_m: self.xte_sum / n,
             max_xte_abs_m: self.xte_abs_max,
-            min_xte_m: if self.xte_min == f64::MAX { 0.0 } else { self.xte_min },
-            max_xte_m: if self.xte_max == f64::MIN { 0.0 } else { self.xte_max },
+            min_xte_m: if self.xte_min == f64::MAX {
+                0.0
+            } else {
+                self.xte_min
+            },
+            max_xte_m: if self.xte_max == f64::MIN {
+                0.0
+            } else {
+                self.xte_max
+            },
             mean_angle_err: self.angle_err_sum / n,
             corrections: self.corrections,
             mean_desired_angle: self.desired_angle_sum / n,
@@ -313,7 +321,11 @@ impl TelemetryLogger {
         // Create logs/ directory next to the executable
         let log_dir = Self::log_directory();
         if let Err(e) = fs::create_dir_all(&log_dir) {
-            tracing::error!("Failed to create telemetry log directory {:?}: {}", log_dir, e);
+            tracing::error!(
+                "Failed to create telemetry log directory {:?}: {}",
+                log_dir,
+                e
+            );
             return None;
         }
 
@@ -450,11 +462,14 @@ impl TelemetryLogger {
 impl Drop for TelemetryLogger {
     fn drop(&mut self) {
         // Write a final disengage event if we haven't already
-        self.log_event("log_close", Some(format!(
-            "iterations={} elapsed_s={:.1}",
-            self.iteration_count,
-            self.run_start.elapsed().as_secs_f64(),
-        )));
+        self.log_event(
+            "log_close",
+            Some(format!(
+                "iterations={} elapsed_s={:.1}",
+                self.iteration_count,
+                self.run_start.elapsed().as_secs_f64(),
+            )),
+        );
 
         let _ = self.writer.flush();
         tracing::info!(

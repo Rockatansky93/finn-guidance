@@ -38,19 +38,19 @@
 //! `logs/` next to the executable and are designed for post-run analysis —
 //! either manually or via a FINN Core worker node for tuning recommendations.
 
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use crossbeam_channel::Receiver;
-use finn_guidance_common::types::GpsFix;
-use finn_guidance_common::protocol::FinnMessage;
 use crate::comms::serial::MotorHandle;
 use crate::guidance::ab_line::AbLineGuide;
 use crate::guidance::steering::SteeringController;
 use crate::position::interpolator::PositionInterpolator;
 use crate::telemetry::logger::{
-    TelemetryLogger, TuningSnapshot, IterRecord, DropCounts, fix_quality_to_u8,
+    fix_quality_to_u8, DropCounts, IterRecord, TelemetryLogger, TuningSnapshot,
 };
 use crate::telemetry::SharedDropCounters;
+use crossbeam_channel::Receiver;
+use finn_guidance_common::protocol::FinnMessage;
+use finn_guidance_common::types::GpsFix;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Fixed loop interval — 10Hz matches the LC29H BA GPS output rate.
 const STEER_LOOP_INTERVAL: Duration = Duration::from_millis(100);
@@ -274,9 +274,7 @@ pub fn run_steer_thread(
                         last_logged_pass = state.pass_number;
 
                         if let Some(ref mut tl) = telemetry {
-                            tl.log_event("engage", Some(format!(
-                                "pass={}", state.pass_number
-                            )));
+                            tl.log_event("engage", Some(format!("pass={}", state.pass_number)));
                         }
                     }
                     SteerCommand::Disengage => {
@@ -333,9 +331,10 @@ pub fn run_steer_thread(
         // Log pass changes
         if current_pass != last_logged_pass {
             if let Some(ref mut tl) = telemetry {
-                tl.log_event("pass_change", Some(format!(
-                    "from={} to={}", last_logged_pass, current_pass
-                )));
+                tl.log_event(
+                    "pass_change",
+                    Some(format!("from={} to={}", last_logged_pass, current_pass)),
+                );
             }
             last_logged_pass = current_pass;
         }
@@ -348,16 +347,15 @@ pub fn run_steer_thread(
 
             if steering.engaged {
                 if let Some(ref err) = error {
-                    let (desired_angle, disengaged) = steering.compute(
-                        err.distance_m,
-                        err.heading_error,
-                        interp_fix.speed,
-                    );
+                    let (desired_angle, disengaged) =
+                        steering.compute(err.distance_m, err.heading_error, interp_fix.speed);
 
                     if disengaged {
                         // Safety disengage — send zero immediately
                         let _ = motor_handle.send_steer_angle(0.0);
-                        let reason = steering.disengage_reason.clone()
+                        let reason = steering
+                            .disengage_reason
+                            .clone()
                             .unwrap_or_else(|| "Unknown".to_string());
                         tracing::warn!("Steer thread: safety disengage — {}", reason);
 

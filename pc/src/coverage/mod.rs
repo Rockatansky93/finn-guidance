@@ -14,5 +14,5 @@
 //!
 //! Each engage/disengage cycle creates a segment within the current job.
 
-pub mod logger;
 pub mod db;
+pub mod logger;

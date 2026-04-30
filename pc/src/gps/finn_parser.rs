@@ -9,8 +9,8 @@
 //! Standard NMEA sentences (GPS) are handled by `parser.rs` — this module
 //! only deals with FINN-prefixed messages.
 
-use finn_guidance_common::types::{MotorStatus, ConfigAck};
-use finn_guidance_common::protocol::{FinnMessage, nmea_checksum};
+use finn_guidance_common::protocol::{nmea_checksum, FinnMessage};
+use finn_guidance_common::types::{ConfigAck, MotorStatus};
 
 /// Try to parse a single line as a FINN sentence.
 ///
@@ -35,7 +35,9 @@ pub fn parse_finn_sentence(line: &str) -> Option<FinnMessage> {
     if actual_cs != expected_cs {
         tracing::debug!(
             "FINN checksum mismatch: expected {:02X}, got {:02X} for '{}'",
-            expected_cs, actual_cs, body
+            expected_cs,
+            actual_cs,
+            body
         );
         return None;
     }
@@ -93,10 +95,7 @@ fn parse_config_ack(fields: &str) -> Option<FinnMessage> {
     let param = parts[0].to_string();
     let success = parts[1] == "OK";
 
-    Some(FinnMessage::ConfigAck(ConfigAck {
-        param,
-        success,
-    }))
+    Some(FinnMessage::ConfigAck(ConfigAck { param, success }))
 }
 
 #[cfg(test)]
@@ -175,7 +174,8 @@ mod tests {
 
     #[test]
     fn test_nmea_ignored() {
-        let msg = parse_finn_sentence("$GNGGA,123456.00,3456.789,S,13856.789,E,1,12,0.8,100.0,M,,,,*XX");
+        let msg =
+            parse_finn_sentence("$GNGGA,123456.00,3456.789,S,13856.789,E,1,12,0.8,100.0,M,,,,*XX");
         assert!(msg.is_none());
     }
 

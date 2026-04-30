@@ -28,8 +28,10 @@ impl PositionTracker {
         // Calculate distance from last position for odometer
         if let Some(prev) = &self.current {
             let dist = finn_guidance_common::coords::haversine_distance(
-                prev.latitude, prev.longitude,
-                fix.latitude, fix.longitude,
+                prev.latitude,
+                prev.longitude,
+                fix.latitude,
+                fix.longitude,
             );
             // Only add to odometer if distance is plausible (< 10m per update, filters GPS jumps)
             if dist < 10.0 {

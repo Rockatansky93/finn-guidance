@@ -4,24 +4,24 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum FixQuality {
     NoFix,
-    Gps,       // Standard GPS
-    Dgps,      // Differential GPS
-    Rtk,       // RTK Fixed - centimetre accuracy
-    RtkFloat,  // RTK Float - decimetre accuracy
+    Gps,      // Standard GPS
+    Dgps,     // Differential GPS
+    Rtk,      // RTK Fixed - centimetre accuracy
+    RtkFloat, // RTK Float - decimetre accuracy
 }
 
 /// A GPS position fix with all relevant data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpsFix {
-    pub latitude: f64,       // Degrees (negative = south)
-    pub longitude: f64,      // Degrees (negative = west)
-    pub altitude: f64,       // Metres above sea level
-    pub speed: f64,          // m/s
-    pub heading: f64,        // Degrees from true north (0-360), with offset applied
+    pub latitude: f64,  // Degrees (negative = south)
+    pub longitude: f64, // Degrees (negative = west)
+    pub altitude: f64,  // Metres above sea level
+    pub speed: f64,     // m/s
+    pub heading: f64,   // Degrees from true north (0-360), with offset applied
     pub fix_quality: FixQuality,
     pub satellites: u8,
-    pub hdop: f64,           // Horizontal dilution of precision
-    pub timestamp_ms: u64,   // Milliseconds since epoch
+    pub hdop: f64,         // Horizontal dilution of precision
+    pub timestamp_ms: u64, // Milliseconds since epoch
 
     // === Roll/pitch from PQTMINS DR fusion (for roll correction) ===
     /// Vehicle roll in degrees (positive = right side down). EMA-smoothed.
@@ -41,15 +41,19 @@ pub struct GpsFix {
     pub diag_ins_heading: f64,
 }
 
-fn f64_nan() -> f64 { f64::NAN }
-fn f64_zero() -> f64 { 0.0 }
+fn f64_nan() -> f64 {
+    f64::NAN
+}
+fn f64_zero() -> f64 {
+    0.0
+}
 
 /// IMU orientation data from BNO055
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImuData {
-    pub roll: f64,    // Degrees, positive = right side down
-    pub pitch: f64,   // Degrees, positive = nose up
-    pub heading: f64, // Degrees from magnetic north
+    pub roll: f64,     // Degrees, positive = right side down
+    pub pitch: f64,    // Degrees, positive = nose up
+    pub heading: f64,  // Degrees from magnetic north
     pub cal_sys: u8,   // System calibration 0-3
     pub cal_gyro: u8,  // Gyro calibration 0-3
     pub cal_accel: u8, // Accelerometer calibration 0-3
@@ -59,9 +63,9 @@ pub struct ImuData {
 /// Wheel angle sensor reading
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WasReading {
-    pub raw_value: u16,   // Raw ADC value (0-4095 on ESP32)
-    pub voltage_mv: u16,  // Millivolts (0-3300)
-    pub angle_deg: f64,   // Calibrated angle in degrees (negative = left, positive = right)
+    pub raw_value: u16,  // Raw ADC value (0-4095 on ESP32)
+    pub voltage_mv: u16, // Millivolts (0-3300)
+    pub angle_deg: f64,  // Calibrated angle in degrees (negative = left, positive = right)
 }
 
 /// ESP32 heartbeat
@@ -73,9 +77,9 @@ pub struct EspHeartbeat {
 /// Motor controller status (from motor ESP32, includes WAS feedback)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MotorStatus {
-    pub current_pwm: i16,   // -255 to 255
-    pub was_raw: u16,       // Raw ADC value from WAS pot
-    pub actual_angle: f64,  // Calibrated angle in degrees (from ESP32)
+    pub current_pwm: i16,  // -255 to 255
+    pub was_raw: u16,      // Raw ADC value from WAS pot
+    pub actual_angle: f64, // Calibrated angle in degrees (from ESP32)
     pub enabled: bool,
     pub uptime_ms: u64,
 }
@@ -83,15 +87,15 @@ pub struct MotorStatus {
 /// DR (dead reckoning) calibration state from LC29H BA
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum DrCalState {
-    Uncalibrated,  // CalState 0 — drive >3 m/s with turns to calibrate
-    Calibrating,   // CalState 1 — calibration in progress
-    Calibrated,    // CalState 2 — DR fully operational
+    Uncalibrated, // CalState 0 — drive >3 m/s with turns to calibrate
+    Calibrating,  // CalState 1 — calibration in progress
+    Calibrated,   // CalState 2 — DR fully operational
 }
 
 /// Config acknowledgement from motor ESP32
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigAck {
-    pub param: String,   // "WAS", "PID", "INVERT"
+    pub param: String, // "WAS", "PID", "INVERT"
     pub success: bool,
 }
 
@@ -118,6 +122,6 @@ pub enum GuidanceLine {
 /// Cross-track error: how far off the guidance line we are
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrossTrackError {
-    pub distance_m: f64,   // Metres from line (negative = left, positive = right)
+    pub distance_m: f64,    // Metres from line (negative = left, positive = right)
     pub heading_error: f64, // Degrees difference from desired heading
 }

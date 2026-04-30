@@ -20,10 +20,10 @@
 //! contains the position). VTG/PQTMINS data is accumulated and included
 //! in the next emitted fix.
 
-use nmea::Nmea;
-use nmea::sentences::FixType;
-use finn_guidance_common::types::{DrCalState, FixQuality, GpsFix};
 use finn_guidance_common::coords;
+use finn_guidance_common::types::{DrCalState, FixQuality, GpsFix};
+use nmea::sentences::FixType;
+use nmea::Nmea;
 
 pub struct NmeaState {
     nmea: Nmea,
@@ -146,14 +146,14 @@ impl NmeaState {
         }
     }
 
-    /// Parse $PQTMINS sentence — DR-fused navigation solution from LC29H BA.
+    /// Parse $PQTMINS sentence — DR-fused attitude/velocity from LC29H BA.
     ///
-    /// Format: $PQTMINS,<MsgVer>,<TOW>,<InsNavType>,<Lat>,<Lon>,<Alt>,
-    ///         <AltMSL>,<Speed2D>,<Speed3D>,<Roll>,<Pitch>,<Heading>,
-    ///         <HACC>,<HDOP>,<PDOP>,<NumSV>*<checksum>
+    /// Confirmed NR11 two-wheel firmware format:
+    /// `$PQTMINS,<Timestamp>,<SolType>,<Lat>,<Lon>,<Height>,
+    /// <VEL_N>,<VEL_E>,<VEL_D>,<Roll>,<Pitch>,<Heading>*<checksum>`
     ///
-    /// We extract heading and speed from this. The heading is gyro-stabilised
-    /// and remains accurate at low speed where VTG heading degrades.
+    /// Position still comes from GGA. PQTMINS is used for roll/pitch, heading
+    /// when available, and scalar speed derived from north/east velocity.
     fn parse_pqtmins(&mut self, sentence: &str) {
         // Strip checksum for parsing
         let body = if let Some(star) = sentence.find('*') {
@@ -163,47 +163,49 @@ impl NmeaState {
         };
 
         let parts: Vec<&str> = body.split(',').collect();
-        // Need at least 13 fields: $PQTMINS + MsgVer + TOW + InsNavType + Lat + Lon
-        //   + Alt + AltMSL + Speed2D + Speed3D + Roll + Pitch + Heading = 13
-        if parts.len() < 13 {
+        // Need: $PQTMINS + 11 fields through Heading.
+        if parts.len() < 12 {
             return;
         }
 
-        // Field 3 (index 3): InsNavType — check it's a valid solution
-        // 0 = no solution, 1 = GNSS only, 2 = DR only, 3 = combined GNSS+DR
-        let nav_type: u8 = parts[3].parse().unwrap_or(0);
-        if nav_type == 0 {
-            return; // No valid solution
+        // Field 2 (index 2): SolType.
+        // 0 = DR not ready, roll/pitch ready only
+        // 1 = DR not ready, GNSS + roll/pitch + relative heading ready
+        // 2 = GNSS + DR calibrated
+        // 3 = DR only
+        let sol_type: u8 = parts[2].parse().unwrap_or(0);
+
+        // Fields 6/7: north/east velocity in m/s. PQTMINS has no scalar speed.
+        if let (Ok(vel_n), Ok(vel_e)) = (parts[6].parse::<f64>(), parts[7].parse::<f64>()) {
+            self.last_speed = (vel_n * vel_n + vel_e * vel_e).sqrt();
         }
 
-        // Field 8 (index 8): Speed2D in m/s
-        if let Ok(speed) = parts[8].parse::<f64>() {
-            self.last_speed = speed;
-        }
-
-        // Field 10 (index 10): Roll in degrees (positive = right side down)
-        if let Ok(roll) = parts[10].parse::<f64>() {
+        // Fields 9/10: roll/pitch in degrees. Do not bail on SolType=0:
+        // that state can still provide useful roll/pitch before heading is ready.
+        if let Ok(roll) = parts[9].parse::<f64>() {
             if !self.has_ins_attitude {
                 // First sample — seed the EMA directly (no smoothing on init)
                 self.smoothed_roll = roll;
                 self.has_ins_attitude = true;
             } else {
                 // EMA: smoothed = alpha * new + (1 - alpha) * previous
-                self.smoothed_roll = self.roll_ema_alpha * roll
-                    + (1.0 - self.roll_ema_alpha) * self.smoothed_roll;
+                self.smoothed_roll =
+                    self.roll_ema_alpha * roll + (1.0 - self.roll_ema_alpha) * self.smoothed_roll;
             }
         }
 
-        // Field 11 (index 11): Pitch in degrees (positive = nose up)
-        if let Ok(pitch) = parts[11].parse::<f64>() {
+        if let Ok(pitch) = parts[10].parse::<f64>() {
             self.last_pitch = pitch;
         }
 
-        // Field 12 (index 12): Heading in degrees (0-360)
-        if let Ok(heading) = parts[12].parse::<f64>() {
-            self.last_ins_heading = heading;
-            self.last_heading = heading;
-            self.heading_from_ins = true;
+        // Field 11: heading in degrees. SolType=0 does not have a reliable
+        // heading yet, so keep VTG/current heading until SolType >= 1.
+        if sol_type >= 1 {
+            if let Ok(heading) = parts[11].parse::<f64>() {
+                self.last_ins_heading = heading;
+                self.last_heading = heading;
+                self.heading_from_ins = true;
+            }
         }
     }
 
@@ -250,9 +252,7 @@ impl NmeaState {
         // antenna/module mounting misalignment. The offset is added
         // to the raw heading so all downstream consumers (guidance,
         // steering, field view) see the corrected value.
-        let corrected_heading = normalise_heading(
-            self.last_heading + self.heading_offset_deg
-        );
+        let corrected_heading = normalise_heading(self.last_heading + self.heading_offset_deg);
 
         // === Roll correction: shift antenna position to ground-truth ===
         // The GPS antenna is mounted on the cab roof at `antenna_height_m`
@@ -266,10 +266,10 @@ impl NmeaState {
         // clockwise from heading), i.e. bearing = heading + 90°.
         let (corrected_lat, corrected_lon) = if self.has_ins_attitude
             && self.antenna_height_m > 0.0
-            && self.smoothed_roll.abs() > 0.1  // Skip tiny roll (< 0.1°)
+            && self.smoothed_roll.abs() > 0.1
+        // Skip tiny roll (< 0.1°)
         {
-            let lateral_offset_m = self.antenna_height_m
-                * self.smoothed_roll.to_radians().sin();
+            let lateral_offset_m = self.antenna_height_m * self.smoothed_roll.to_radians().sin();
             // Shift perpendicular to heading: heading + 90° = rightward.
             // lateral_offset_m is positive when roll is positive (right down),
             // meaning the antenna moved left, so we correct rightward.
@@ -326,13 +326,53 @@ fn apply_offset(lat: f64, lon: f64, bearing_deg: f64, distance_m: f64) -> (f64, 
     let brg_r = coords::deg_to_rad(bearing_deg);
     let angular_dist = distance_m / EARTH_RADIUS;
 
-    let new_lat_r = (lat_r.sin() * angular_dist.cos()
-        + lat_r.cos() * angular_dist.sin() * brg_r.cos())
-    .asin();
+    let new_lat_r =
+        (lat_r.sin() * angular_dist.cos() + lat_r.cos() * angular_dist.sin() * brg_r.cos()).asin();
 
     let new_lon_r = lon_r
         + (brg_r.sin() * angular_dist.sin() * lat_r.cos())
             .atan2(angular_dist.cos() - lat_r.sin() * new_lat_r.sin());
 
     (coords::rad_to_deg(new_lat_r), coords::rad_to_deg(new_lon_r))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NmeaState;
+
+    #[test]
+    fn pqtmins_uses_confirmed_nr11_field_offsets() {
+        let mut state = NmeaState::new();
+
+        state.parse_pqtmins(
+            "$PQTMINS,775312,1,-33.27565284,138.59023261,414.533028,\
+             0.378698,-0.717217,0.024944,1.25,-2.50,336.60*00",
+        );
+
+        assert!((state.last_speed - 0.811).abs() < 0.001);
+        assert!((state.smoothed_roll - 1.25).abs() < f64::EPSILON);
+        assert!((state.last_pitch + 2.50).abs() < f64::EPSILON);
+        assert!((state.last_ins_heading - 336.60).abs() < f64::EPSILON);
+        assert!((state.last_heading - 336.60).abs() < f64::EPSILON);
+        assert!(state.heading_from_ins);
+        assert!(state.has_ins_attitude);
+    }
+
+    #[test]
+    fn pqtmins_soltype_zero_keeps_roll_pitch_but_not_heading() {
+        let mut state = NmeaState::new();
+        state.last_heading = 123.4;
+
+        state.parse_pqtmins(
+            "$PQTMINS,775312,0,0.00000000,0.00000000,0.000000,\
+             0.000000,0.000000,0.000000,3.00,4.00,270.00*00",
+        );
+
+        assert!((state.smoothed_roll - 3.00).abs() < f64::EPSILON);
+        assert!((state.last_pitch - 4.00).abs() < f64::EPSILON);
+        assert!((state.last_heading - 123.4).abs() < f64::EPSILON);
+        assert!(state.last_ins_heading.is_nan());
+        assert!(!state.heading_from_ins);
+        assert!(state.has_ins_attitude);
+    }
 }

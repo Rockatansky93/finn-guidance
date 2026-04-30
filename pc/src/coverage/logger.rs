@@ -19,9 +19,9 @@
 //! GPS fix → filter → write buffer → batch insert to SQLite (every 50 points)
 //!                                  → append to render cache (for field_view)
 
-use finn_guidance_common::types::{GpsFix, FixQuality};
-use finn_guidance_common::coords;
 use crate::coverage::db::{CoverageDb, CoveragePointRow};
+use finn_guidance_common::coords;
+use finn_guidance_common::types::{FixQuality, GpsFix};
 
 /// Configuration for coverage log filtering.
 #[derive(Debug, Clone)]
@@ -268,7 +268,9 @@ impl CoverageLogger {
 
         // === Gate 2: Time filter ===
         if self.filter.min_interval_ms > 0 && self.last_logged_timestamp_ms > 0 {
-            let elapsed = fix.timestamp_ms.saturating_sub(self.last_logged_timestamp_ms);
+            let elapsed = fix
+                .timestamp_ms
+                .saturating_sub(self.last_logged_timestamp_ms);
             if elapsed < self.filter.min_interval_ms {
                 return;
             }
@@ -346,10 +348,7 @@ impl CoverageLogger {
             let _ = db.end_job(job_id, self.points_logged, self.current_segment);
         }
         self.current_job_id = None;
-        tracing::info!(
-            "Coverage job ended - {} points logged",
-            self.points_logged,
-        );
+        tracing::info!("Coverage job ended - {} points logged", self.points_logged,);
     }
 
     /// Get coverage points for rendering.
@@ -383,7 +382,11 @@ impl CoverageLogger {
         match db.load_coverage_points(job_id) {
             Ok(rows) => {
                 self.render_cache = rows.iter().map(CoveragePoint::from_row).collect();
-                tracing::info!("Loaded {} coverage points from job {}", self.render_cache.len(), job_id);
+                tracing::info!(
+                    "Loaded {} coverage points from job {}",
+                    self.render_cache.len(),
+                    job_id
+                );
             }
             Err(e) => {
                 tracing::error!("Failed to load coverage for job {}: {}", job_id, e);
@@ -428,8 +431,10 @@ impl CoverageLogger {
             }
 
             let dist = coords::haversine_distance(
-                prev.latitude, prev.longitude,
-                curr.latitude, curr.longitude,
+                prev.latitude,
+                prev.longitude,
+                curr.latitude,
+                curr.longitude,
             );
             total_area_m2 += dist * self.implement_width_m;
         }

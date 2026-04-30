@@ -1,20 +1,20 @@
-mod gps;
-mod guidance;
-mod gui;
 mod comms;
-mod position;
 mod coverage;
+mod gps;
+mod gui;
+mod guidance;
+mod position;
 mod telemetry;
 
-use tracing_subscriber;
-use crossbeam_channel;
-use finn_guidance_common::types::GpsFix;
-use finn_guidance_common::protocol::FinnMessage;
 use crate::comms::serial::MotorHandle;
 use crate::guidance::steer_thread::{SharedSteerState, SteerStateHandle};
 use crate::telemetry::SharedDropCounters;
+use crossbeam_channel;
+use finn_guidance_common::protocol::FinnMessage;
+use finn_guidance_common::types::GpsFix;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use tracing_subscriber;
 
 fn main() {
     // Initialise logging
@@ -40,14 +40,14 @@ fn main() {
 
     // Shared steering state — steer thread + GUI
     let steer_state: SteerStateHandle = Arc::new(Mutex::new(SharedSteerState::new(
-        3.0,   // lookahead_base
-        1.0,   // lookahead_speed_factor
-        2.8,   // wheelbase_m
-        15.0,  // max_steer_angle
-        0.5,   // kd_xte
-        0.03,  // deadband_m
-        12.0,  // implement_width_m
-        0.0,   // overlap_m
+        3.0,  // lookahead_base
+        1.0,  // lookahead_speed_factor
+        2.8,  // wheelbase_m
+        15.0, // max_steer_angle
+        0.5,  // kd_xte
+        0.03, // deadband_m
+        12.0, // implement_width_m
+        0.0,  // overlap_m
     )));
 
     // Shared drop counters — incremented by reader threads, consumed by steer thread telemetry

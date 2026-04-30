@@ -12,15 +12,15 @@
 //! than backpressure the whole reader thread. Drop counters are logged
 //! every ~5s so consumer stalls are visible in field logs.
 
-use std::io::{BufRead, BufReader, Write};
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::Ordering;
-use std::time::Duration;
-use crossbeam_channel::Sender;
-use serialport::{self, SerialPortType};
-use finn_guidance_common::protocol::{self, FinnMessage};
 use crate::gps::finn_parser;
 use crate::telemetry::SharedDropCounters;
+use crossbeam_channel::Sender;
+use finn_guidance_common::protocol::{self, FinnMessage};
+use serialport::{self, SerialPortType};
+use std::io::{BufRead, BufReader, Write};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Thread-safe handle for sending commands to the motor ESP32.
 /// Cloneable — the GUI thread holds one, the motor reader thread holds another.
@@ -53,7 +53,8 @@ impl MotorHandle {
     pub fn send_raw(&self, sentence: &str) -> Result<(), String> {
         let mut guard = self.port.lock().map_err(|e| e.to_string())?;
         let port = guard.as_mut().ok_or("Motor serial port not open")?;
-        port.write_all(sentence.as_bytes()).map_err(|e| e.to_string())?;
+        port.write_all(sentence.as_bytes())
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -77,7 +78,12 @@ impl MotorHandle {
 
     /// Send WAS filtering parameters to the ESP32 NVS.
     /// All values are x100 integers (e.g. alpha=15 means 0.15).
-    pub fn send_wasf_config(&self, ema_alpha_x100: u16, deadzone_x100: u16, curve_exp_x100: u16) -> Result<(), String> {
+    pub fn send_wasf_config(
+        &self,
+        ema_alpha_x100: u16,
+        deadzone_x100: u16,
+        curve_exp_x100: u16,
+    ) -> Result<(), String> {
         let cmd = protocol::format_wasf_config(ema_alpha_x100, deadzone_x100, curve_exp_x100);
         self.send_raw(&cmd)
     }
@@ -131,7 +137,11 @@ fn auto_detect_motor_port(baud_rate: u32, exclude_port: &str) -> Option<String> 
         for line in reader.lines().take(30) {
             if let Ok(sentence) = line {
                 if sentence.starts_with("$FINNMTR") {
-                    tracing::info!("    Found motor ESP32 on {} — {}", name, &sentence[..sentence.len().min(60)]);
+                    tracing::info!(
+                        "    Found motor ESP32 on {} — {}",
+                        name,
+                        &sentence[..sentence.len().min(60)]
+                    );
                     return Some(name.clone());
                 }
             }

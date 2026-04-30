@@ -101,8 +101,10 @@ impl AbLineGuide {
                 if (a.0 - b.0).abs() > 1e-10 || (a.1 - b.1).abs() > 1e-10 =>
             {
                 Some(AbPoints {
-                    a_lat: a.0, a_lon: a.1,
-                    b_lat: b.0, b_lon: b.1,
+                    a_lat: a.0,
+                    a_lon: a.1,
+                    b_lat: b.0,
+                    b_lon: b.1,
                 })
             }
             _ => None,
@@ -139,11 +141,8 @@ impl AbLineGuide {
                 }
 
                 // Get raw cross-track distance in the A→B frame.
-                let raw_xtd = coords::cross_track_distance(
-                    fix.latitude, fix.longitude,
-                    a.0, a.1,
-                    b.0, b.1,
-                );
+                let raw_xtd =
+                    coords::cross_track_distance(fix.latitude, fix.longitude, a.0, a.1, b.0, b.1);
 
                 // The residual error in the A→B frame is:
                 //   adjusted_xtd = raw_xtd - pass_offset_m - nudge_m
@@ -236,10 +235,7 @@ impl AbLineGuide {
         self.pass_number = new_pass;
         self.pass_offset_m = self.pass_spacing() * new_pass as f64;
 
-        Some(PassChangeEvent {
-            old_pass,
-            new_pass,
-        })
+        Some(PassChangeEvent { old_pass, new_pass })
     }
 
     /// Find the pass number whose line is nearest to the current position.
@@ -248,11 +244,8 @@ impl AbLineGuide {
     fn find_nearest_pass(&self, fix: &GpsFix) -> i32 {
         match &self.line {
             Some(GuidanceLine::AbLine { a, b }) => {
-                let raw_xtd = coords::cross_track_distance(
-                    fix.latitude, fix.longitude,
-                    a.0, a.1,
-                    b.0, b.1,
-                );
+                let raw_xtd =
+                    coords::cross_track_distance(fix.latitude, fix.longitude, a.0, a.1, b.0, b.1);
                 // Subtract nudge before rounding so the nearest pass is found
                 // relative to the nudged line system, not the raw AB origin.
                 let nudge_adjusted = raw_xtd - self.nudge_m;
@@ -271,11 +264,8 @@ impl AbLineGuide {
                     return None;
                 }
 
-                let raw_xtd = coords::cross_track_distance(
-                    fix.latitude, fix.longitude,
-                    a.0, a.1,
-                    b.0, b.1,
-                );
+                let raw_xtd =
+                    coords::cross_track_distance(fix.latitude, fix.longitude, a.0, a.1, b.0, b.1);
 
                 // Apply pass offset and nudge
                 let adjusted_xtd = raw_xtd - self.pass_offset_m - self.nudge_m;

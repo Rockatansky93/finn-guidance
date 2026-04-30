@@ -28,9 +28,9 @@
 //! real fix corrects it. With the BA's DR-fused heading, projection
 //! direction stays correct through turns.
 
-use std::time::Instant;
-use finn_guidance_common::types::GpsFix;
 use finn_guidance_common::coords;
+use finn_guidance_common::types::GpsFix;
+use std::time::Instant;
 
 /// Position interpolator for smooth GUI updates between GPS fixes.
 pub struct PositionInterpolator {
@@ -147,9 +147,8 @@ fn destination_point(lat: f64, lon: f64, bearing_deg: f64, distance_m: f64) -> (
     let brg_r = coords::deg_to_rad(bearing_deg);
     let angular_dist = distance_m / EARTH_RADIUS;
 
-    let new_lat_r = (lat_r.sin() * angular_dist.cos()
-        + lat_r.cos() * angular_dist.sin() * brg_r.cos())
-    .asin();
+    let new_lat_r =
+        (lat_r.sin() * angular_dist.cos() + lat_r.cos() * angular_dist.sin() * brg_r.cos()).asin();
 
     let new_lon_r = lon_r
         + (brg_r.sin() * angular_dist.sin() * lat_r.cos())
@@ -168,7 +167,11 @@ mod tests {
         let (lat, lon) = destination_point(-33.275, 138.590, 0.0, 100.0);
         // Should be ~0.0009° further north
         assert!(lat > -33.275, "Should move north, got {}", lat);
-        assert!((lon - 138.590).abs() < 0.0001, "Lon should stay similar, got {}", lon);
+        assert!(
+            (lon - 138.590).abs() < 0.0001,
+            "Lon should stay similar, got {}",
+            lon
+        );
     }
 
     #[test]

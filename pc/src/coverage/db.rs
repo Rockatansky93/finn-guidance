@@ -17,9 +17,9 @@
 //!   N/S header, E/W header, and diagonals). This grouping makes it easy to find
 //!   the right line at the start of a run, especially when transferring between PCs.
 
-use std::path::Path;
-use serde::{Deserialize, Serialize};
 use finn_guidance_common::types::FixQuality;
+use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// Coverage database backed by SQLite.
 pub struct CoverageDb {
@@ -44,7 +44,9 @@ impl CoverageDb {
 
     /// Create database tables if they don't exist.
     fn create_tables(&self) -> Result<(), String> {
-        self.conn.execute_batch("
+        self.conn
+            .execute_batch(
+                "
             CREATE TABLE IF NOT EXISTS fields (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
@@ -106,12 +108,15 @@ impl CoverageDb {
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
-        ").map_err(|e| format!("Failed to create tables: {}", e))?;
+        ",
+            )
+            .map_err(|e| format!("Failed to create tables: {}", e))?;
 
         // Migration: add 'name' column to jobs if upgrading from old schema
         // that had 'csv_filename'. Ignore errors (column already exists).
         let _ = self.conn.execute(
-            "ALTER TABLE jobs ADD COLUMN name TEXT NOT NULL DEFAULT ''", []
+            "ALTER TABLE jobs ADD COLUMN name TEXT NOT NULL DEFAULT ''",
+            [],
         );
 
         Ok(())
@@ -121,16 +126,23 @@ impl CoverageDb {
 
     /// Create a new job and return its ID.
     pub fn create_job(&self, name: &str, implement_width: f64) -> Result<i64, String> {
-        self.conn.execute(
-            "INSERT INTO jobs (name, implement_width_m) VALUES (?1, ?2)",
-            rusqlite::params![name, implement_width],
-        ).map_err(|e| format!("Failed to create job: {}", e))?;
+        self.conn
+            .execute(
+                "INSERT INTO jobs (name, implement_width_m) VALUES (?1, ?2)",
+                rusqlite::params![name, implement_width],
+            )
+            .map_err(|e| format!("Failed to create job: {}", e))?;
 
         Ok(self.conn.last_insert_rowid())
     }
 
     /// End a job, recording its final stats.
-    pub fn end_job(&self, job_id: i64, total_points: u64, total_segments: u32) -> Result<(), String> {
+    pub fn end_job(
+        &self,
+        job_id: i64,
+        total_points: u64,
+        total_segments: u32,
+    ) -> Result<(), String> {
         self.conn.execute(
             "UPDATE jobs SET ended_at = datetime('now', 'localtime'), total_points = ?1, total_segments = ?2 WHERE id = ?3",
             rusqlite::params![total_points as i64, total_segments as i32, job_id],
@@ -145,31 +157,42 @@ impl CoverageDb {
              FROM jobs ORDER BY started_at DESC"
         ).map_err(|e| format!("Failed to query jobs: {}", e))?;
 
-        let jobs = stmt.query_map([], |row| {
-            Ok(SavedJob {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                started_at: row.get(2)?,
-                ended_at: row.get(3)?,
-                implement_width_m: row.get(4)?,
-                total_points: row.get(5)?,
-                total_segments: row.get(6)?,
-                notes: row.get(7)?,
+        let jobs = stmt
+            .query_map([], |row| {
+                Ok(SavedJob {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    started_at: row.get(2)?,
+                    ended_at: row.get(3)?,
+                    implement_width_m: row.get(4)?,
+                    total_points: row.get(5)?,
+                    total_segments: row.get(6)?,
+                    notes: row.get(7)?,
+                })
             })
-        }).map_err(|e| format!("Failed to read jobs: {}", e))?
-        .filter_map(|r| r.ok())
-        .collect();
+            .map_err(|e| format!("Failed to read jobs: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
 
         Ok(jobs)
     }
 
     /// Delete a job, its segments, and its coverage points by ID.
     pub fn delete_job(&self, id: i64) -> Result<(), String> {
-        self.conn.execute("DELETE FROM coverage_points WHERE job_id = ?1", rusqlite::params![id])
+        self.conn
+            .execute(
+                "DELETE FROM coverage_points WHERE job_id = ?1",
+                rusqlite::params![id],
+            )
             .map_err(|e| format!("Failed to delete coverage points: {}", e))?;
-        self.conn.execute("DELETE FROM segments WHERE job_id = ?1", rusqlite::params![id])
+        self.conn
+            .execute(
+                "DELETE FROM segments WHERE job_id = ?1",
+                rusqlite::params![id],
+            )
             .map_err(|e| format!("Failed to delete segments: {}", e))?;
-        self.conn.execute("DELETE FROM jobs WHERE id = ?1", rusqlite::params![id])
+        self.conn
+            .execute("DELETE FROM jobs WHERE id = ?1", rusqlite::params![id])
             .map_err(|e| format!("Failed to delete job: {}", e))?;
         Ok(())
     }
@@ -178,10 +201,12 @@ impl CoverageDb {
 
     /// Create a new segment within a job and return its ID.
     pub fn create_segment(&self, job_id: i64, segment_number: u32) -> Result<i64, String> {
-        self.conn.execute(
-            "INSERT INTO segments (job_id, segment_number) VALUES (?1, ?2)",
-            rusqlite::params![job_id, segment_number as i32],
-        ).map_err(|e| format!("Failed to create segment: {}", e))?;
+        self.conn
+            .execute(
+                "INSERT INTO segments (job_id, segment_number) VALUES (?1, ?2)",
+                rusqlite::params![job_id, segment_number as i32],
+            )
+            .map_err(|e| format!("Failed to create segment: {}", e))?;
 
         Ok(self.conn.last_insert_rowid())
     }
@@ -202,46 +227,56 @@ impl CoverageDb {
         &self,
         field_id: Option<i64>,
         name: &str,
-        a_lat: f64, a_lon: f64,
-        b_lat: f64, b_lon: f64,
+        a_lat: f64,
+        a_lon: f64,
+        b_lat: f64,
+        b_lon: f64,
     ) -> Result<i64, String> {
-        self.conn.execute(
-            "INSERT INTO ab_lines (field_id, name, a_lat, a_lon, b_lat, b_lon)
+        self.conn
+            .execute(
+                "INSERT INTO ab_lines (field_id, name, a_lat, a_lon, b_lat, b_lon)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![field_id, name, a_lat, a_lon, b_lat, b_lon],
-        ).map_err(|e| format!("Failed to save AB line: {}", e))?;
+                rusqlite::params![field_id, name, a_lat, a_lon, b_lat, b_lon],
+            )
+            .map_err(|e| format!("Failed to save AB line: {}", e))?;
         Ok(self.conn.last_insert_rowid())
     }
 
     /// Load all saved AB lines, ordered by field then creation date.
     pub fn list_ab_lines(&self) -> Result<Vec<SavedAbLine>, String> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, field_id, name, a_lat, a_lon, b_lat, b_lon, created_at
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, field_id, name, a_lat, a_lon, b_lat, b_lon, created_at
              FROM ab_lines
-             ORDER BY field_id ASC NULLS LAST, created_at DESC"
-        ).map_err(|e| format!("Failed to query AB lines: {}", e))?;
+             ORDER BY field_id ASC NULLS LAST, created_at DESC",
+            )
+            .map_err(|e| format!("Failed to query AB lines: {}", e))?;
 
-        let lines = stmt.query_map([], |row| {
-            Ok(SavedAbLine {
-                id: row.get(0)?,
-                field_id: row.get(1)?,
-                name: row.get(2)?,
-                a_lat: row.get(3)?,
-                a_lon: row.get(4)?,
-                b_lat: row.get(5)?,
-                b_lon: row.get(6)?,
-                created_at: row.get(7)?,
+        let lines = stmt
+            .query_map([], |row| {
+                Ok(SavedAbLine {
+                    id: row.get(0)?,
+                    field_id: row.get(1)?,
+                    name: row.get(2)?,
+                    a_lat: row.get(3)?,
+                    a_lon: row.get(4)?,
+                    b_lat: row.get(5)?,
+                    b_lon: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
             })
-        }).map_err(|e| format!("Failed to read AB lines: {}", e))?
-        .filter_map(|r| r.ok())
-        .collect();
+            .map_err(|e| format!("Failed to read AB lines: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
 
         Ok(lines)
     }
 
     /// Delete a saved AB line by ID.
     pub fn delete_ab_line(&self, id: i64) -> Result<(), String> {
-        self.conn.execute("DELETE FROM ab_lines WHERE id = ?1", rusqlite::params![id])
+        self.conn
+            .execute("DELETE FROM ab_lines WHERE id = ?1", rusqlite::params![id])
             .map_err(|e| format!("Failed to delete AB line: {}", e))?;
         Ok(())
     }
@@ -250,44 +285,52 @@ impl CoverageDb {
 
     /// Create a new field and return its ID.
     pub fn create_field(&self, name: &str) -> Result<i64, String> {
-        self.conn.execute(
-            "INSERT INTO fields (name) VALUES (?1)",
-            rusqlite::params![name],
-        ).map_err(|e| format!("Failed to create field: {}", e))?;
+        self.conn
+            .execute(
+                "INSERT INTO fields (name) VALUES (?1)",
+                rusqlite::params![name],
+            )
+            .map_err(|e| format!("Failed to create field: {}", e))?;
         Ok(self.conn.last_insert_rowid())
     }
 
     /// Rename an existing field.
     pub fn rename_field(&self, id: i64, new_name: &str) -> Result<(), String> {
-        self.conn.execute(
-            "UPDATE fields SET name = ?1 WHERE id = ?2",
-            rusqlite::params![new_name, id],
-        ).map_err(|e| format!("Failed to rename field: {}", e))?;
+        self.conn
+            .execute(
+                "UPDATE fields SET name = ?1 WHERE id = ?2",
+                rusqlite::params![new_name, id],
+            )
+            .map_err(|e| format!("Failed to rename field: {}", e))?;
         Ok(())
     }
 
     /// Delete a field. Its AB lines have their field_id set to NULL (not deleted).
     pub fn delete_field(&self, id: i64) -> Result<(), String> {
-        self.conn.execute("DELETE FROM fields WHERE id = ?1", rusqlite::params![id])
+        self.conn
+            .execute("DELETE FROM fields WHERE id = ?1", rusqlite::params![id])
             .map_err(|e| format!("Failed to delete field: {}", e))?;
         Ok(())
     }
 
     /// List all fields ordered by name.
     pub fn list_fields(&self) -> Result<Vec<SavedField>, String> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, created_at FROM fields ORDER BY name ASC"
-        ).map_err(|e| format!("Failed to query fields: {}", e))?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name, created_at FROM fields ORDER BY name ASC")
+            .map_err(|e| format!("Failed to query fields: {}", e))?;
 
-        let fields = stmt.query_map([], |row| {
-            Ok(SavedField {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                created_at: row.get(2)?,
+        let fields = stmt
+            .query_map([], |row| {
+                Ok(SavedField {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    created_at: row.get(2)?,
+                })
             })
-        }).map_err(|e| format!("Failed to read fields: {}", e))?
-        .filter_map(|r| r.ok())
-        .collect();
+            .map_err(|e| format!("Failed to read fields: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
 
         Ok(fields)
     }
@@ -315,8 +358,10 @@ impl CoverageDb {
 
         // Build a name→id map for existing fields
         let existing_fields = self.list_fields()?;
-        let mut field_name_to_id: std::collections::HashMap<String, i64> =
-            existing_fields.iter().map(|f| (f.name.clone(), f.id)).collect();
+        let mut field_name_to_id: std::collections::HashMap<String, i64> = existing_fields
+            .iter()
+            .map(|f| (f.name.clone(), f.id))
+            .collect();
 
         // Map from the *bundle's* field id to the *local* field id
         let mut bundle_field_id_map: std::collections::HashMap<i64, i64> =
@@ -337,18 +382,23 @@ impl CoverageDb {
         for line in &bundle.ab_lines {
             // Map the bundle field_id to the local field_id (may be None for
             // lines that weren't assigned to a field when exported)
-            let local_field_id: Option<i64> = line.field_id
+            let local_field_id: Option<i64> = line
+                .field_id
                 .and_then(|bid| bundle_field_id_map.get(&bid).copied());
 
             // Check for duplicate: same name + a-point inside the same field
-            let exists: bool = self.conn.query_row(
-                "SELECT COUNT(*) FROM ab_lines
+            let exists: bool = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM ab_lines
                  WHERE name = ?1
                    AND ABS(a_lat - ?2) < 1e-8 AND ABS(a_lon - ?3) < 1e-8
                    AND (field_id = ?4 OR (field_id IS NULL AND ?4 IS NULL))",
-                rusqlite::params![line.name, line.a_lat, line.a_lon, local_field_id],
-                |row| row.get::<_, i64>(0),
-            ).unwrap_or(0) > 0;
+                    rusqlite::params![line.name, line.a_lat, line.a_lon, local_field_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                > 0;
 
             if exists {
                 lines_skipped += 1;
@@ -356,25 +406,33 @@ impl CoverageDb {
                 self.save_ab_line(
                     local_field_id,
                     &line.name,
-                    line.a_lat, line.a_lon,
-                    line.b_lat, line.b_lon,
+                    line.a_lat,
+                    line.a_lon,
+                    line.b_lat,
+                    line.b_lon,
                 )?;
                 lines_added += 1;
             }
         }
 
-        Ok(ImportStats { fields_added, lines_added, lines_skipped })
+        Ok(ImportStats {
+            fields_added,
+            lines_added,
+            lines_skipped,
+        })
     }
 
     // === Config operations ===
 
     /// Get a config value by key.
     pub fn get_config(&self, key: &str) -> Option<String> {
-        self.conn.query_row(
-            "SELECT value FROM config WHERE key = ?1",
-            rusqlite::params![key],
-            |row| row.get(0),
-        ).ok()
+        self.conn
+            .query_row(
+                "SELECT value FROM config WHERE key = ?1",
+                rusqlite::params![key],
+                |row| row.get(0),
+            )
+            .ok()
     }
 
     /// Set a config value (upsert).
@@ -391,12 +449,17 @@ impl CoverageDb {
     /// Insert a batch of coverage points in a single transaction.
     /// Call this periodically (e.g. every 50 points) for good throughput
     /// without blocking the GPS thread.
-    pub fn insert_coverage_batch(&self, job_id: i64, points: &[CoveragePointRow]) -> Result<(), String> {
+    pub fn insert_coverage_batch(
+        &self,
+        job_id: i64,
+        points: &[CoveragePointRow],
+    ) -> Result<(), String> {
         if points.is_empty() {
             return Ok(());
         }
 
-        self.conn.execute("BEGIN", [])
+        self.conn
+            .execute("BEGIN", [])
             .map_err(|e| format!("Failed to begin transaction: {}", e))?;
 
         {
@@ -420,11 +483,13 @@ impl CoverageDb {
                     quality_str,
                     pt.satellites as i32,
                     pt.hdop,
-                ]).map_err(|e| format!("Failed to insert coverage point: {}", e))?;
+                ])
+                .map_err(|e| format!("Failed to insert coverage point: {}", e))?;
             }
         }
 
-        self.conn.execute("COMMIT", [])
+        self.conn
+            .execute("COMMIT", [])
             .map_err(|e| format!("Failed to commit transaction: {}", e))?;
 
         Ok(())
@@ -432,51 +497,60 @@ impl CoverageDb {
 
     /// Load all coverage points for a job, ordered by segment then timestamp.
     pub fn load_coverage_points(&self, job_id: i64) -> Result<Vec<CoveragePointRow>, String> {
-        let mut stmt = self.conn.prepare(
-            "SELECT segment, timestamp_ms, latitude, longitude, altitude,
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT segment, timestamp_ms, latitude, longitude, altitude,
                     speed, heading, fix_quality, satellites, hdop
              FROM coverage_points
              WHERE job_id = ?1
-             ORDER BY segment ASC, timestamp_ms ASC"
-        ).map_err(|e| format!("Failed to query coverage points: {}", e))?;
+             ORDER BY segment ASC, timestamp_ms ASC",
+            )
+            .map_err(|e| format!("Failed to query coverage points: {}", e))?;
 
-        let points = stmt.query_map(rusqlite::params![job_id], |row| {
-            let quality_str: String = row.get(7)?;
-            Ok(CoveragePointRow {
-                segment: row.get(0)?,
-                timestamp_ms: row.get::<_, i64>(1)? as u64,
-                latitude: row.get(2)?,
-                longitude: row.get(3)?,
-                altitude: row.get(4)?,
-                speed: row.get(5)?,
-                heading: row.get(6)?,
-                fix_quality: str_to_fix_quality(&quality_str),
-                satellites: row.get::<_, i32>(8)? as u8,
-                hdop: row.get(9)?,
+        let points = stmt
+            .query_map(rusqlite::params![job_id], |row| {
+                let quality_str: String = row.get(7)?;
+                Ok(CoveragePointRow {
+                    segment: row.get(0)?,
+                    timestamp_ms: row.get::<_, i64>(1)? as u64,
+                    latitude: row.get(2)?,
+                    longitude: row.get(3)?,
+                    altitude: row.get(4)?,
+                    speed: row.get(5)?,
+                    heading: row.get(6)?,
+                    fix_quality: str_to_fix_quality(&quality_str),
+                    satellites: row.get::<_, i32>(8)? as u8,
+                    hdop: row.get(9)?,
+                })
             })
-        }).map_err(|e| format!("Failed to read coverage points: {}", e))?
-        .filter_map(|r| r.ok())
-        .collect();
+            .map_err(|e| format!("Failed to read coverage points: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
 
         Ok(points)
     }
 
     /// Count coverage points for a job.
     pub fn count_coverage_points(&self, job_id: i64) -> Result<u64, String> {
-        self.conn.query_row(
-            "SELECT COUNT(*) FROM coverage_points WHERE job_id = ?1",
-            rusqlite::params![job_id],
-            |row| row.get::<_, i64>(0),
-        ).map(|c| c as u64)
-        .map_err(|e| format!("Failed to count coverage points: {}", e))
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM coverage_points WHERE job_id = ?1",
+                rusqlite::params![job_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|c| c as u64)
+            .map_err(|e| format!("Failed to count coverage points: {}", e))
     }
 
     /// Delete all coverage points for a job (without deleting the job itself).
     pub fn clear_coverage_points(&self, job_id: i64) -> Result<(), String> {
-        self.conn.execute(
-            "DELETE FROM coverage_points WHERE job_id = ?1",
-            rusqlite::params![job_id],
-        ).map_err(|e| format!("Failed to clear coverage points: {}", e))?;
+        self.conn
+            .execute(
+                "DELETE FROM coverage_points WHERE job_id = ?1",
+                rusqlite::params![job_id],
+            )
+            .map_err(|e| format!("Failed to clear coverage points: {}", e))?;
         Ok(())
     }
 

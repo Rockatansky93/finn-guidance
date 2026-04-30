@@ -17,8 +17,8 @@
 
 pub mod logger;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 // ─────────────────────────────────────────────────────────────────────
 // Shared atomic drop counters — incremented by reader threads,

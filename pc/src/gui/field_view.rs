@@ -8,11 +8,11 @@
 //!
 //! Each layer draws independently using the shared FieldProjection.
 
-use std::collections::VecDeque;
-use eframe::egui;
-use finn_guidance_common::types::{GpsFix, FixQuality, GuidanceLine};
-use crate::coverage::logger::CoveragePoint;
 use super::field_projection::FieldProjection;
+use crate::coverage::logger::CoveragePoint;
+use eframe::egui;
+use finn_guidance_common::types::{FixQuality, GpsFix, GuidanceLine};
+use std::collections::VecDeque;
 
 /// Colours used across the field view
 struct FieldColours;
@@ -151,12 +151,20 @@ impl FieldView {
         for ix in grid_min_x..=grid_max_x {
             let x = ix as f64 * spacing;
             let is_origin = ix == 0;
-            let colour = if is_origin { FieldColours::GRID_MAJOR } else { FieldColours::GRID_MINOR };
+            let colour = if is_origin {
+                FieldColours::GRID_MAJOR
+            } else {
+                FieldColours::GRID_MINOR
+            };
             let width = if is_origin { 1.5 } else { 0.5 };
 
             // Draw a line segment from bottom to top of visible area
-            let (sx1, sy1) = self.projection.local_to_screen(x, (grid_min_y as f64) * spacing);
-            let (sx2, sy2) = self.projection.local_to_screen(x, (grid_max_y as f64) * spacing);
+            let (sx1, sy1) = self
+                .projection
+                .local_to_screen(x, (grid_min_y as f64) * spacing);
+            let (sx2, sy2) = self
+                .projection
+                .local_to_screen(x, (grid_max_y as f64) * spacing);
 
             painter.line_segment(
                 [egui::pos2(sx1, sy1), egui::pos2(sx2, sy2)],
@@ -168,11 +176,19 @@ impl FieldView {
         for iy in grid_min_y..=grid_max_y {
             let y = iy as f64 * spacing;
             let is_origin = iy == 0;
-            let colour = if is_origin { FieldColours::GRID_MAJOR } else { FieldColours::GRID_MINOR };
+            let colour = if is_origin {
+                FieldColours::GRID_MAJOR
+            } else {
+                FieldColours::GRID_MINOR
+            };
             let width = if is_origin { 1.5 } else { 0.5 };
 
-            let (sx1, sy1) = self.projection.local_to_screen((grid_min_x as f64) * spacing, y);
-            let (sx2, sy2) = self.projection.local_to_screen((grid_max_x as f64) * spacing, y);
+            let (sx1, sy1) = self
+                .projection
+                .local_to_screen((grid_min_x as f64) * spacing, y);
+            let (sx2, sy2) = self
+                .projection
+                .local_to_screen((grid_max_x as f64) * spacing, y);
 
             painter.line_segment(
                 [egui::pos2(sx1, sy1), egui::pos2(sx2, sy2)],
@@ -211,7 +227,7 @@ impl FieldView {
         }
         let ux = dx / len; // Unit vector along line
         let uy = dy / len;
-        let nx = uy;  // Normal vector (perpendicular, pointing right of A→B direction)
+        let nx = uy; // Normal vector (perpendicular, pointing right of A→B direction)
         let ny = -ux; // Must match cross_track_distance sign convention: positive = right
 
         // Extend the line far enough to cross the visible area
@@ -348,7 +364,8 @@ impl FieldView {
 
             // Find the next point to bridge to: step ahead, but must be same segment
             let next_idx = i + step;
-            let bridge_target = if next_idx < points.len() && points[next_idx].segment == pt.segment {
+            let bridge_target = if next_idx < points.len() && points[next_idx].segment == pt.segment
+            {
                 Some(next_idx)
             } else if i + 1 < points.len() && points[i + 1].segment == pt.segment {
                 // Step landed outside segment or past end — fall back to i+1
@@ -360,15 +377,17 @@ impl FieldView {
             if let Some(ni) = bridge_target {
                 // Draw a quad from this point to the bridge target
                 let next = &points[ni];
-                let (nlx, nly) = self.projection.world_to_local(next.latitude, next.longitude);
+                let (nlx, nly) = self
+                    .projection
+                    .world_to_local(next.latitude, next.longitude);
 
                 // Four corners: left/right of current point, left/right of next point
-                let c1 = self.projection.local_to_screen(
-                    lx - perp_x * half_width, ly - perp_y * half_width,
-                );
-                let c2 = self.projection.local_to_screen(
-                    lx + perp_x * half_width, ly + perp_y * half_width,
-                );
+                let c1 = self
+                    .projection
+                    .local_to_screen(lx - perp_x * half_width, ly - perp_y * half_width);
+                let c2 = self
+                    .projection
+                    .local_to_screen(lx + perp_x * half_width, ly + perp_y * half_width);
 
                 // Use next point's heading for the far end
                 let nh_rad = next.heading * std::f64::consts::PI / 180.0;
@@ -377,12 +396,12 @@ impl FieldView {
                 let nperp_x = ncos;
                 let nperp_y = -nsin;
 
-                let c3 = self.projection.local_to_screen(
-                    nlx + nperp_x * half_width, nly + nperp_y * half_width,
-                );
-                let c4 = self.projection.local_to_screen(
-                    nlx - nperp_x * half_width, nly - nperp_y * half_width,
-                );
+                let c3 = self
+                    .projection
+                    .local_to_screen(nlx + nperp_x * half_width, nly + nperp_y * half_width);
+                let c4 = self
+                    .projection
+                    .local_to_screen(nlx - nperp_x * half_width, nly - nperp_y * half_width);
 
                 painter.add(egui::Shape::convex_polygon(
                     vec![
@@ -482,10 +501,7 @@ impl FieldView {
         let sin_h = heading_rad.sin() as f32;
 
         // Triangle: nose, left wing, right wing
-        let nose = egui::pos2(
-            pos.x + sin_h * size * 1.5,
-            pos.y - cos_h * size * 1.5,
-        );
+        let nose = egui::pos2(pos.x + sin_h * size * 1.5, pos.y - cos_h * size * 1.5);
         let left = egui::pos2(
             pos.x - (cos_h * size * 0.7 + sin_h * size * 0.5),
             pos.y - (sin_h * size * 0.7 - cos_h * size * 0.5),
@@ -532,11 +548,17 @@ impl FieldView {
         );
         // End caps
         painter.line_segment(
-            [egui::pos2(bar_x_start, bar_y - 4.0), egui::pos2(bar_x_start, bar_y + 4.0)],
+            [
+                egui::pos2(bar_x_start, bar_y - 4.0),
+                egui::pos2(bar_x_start, bar_y + 4.0),
+            ],
             egui::Stroke::new(1.5, egui::Color32::WHITE),
         );
         painter.line_segment(
-            [egui::pos2(bar_x_end, bar_y - 4.0), egui::pos2(bar_x_end, bar_y + 4.0)],
+            [
+                egui::pos2(bar_x_end, bar_y - 4.0),
+                egui::pos2(bar_x_end, bar_y + 4.0),
+            ],
             egui::Stroke::new(1.5, egui::Color32::WHITE),
         );
 

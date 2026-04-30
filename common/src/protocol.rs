@@ -84,6 +84,9 @@ pub fn format_invert_config(invert: bool) -> String {
 ///   deadzone_x100:   Dead zone half-width in degrees (e.g. 200 = 2.00°)
 ///   curve_exp_x100:  Non-linear curve exponent (e.g. 200 = 2.00)
 pub fn format_wasf_config(ema_alpha_x100: u16, deadzone_x100: u16, curve_exp_x100: u16) -> String {
-    let body = format!("FINNCFG,WASF,{},{},{}", ema_alpha_x100, deadzone_x100, curve_exp_x100);
+    let body = format!(
+        "FINNCFG,WASF,{},{},{}",
+        ema_alpha_x100, deadzone_x100, curve_exp_x100
+    );
     format_finn_sentence(&body)
 }

@@ -29,16 +29,16 @@
 
 use crossbeam_channel::Sender;
 use serialport::{self, SerialPortType};
-use std::io::{BufRead, Read, Write};
 use std::io::BufReader;
+use std::io::{BufRead, Read, Write};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing;
 
-use finn_guidance_common::types::GpsFix;
 use super::parser;
 use crate::telemetry::SharedDropCounters;
+use finn_guidance_common::types::GpsFix;
 
 /// Configuration for the GPS serial connection
 pub struct GpsConfig {
@@ -115,8 +115,7 @@ fn auto_detect_gps_port(baud_rate: u32) -> Option<String> {
         let port_name = &port_info.port_name;
         let type_desc = match &port_info.port_type {
             SerialPortType::UsbPort(info) => {
-                format!("USB ({})",
-                    info.product.as_deref().unwrap_or("unknown"))
+                format!("USB ({})", info.product.as_deref().unwrap_or("unknown"))
             }
             SerialPortType::PciPort => "PCI".to_string(),
             SerialPortType::BluetoothPort => "Bluetooth".to_string(),
@@ -148,7 +147,8 @@ fn auto_detect_gps_port(baud_rate: u32) -> Option<String> {
                         is_motor_esp32 = true;
                         break;
                     }
-                    if sentence.starts_with("$G") || sentence.starts_with("$PAIR")
+                    if sentence.starts_with("$G")
+                        || sentence.starts_with("$PAIR")
                         || sentence.starts_with("$PQTM")
                     {
                         if !found_nmea {
@@ -174,34 +174,115 @@ fn auto_detect_gps_port(baud_rate: u32) -> Option<String> {
     None
 }
 
+/// Briefly listen for PQTMINS before writing DR config. If the module is
+/// already streaming from saved NVS settings, avoid another flash write.
+fn pqtmins_already_streaming(port: &mut Box<dyn serialport::SerialPort>) -> bool {
+    let response = read_config_response(port, Duration::from_millis(400));
+    response.lines().any(|line| line.starts_with("$PQTMINS"))
+}
+
+/// Read any immediate response/data from the GPS module for a bounded time.
+fn read_config_response(port: &mut Box<dyn serialport::SerialPort>, timeout: Duration) -> String {
+    let original_timeout = port.timeout();
+    let _ = port.set_timeout(Duration::from_millis(100));
+
+    let start = std::time::Instant::now();
+    let mut buf = [0u8; 512];
+    let mut response = String::new();
+
+    while start.elapsed() < timeout {
+        match port.read(&mut buf) {
+            Ok(n) if n > 0 => {
+                response.push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+            _ => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    let _ = port.set_timeout(original_timeout);
+    response
+}
+
+/// Log the non-standard response forms seen from LC29H BA firmware.
+fn log_pqtm_config_response(command: &str, response: &str) {
+    if response.contains("$PQTMCFGEINSMSGOK") || response.contains("$PQTMCFGEINSMSG,OK") {
+        tracing::info!("  {} accepted", command);
+    } else if response.contains("$PQTMCFGEINSMSGERROR")
+        || response.contains("$PQTMCFGEINSMSG,ERROR")
+    {
+        tracing::warn!("  {} rejected: {}", command, compact_response(response));
+    } else if response.contains("$PQTMEINSMSG") {
+        tracing::warn!(
+            "  {} returned get/echo response instead of OK: {}",
+            command,
+            compact_response(response)
+        );
+    } else if response.trim().is_empty() {
+        tracing::warn!("  No {} acknowledgement received", command);
+    } else {
+        tracing::debug!("  {} response: {}", command, compact_response(response));
+    }
+}
+
+fn compact_response(response: &str) -> String {
+    response.lines().take(4).collect::<Vec<_>>().join(" | ")
+}
+
 /// Send module configuration commands to the LC29H BA.
 ///
 /// Disables unnecessary NMEA sentences, then sets the fix rate to 10Hz.
 /// If 10Hz is rejected, falls back to lower rates.
 fn ensure_module_config(port: &mut Box<dyn serialport::SerialPort>, fix_rate_hz: u8) {
     let interval_ms = 1000 / fix_rate_hz as u16;
-    tracing::info!("Configuring GPS module: target {}Hz ({}ms interval)", fix_rate_hz, interval_ms);
+    tracing::info!(
+        "Configuring GPS module: target {}Hz ({}ms interval)",
+        fix_rate_hz,
+        interval_ms
+    );
 
-    // Step 1: Enable DR-fused INS output (PQTMINS at 10Hz, PQTMIMU off, PQTMGPS off)
-    // This gives us gyro-stabilised heading that works at low speed.
-    // Format: $PQTMCFGEINSMSG,W,<PQTMINS>,<PQTMIMU>,<PQTMGPS>,<Rate>
-    // Rate=10 means 10Hz output for PQTMINS.
-    let ins_cmd = format_pair_command("PQTMCFGEINSMSG,W,1,0,0,10");
-    tracing::info!("  Enabling PQTMINS at 10Hz: {}", ins_cmd.trim());
-    if let Err(e) = port.write_all(ins_cmd.as_bytes()) {
-        tracing::warn!("  Failed to send PQTMCFGEINSMSG: {}", e);
+    // Step 1: Enable DR telemetry.
+    // Confirmed LC29H BA NR11 two-wheel syntax:
+    // $PQTMCFGEINSMSG,<Type>,<INS_Enabled>,<IMU_Enabled>,<GPS_Enabled>,<Rate>
+    // Type 1 = Set. We enable PQTMINS and PQTMIMU at 10Hz; PQTMGPS stays off
+    // because position continues to come from GGA.
+    if pqtmins_already_streaming(port) {
+        tracing::info!("  PQTMINS already streaming — skipping DR config write");
+    } else {
+        let ins_cmd = format_pair_command("PQTMCFGEINSMSG,1,1,1,0,10");
+        tracing::info!("  Enabling PQTMINS/PQTMIMU at 10Hz: {}", ins_cmd.trim());
+        if let Err(e) = port.write_all(ins_cmd.as_bytes()) {
+            tracing::warn!("  Failed to send PQTMCFGEINSMSG: {}", e);
+        }
+        let _ = port.flush();
+        std::thread::sleep(Duration::from_millis(200));
+
+        let response = read_config_response(port, Duration::from_millis(500));
+        log_pqtm_config_response("PQTMCFGEINSMSG", &response);
+
+        // Save INS config to NVS so it persists across power cycles. Per Quectel
+        // docs the setting becomes active after reset/power-cycle. We avoid a
+        // runtime hot-start here because field probes showed it can trash a fix
+        // for longer than a normal startup budget.
+        let save_cmd = "$PQTMSAVEPAR*5A\r\n";
+        tracing::info!("  Saving DR config to NVS: {}", save_cmd.trim());
+        if let Err(e) = port.write_all(save_cmd.as_bytes()) {
+            tracing::warn!("  Failed to send PQTMSAVEPAR: {}", e);
+        }
+        let _ = port.flush();
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    // Step 1b: Ensure DRCAL telemetry is enabled. This is independent of
+    // PQTMINS/PQTMIMU and drives the GUI calibration-state indicator.
+    let drcal_cmd = format_pair_command("PAIR6010,2,1");
+    tracing::info!("  Enabling PQTMDRCAL telemetry: {}", drcal_cmd.trim());
+    if let Err(e) = port.write_all(drcal_cmd.as_bytes()) {
+        tracing::warn!("  Failed to send PAIR6010: {}", e);
     }
     let _ = port.flush();
-    std::thread::sleep(Duration::from_millis(200));
-
-    // Save INS config to NVS so it persists across power cycles
-    let save_cmd = "$PQTMSAVEPAR*5A\r\n";
-    tracing::info!("  Saving config to NVS: {}", save_cmd.trim());
-    if let Err(e) = port.write_all(save_cmd.as_bytes()) {
-        tracing::warn!("  Failed to send PQTMSAVEPAR: {}", e);
-    }
-    let _ = port.flush();
-    std::thread::sleep(Duration::from_millis(300));
+    std::thread::sleep(Duration::from_millis(150));
 
     // Step 2: Disable unnecessary NMEA sentences
     let disable_cmds = [
@@ -413,7 +494,10 @@ pub fn run_gps_reader(
                     if line_count <= 20 {
                         tracing::info!(
                             "Got fix: lat={:.6} lon={:.6} sats={} quality={:?}",
-                            fix.latitude, fix.longitude, fix.satellites, fix.fix_quality
+                            fix.latitude,
+                            fix.longitude,
+                            fix.satellites,
+                            fix.fix_quality
                         );
                     }
 
@@ -454,7 +538,8 @@ pub fn run_gps_reader(
                         if local_gui_drops > 0 || local_steer_drops > 0 {
                             tracing::warn!(
                                 "GPS fix drops in last ~5s: gui={} steer={} (consumer stalled)",
-                                local_gui_drops, local_steer_drops
+                                local_gui_drops,
+                                local_steer_drops
                             );
                             local_gui_drops = 0;
                             local_steer_drops = 0;

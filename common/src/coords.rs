@@ -1,8 +1,7 @@
 /// Coordinate math utilities for guidance calculations.
-/// 
+///
 /// Uses WGS84 ellipsoid for distance calculations.
 /// All angles in degrees unless suffixed with _rad.
-
 use std::f64::consts::PI;
 
 const EARTH_RADIUS_M: f64 = 6_371_000.0;
@@ -24,8 +23,7 @@ pub fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     let lat1_r = deg_to_rad(lat1);
     let lat2_r = deg_to_rad(lat2);
 
-    let a = (dlat / 2.0).sin().powi(2)
-        + lat1_r.cos() * lat2_r.cos() * (dlon / 2.0).sin().powi(2);
+    let a = (dlat / 2.0).sin().powi(2) + lat1_r.cos() * lat2_r.cos() * (dlon / 2.0).sin().powi(2);
     let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
 
     EARTH_RADIUS_M * c
@@ -46,16 +44,19 @@ pub fn bearing(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 /// Cross-track distance from a point to the line defined by A->B.
 /// Returns signed distance in metres (negative = left of line, positive = right).
 pub fn cross_track_distance(
-    point_lat: f64, point_lon: f64,
-    a_lat: f64, a_lon: f64,
-    b_lat: f64, b_lon: f64,
+    point_lat: f64,
+    point_lon: f64,
+    a_lat: f64,
+    a_lon: f64,
+    b_lat: f64,
+    b_lon: f64,
 ) -> f64 {
     let dist_a_to_point = haversine_distance(a_lat, a_lon, point_lat, point_lon);
     let bearing_a_to_point = deg_to_rad(bearing(a_lat, a_lon, point_lat, point_lon));
     let bearing_a_to_b = deg_to_rad(bearing(a_lat, a_lon, b_lat, b_lon));
 
-    let xtd = (dist_a_to_point / EARTH_RADIUS_M).sin()
-        * (bearing_a_to_point - bearing_a_to_b).sin();
+    let xtd =
+        (dist_a_to_point / EARTH_RADIUS_M).sin() * (bearing_a_to_point - bearing_a_to_b).sin();
 
     EARTH_RADIUS_M * xtd.asin()
 }

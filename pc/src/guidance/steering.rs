@@ -45,7 +45,6 @@ use std::time::Instant;
 /// Steering controller state — outer loop only (Decision #026).
 pub struct SteeringController {
     // === Outer loop: pure pursuit ===
-
     /// Base lookahead distance (metres). Maps to "Online Aggression" slider.
     pub lookahead_base: f64,
 
@@ -59,13 +58,11 @@ pub struct SteeringController {
     pub max_steer_angle: f64,
 
     // === XTE deadband / smooth taper ===
-
     /// XTE deadband in metres. Within this zone, desired angle tapers
     /// linearly to zero rather than cutting hard.
     pub deadband_m: f64,
 
     // === Waveform damping ===
-
     /// XTE rate damping gain. Reduces corrections when converging,
     /// increases urgency when diverging.
     pub kd_xte: f64,
@@ -77,7 +74,6 @@ pub struct SteeringController {
     prev_compute_time: Option<Instant>,
 
     // === Control state ===
-
     /// Whether auto-steer is currently engaged.
     pub engaged: bool,
 
@@ -85,7 +81,6 @@ pub struct SteeringController {
     pub min_speed: f64,
 
     // === Safety ===
-
     /// Maximum GPS fix age (seconds) before auto-disengage.
     pub max_fix_age_secs: f64,
 
@@ -93,7 +88,6 @@ pub struct SteeringController {
     last_fix_time: Option<Instant>,
 
     // === Debug/display ===
-
     /// The last desired steering angle computed (for display).
     pub last_desired_angle: f64,
 
@@ -199,12 +193,7 @@ impl SteeringController {
     /// - `speed_mps`: current vehicle speed in m/s
     ///
     /// Returns (desired_angle_deg, disengaged_this_frame).
-    pub fn compute(
-        &mut self,
-        xte_m: f64,
-        heading_error_deg: f64,
-        speed_mps: f64,
-    ) -> (f64, bool) {
+    pub fn compute(&mut self, xte_m: f64, heading_error_deg: f64, speed_mps: f64) -> (f64, bool) {
         if !self.engaged {
             self.last_desired_angle = 0.0;
             return (0.0, false);
@@ -241,9 +230,8 @@ impl SteeringController {
         self.prev_compute_time = Some(now);
 
         // === Outer loop: pure pursuit geometry ===
-        let base_lookahead = (self.lookahead_base
-            + self.lookahead_speed_factor * speed_mps)
-            .clamp(2.0, 15.0);
+        let base_lookahead =
+            (self.lookahead_base + self.lookahead_speed_factor * speed_mps).clamp(2.0, 15.0);
 
         // Heading-aware lookahead reduction: when the tractor is pointed
         // significantly off the line bearing but XTE is small (approaching
@@ -276,8 +264,7 @@ impl SteeringController {
         let alpha_line_frame = (-xte_m).atan2(lookahead_m);
         let alpha_rad = alpha_line_frame - psi_rad;
 
-        let delta_rad = (2.0 * self.wheelbase_m * alpha_rad.sin())
-            .atan2(lookahead_m);
+        let delta_rad = (2.0 * self.wheelbase_m * alpha_rad.sin()).atan2(lookahead_m);
         let mut desired_angle = delta_rad.to_degrees();
 
         // === Waveform damping ===
@@ -339,8 +326,11 @@ mod tests {
         let mut c = engaged_controller();
         c.prev_xte_m = Some(1.0);
         let (angle, _) = c.compute(1.0, 0.0, 2.0);
-        assert!(angle < 0.0,
-            "Right of line should command left steering, got {}", angle);
+        assert!(
+            angle < 0.0,
+            "Right of line should command left steering, got {}",
+            angle
+        );
     }
 
     #[test]
@@ -348,8 +338,11 @@ mod tests {
         let mut c = engaged_controller();
         c.prev_xte_m = Some(-1.0);
         let (angle, _) = c.compute(-1.0, 0.0, 2.0);
-        assert!(angle > 0.0,
-            "Left of line should command right steering, got {}", angle);
+        assert!(
+            angle > 0.0,
+            "Left of line should command right steering, got {}",
+            angle
+        );
     }
 
     #[test]
@@ -357,8 +350,11 @@ mod tests {
         let mut c = engaged_controller();
         c.prev_xte_m = Some(0.0);
         let (angle, _) = c.compute(0.0, 10.0, 2.0);
-        assert!(angle < 0.0,
-            "Pointed right of line should command left steer, got {}", angle);
+        assert!(
+            angle < 0.0,
+            "Pointed right of line should command left steer, got {}",
+            angle
+        );
     }
 
     #[test]
@@ -366,8 +362,11 @@ mod tests {
         let mut c = engaged_controller();
         c.max_steer_angle = 15.0;
         let (angle, _) = c.compute(50.0, 0.0, 2.0);
-        assert!(angle.abs() <= 15.0 + 0.01,
-            "Desired angle {} exceeds max", angle);
+        assert!(
+            angle.abs() <= 15.0 + 0.01,
+            "Desired angle {} exceeds max",
+            angle
+        );
     }
 
     #[test]
@@ -379,8 +378,12 @@ mod tests {
         let l_slow = c.last_lookahead_m;
         c.compute(1.0, 0.0, 5.0);
         let l_fast = c.last_lookahead_m;
-        assert!(l_fast > l_slow,
-            "Lookahead should grow with speed: {} vs {}", l_slow, l_fast);
+        assert!(
+            l_fast > l_slow,
+            "Lookahead should grow with speed: {} vs {}",
+            l_slow,
+            l_fast
+        );
     }
 
     #[test]
@@ -408,9 +411,12 @@ mod tests {
         c2.compute(1.0, 0.0, 2.0);
         let converging_angle = c2.last_desired_angle;
 
-        assert!(converging_angle.abs() < steady_angle.abs(),
+        assert!(
+            converging_angle.abs() < steady_angle.abs(),
             "Converging XTE should reduce correction: steady={:.3} converging={:.3}",
-            steady_angle, converging_angle);
+            steady_angle,
+            converging_angle
+        );
     }
 
     #[test]
@@ -428,8 +434,11 @@ mod tests {
         c2.compute(1.0, 0.0, 2.0);
         let diverging_angle = c2.last_desired_angle;
 
-        assert!(diverging_angle.abs() > steady_angle.abs(),
+        assert!(
+            diverging_angle.abs() > steady_angle.abs(),
             "Diverging XTE should increase correction: steady={:.3} diverging={:.3}",
-            steady_angle, diverging_angle);
+            steady_angle,
+            diverging_angle
+        );
     }
 }

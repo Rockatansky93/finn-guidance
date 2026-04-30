@@ -8,20 +8,22 @@
 //!
 //! The GPS status bar is always visible on both pages (safety-critical).
 
+use super::field_view::FieldView;
+use crate::comms::serial::MotorHandle;
+use crate::coverage::db::{CoverageDb, SavedAbLine, SavedField};
+use crate::coverage::logger::CoverageLogger;
+use crate::gps::reader::{SharedAntennaHeight, SharedHeadingOffset};
+use crate::guidance::ab_line::AbLineGuide;
+use crate::guidance::steer_thread::{
+    AbLineData, SteerCommand, SteerDisplayState, SteerStateHandle,
+};
+use crate::position::interpolator::PositionInterpolator;
+use crossbeam_channel::Receiver;
+use eframe::egui;
+use finn_guidance_common::protocol::FinnMessage;
+use finn_guidance_common::types::{CrossTrackError, FixQuality, GpsFix, MotorStatus};
 use std::collections::VecDeque;
 use std::time::Duration;
-use eframe::egui;
-use crossbeam_channel::Receiver;
-use finn_guidance_common::types::{GpsFix, CrossTrackError, FixQuality, MotorStatus};
-use finn_guidance_common::protocol::FinnMessage;
-use crate::comms::serial::MotorHandle;
-use crate::guidance::ab_line::AbLineGuide;
-use crate::guidance::steer_thread::{SteerStateHandle, SteerCommand, SteerDisplayState, AbLineData};
-use crate::coverage::logger::CoverageLogger;
-use crate::coverage::db::{CoverageDb, SavedField, SavedAbLine};
-use crate::position::interpolator::PositionInterpolator;
-use crate::gps::reader::{SharedHeadingOffset, SharedAntennaHeight};
-use super::field_view::FieldView;
 
 /// Target frame interval — 30fps is smooth for guidance display while
 /// keeping CPU load low on field laptops (Dell 7390 etc).
@@ -153,78 +155,101 @@ pub struct GuidanceApp {
 }
 
 impl GuidanceApp {
-    pub fn new(gps_rx: Receiver<GpsFix>, finn_rx: Receiver<FinnMessage>, motor_handle: MotorHandle, steer_state: SteerStateHandle, implement_width: f64, heading_offset_shared: SharedHeadingOffset, antenna_height_shared: SharedAntennaHeight) -> Self {
+    pub fn new(
+        gps_rx: Receiver<GpsFix>,
+        finn_rx: Receiver<FinnMessage>,
+        motor_handle: MotorHandle,
+        steer_state: SteerStateHandle,
+        implement_width: f64,
+        heading_offset_shared: SharedHeadingOffset,
+        antenna_height_shared: SharedAntennaHeight,
+    ) -> Self {
         // Open the coverage database.  `CoverageLogger` also holds a reference
         // in some configurations; here we open a second handle for persistence.
         let db = CoverageDb::open(std::path::Path::new("data/coverage.db")).ok();
 
         // Pre-load the field/line lists so the UI is ready immediately.
-        let saved_fields = db.as_ref()
+        let saved_fields = db
+            .as_ref()
             .and_then(|d| d.list_fields().ok())
             .unwrap_or_default();
-        let saved_ab_lines = db.as_ref()
+        let saved_ab_lines = db
+            .as_ref()
             .and_then(|d| d.list_ab_lines().ok())
             .unwrap_or_default();
 
         // Load persisted settings from database, falling back to defaults
-        let implement_width = db.as_ref()
+        let implement_width = db
+            .as_ref()
             .and_then(|d| d.get_config("implement_width_m"))
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(implement_width);
 
-        let overlap = db.as_ref()
+        let overlap = db
+            .as_ref()
             .and_then(|d| d.get_config("overlap_m"))
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(0.0);
 
-        let lightbar_cm_per_seg = db.as_ref()
+        let lightbar_cm_per_seg = db
+            .as_ref()
             .and_then(|d| d.get_config("lightbar_cm_per_seg"))
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(20.0);
 
         // Load WAS calibration from database (None if not yet calibrated)
-        let was_centre = db.as_ref()
+        let was_centre = db
+            .as_ref()
             .and_then(|d| d.get_config("was_centre"))
             .and_then(|v| v.parse::<u16>().ok());
-        let was_left_lock = db.as_ref()
+        let was_left_lock = db
+            .as_ref()
             .and_then(|d| d.get_config("was_left_lock"))
             .and_then(|v| v.parse::<u16>().ok());
-        let was_right_lock = db.as_ref()
+        let was_right_lock = db
+            .as_ref()
             .and_then(|d| d.get_config("was_right_lock"))
             .and_then(|v| v.parse::<u16>().ok());
-        let motor_invert = db.as_ref()
+        let motor_invert = db
+            .as_ref()
             .and_then(|d| d.get_config("motor_invert"))
             .map(|v| v == "true")
             .unwrap_or(false);
 
         // Load WAS filtering parameters from database
-        let was_ema_alpha = db.as_ref()
+        let was_ema_alpha = db
+            .as_ref()
             .and_then(|d| d.get_config("was_ema_alpha"))
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(0.15);
-        let was_deadzone_deg = db.as_ref()
+        let was_deadzone_deg = db
+            .as_ref()
             .and_then(|d| d.get_config("was_deadzone_deg"))
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(2.0);
-        let was_curve_exp = db.as_ref()
+        let was_curve_exp = db
+            .as_ref()
             .and_then(|d| d.get_config("was_curve_exp"))
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(2.0);
 
         // Load nudge step size from database
-        let nudge_step_cm = db.as_ref()
+        let nudge_step_cm = db
+            .as_ref()
             .and_then(|d| d.get_config("nudge_step_cm"))
             .and_then(|v| v.parse::<i32>().ok())
             .unwrap_or(5);
 
         // Load heading offset calibration from database
-        let heading_offset_deg = db.as_ref()
+        let heading_offset_deg = db
+            .as_ref()
             .and_then(|d| d.get_config("heading_offset_deg"))
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(0.0);
 
         // Load telemetry logging toggle from database (default: off)
-        let telemetry_enabled = db.as_ref()
+        let telemetry_enabled = db
+            .as_ref()
             .and_then(|d| d.get_config("telemetry_enabled"))
             .map(|v| v == "true")
             .unwrap_or(false);
@@ -235,7 +260,8 @@ impl GuidanceApp {
         );
 
         // Load antenna height for roll correction from database
-        let antenna_height_m = db.as_ref()
+        let antenna_height_m = db
+            .as_ref()
             .and_then(|d| d.get_config("antenna_height_m"))
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(0.0);
@@ -248,28 +274,34 @@ impl GuidanceApp {
         // Load pure-pursuit steering parameters from database.
         // Note: pre-pure-pursuit databases may have `steer_kp` / `steer_kh`
         // stored — those keys are now ignored and left in place (harmless).
-        let lookahead_base = db.as_ref()
+        let lookahead_base = db
+            .as_ref()
             .and_then(|d| d.get_config("steer_lookahead_base"))
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(3.0);
-        let lookahead_speed_factor = db.as_ref()
+        let lookahead_speed_factor = db
+            .as_ref()
             .and_then(|d| d.get_config("steer_lookahead_speed_factor"))
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(1.0);
-        let steer_wheelbase = db.as_ref()
+        let steer_wheelbase = db
+            .as_ref()
             .and_then(|d| d.get_config("steer_wheelbase"))
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(2.8);
-        let steer_max_angle = db.as_ref()
+        let steer_max_angle = db
+            .as_ref()
             .and_then(|d| d.get_config("steer_max_angle"))
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(15.0);
-        let _steer_kp_angle = db.as_ref()
+        let _steer_kp_angle = db
+            .as_ref()
             .and_then(|d| d.get_config("steer_kp_angle"))
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(10.0);
 
-        let steer_kd_xte = db.as_ref()
+        let steer_kd_xte = db
+            .as_ref()
             .and_then(|d| d.get_config("steer_kd_xte"))
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(0.5);
@@ -415,12 +447,16 @@ impl GuidanceApp {
         let angle = if raw <= centre {
             // Left half: map [left_lock .. centre] → [-MAX_ANGLE .. 0]
             let range = centre - left;
-            if range.abs() < 1.0 { return Some(0.0); }
+            if range.abs() < 1.0 {
+                return Some(0.0);
+            }
             -MAX_ANGLE * (centre - raw) / range
         } else {
             // Right half: map [centre .. right_lock] → [0 .. MAX_ANGLE]
             let range = right - centre;
-            if range.abs() < 1.0 { return Some(0.0); }
+            if range.abs() < 1.0 {
+                return Some(0.0);
+            }
             MAX_ANGLE * (raw - centre) / range
         };
 
@@ -431,7 +467,11 @@ impl GuidanceApp {
     /// When motor_invert is true, the sign is flipped so that positive always
     /// means "steer right" from the PID's perspective.
     fn apply_motor_direction(&self, pwm: i16) -> i16 {
-        if self.motor_invert { -pwm } else { pwm }
+        if self.motor_invert {
+            -pwm
+        } else {
+            pwm
+        }
     }
 
     /// Push the current heading offset to the shared atomic (for the GPS
@@ -442,7 +482,10 @@ impl GuidanceApp {
             std::sync::atomic::Ordering::Relaxed,
         );
         if let Some(db) = &self.db {
-            let _ = db.set_config("heading_offset_deg", &format!("{:.1}", self.heading_offset_deg));
+            let _ = db.set_config(
+                "heading_offset_deg",
+                &format!("{:.1}", self.heading_offset_deg),
+            );
         }
     }
 
@@ -503,9 +546,8 @@ impl eframe::App for GuidanceApp {
                 }
                 FinnMessage::ConfigAck(ack) => {
                     let status = if ack.success { "OK" } else { "FAILED" };
-                    self.was_cal_msg = Some((
-                        format!("ESP32 {} config: {}", ack.param, status), 180
-                    ));
+                    self.was_cal_msg =
+                        Some((format!("ESP32 {} config: {}", ack.param, status), 180));
                 }
             }
         }
@@ -516,12 +558,12 @@ impl eframe::App for GuidanceApp {
             self.steer_display = state.display.clone();
             // Check if steer thread flagged a disengage event
             if state.display.just_disengaged {
-                let reason = state.display.disengage_reason.clone()
+                let reason = state
+                    .display
+                    .disengage_reason
+                    .clone()
                     .unwrap_or_else(|| "Unknown".to_string());
-                self.steer_status_msg = Some((
-                    format!("Auto-steer OFF: {}", reason),
-                    300,
-                ));
+                self.steer_status_msg = Some((format!("Auto-steer OFF: {}", reason), 300));
                 state.display.just_disengaged = false;
             }
         }
@@ -549,19 +591,39 @@ impl eframe::App for GuidanceApp {
             }
         }
         if let Some((_, ref mut frames)) = self.ab_status_msg {
-            if *frames == 0 { self.ab_status_msg = None; } else { *frames -= 1; }
+            if *frames == 0 {
+                self.ab_status_msg = None;
+            } else {
+                *frames -= 1;
+            }
         }
         if let Some((_, ref mut frames)) = self.io_status_msg {
-            if *frames == 0 { self.io_status_msg = None; } else { *frames -= 1; }
+            if *frames == 0 {
+                self.io_status_msg = None;
+            } else {
+                *frames -= 1;
+            }
         }
         if let Some((_, ref mut frames)) = self.motor_test_msg {
-            if *frames == 0 { self.motor_test_msg = None; } else { *frames -= 1; }
+            if *frames == 0 {
+                self.motor_test_msg = None;
+            } else {
+                *frames -= 1;
+            }
         }
         if let Some((_, ref mut frames)) = self.was_cal_msg {
-            if *frames == 0 { self.was_cal_msg = None; } else { *frames -= 1; }
+            if *frames == 0 {
+                self.was_cal_msg = None;
+            } else {
+                *frames -= 1;
+            }
         }
         if let Some((_, ref mut frames)) = self.steer_status_msg {
-            if *frames == 0 { self.steer_status_msg = None; } else { *frames -= 1; }
+            if *frames == 0 {
+                self.steer_status_msg = None;
+            } else {
+                *frames -= 1;
+            }
         }
 
         // Request repaint at ~30fps — smooth for guidance display while
@@ -601,7 +663,10 @@ impl GuidanceApp {
                     ui.label(format!("{:.1} km/h", fix.speed * 3.6));
                     ui.separator();
                     if self.heading_offset_deg.abs() > 0.05 {
-                        ui.label(format!("{:.0}° ({:+.1}°)", fix.heading, self.heading_offset_deg));
+                        ui.label(format!(
+                            "{:.0}° ({:+.1}°)",
+                            fix.heading, self.heading_offset_deg
+                        ));
                     } else {
                         ui.label(format!("{:.0}°", fix.heading));
                     }
@@ -627,208 +692,248 @@ impl GuidanceApp {
         // Bottom bar: two rows for tractor cab use.
         // Row 1: Set A/B, Nudge buttons, Align Grid
         // Row 2: ENGAGE, AUTO-STEER, Auto-pass, Pass indicator, Setup
-        egui::TopBottomPanel::bottom("working_controls")
-            .show(ctx, |ui| {
-                // === Row 1: Set A/B, Nudge, Align ===
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
+        egui::TopBottomPanel::bottom("working_controls").show(ctx, |ui| {
+            // === Row 1: Set A/B, Nudge, Align ===
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
 
-                    // Set A / Set B buttons
-                    let has_fix = self.current_fix.is_some();
-                    let set_a_btn = egui::Button::new(
-                        egui::RichText::new("Set A").size(24.0).strong()
-                    ).min_size(egui::vec2(120.0, 60.0));
-                    if ui.add_enabled(has_fix, set_a_btn).clicked() {
-                        if let Some(fix) = &self.current_fix {
-                            self.guide.set_point_a(fix);
-                            self.sync_guide_to_steer_thread();
-                            self.steer_status_msg = Some(("Point A set".to_string(), 120));
-                        }
+                // Set A / Set B buttons
+                let has_fix = self.current_fix.is_some();
+                let set_a_btn = egui::Button::new(egui::RichText::new("Set A").size(24.0).strong())
+                    .min_size(egui::vec2(120.0, 60.0));
+                if ui.add_enabled(has_fix, set_a_btn).clicked() {
+                    if let Some(fix) = &self.current_fix {
+                        self.guide.set_point_a(fix);
+                        self.sync_guide_to_steer_thread();
+                        self.steer_status_msg = Some(("Point A set".to_string(), 120));
                     }
-                    let set_b_btn = egui::Button::new(
-                        egui::RichText::new("Set B").size(24.0).strong()
-                    ).min_size(egui::vec2(120.0, 60.0));
-                    let can_set_b = has_fix && self.guide.line.is_some();
-                    if ui.add_enabled(can_set_b, set_b_btn).clicked() {
-                        if let Some(fix) = &self.current_fix {
-                            self.guide.set_point_b(fix);
-                            self.sync_guide_to_steer_thread();
-                            self.steer_status_msg = Some(("Point B set — line active".to_string(), 180));
-                        }
+                }
+                let set_b_btn = egui::Button::new(egui::RichText::new("Set B").size(24.0).strong())
+                    .min_size(egui::vec2(120.0, 60.0));
+                let can_set_b = has_fix && self.guide.line.is_some();
+                if ui.add_enabled(can_set_b, set_b_btn).clicked() {
+                    if let Some(fix) = &self.current_fix {
+                        self.guide.set_point_b(fix);
+                        self.sync_guide_to_steer_thread();
+                        self.steer_status_msg =
+                            Some(("Point B set — line active".to_string(), 180));
                     }
+                }
 
-                    ui.separator();
+                ui.separator();
 
-                    // Nudge buttons: ◄N  ◄1  [value]  1►  N►  Reset
-                    // Coarse step is configurable (nudge_step_cm), fine step is always 1cm.
-                    let step_m = self.nudge_step_cm as f64 / 100.0;
-                    let step_label = self.nudge_step_cm.to_string();
-                    if ui.add(egui::Button::new(
-                        egui::RichText::new(format!("◄{}", step_label)).size(24.0)
-                    ).min_size(egui::vec2(64.0, 60.0))).clicked() {
-                        self.guide.nudge_left(step_m);
+                // Nudge buttons: ◄N  ◄1  [value]  1►  N►  Reset
+                // Coarse step is configurable (nudge_step_cm), fine step is always 1cm.
+                let step_m = self.nudge_step_cm as f64 / 100.0;
+                let step_label = self.nudge_step_cm.to_string();
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new(format!("◄{}", step_label)).size(24.0),
+                        )
+                        .min_size(egui::vec2(64.0, 60.0)),
+                    )
+                    .clicked()
+                {
+                    self.guide.nudge_left(step_m);
+                    self.sync_guide_to_steer_thread();
+                }
+                if ui
+                    .add(
+                        egui::Button::new(egui::RichText::new("◄1").size(24.0))
+                            .min_size(egui::vec2(64.0, 60.0)),
+                    )
+                    .clicked()
+                {
+                    self.guide.nudge_left(0.01);
+                    self.sync_guide_to_steer_thread();
+                }
+
+                let nudge_cm = (self.guide.nudge_m * 100.0).round() as i32;
+                let nudge_colour = if nudge_cm == 0 {
+                    egui::Color32::GRAY
+                } else {
+                    egui::Color32::from_rgb(255, 200, 60)
+                };
+                let nudge_text = if nudge_cm == 0 {
+                    "0".to_string()
+                } else if nudge_cm > 0 {
+                    format!("{}R", nudge_cm)
+                } else {
+                    format!("{}L", nudge_cm.abs())
+                };
+                ui.label(
+                    egui::RichText::new(nudge_text)
+                        .size(24.0)
+                        .strong()
+                        .color(nudge_colour),
+                );
+
+                if ui
+                    .add(
+                        egui::Button::new(egui::RichText::new("1►").size(24.0))
+                            .min_size(egui::vec2(64.0, 60.0)),
+                    )
+                    .clicked()
+                {
+                    self.guide.nudge_right(0.01);
+                    self.sync_guide_to_steer_thread();
+                }
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new(format!("{}►", step_label)).size(24.0),
+                        )
+                        .min_size(egui::vec2(64.0, 60.0)),
+                    )
+                    .clicked()
+                {
+                    self.guide.nudge_right(step_m);
+                    self.sync_guide_to_steer_thread();
+                }
+                if nudge_cm != 0 {
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("Rst").size(20.0))
+                                .min_size(egui::vec2(70.0, 60.0)),
+                        )
+                        .clicked()
+                    {
+                        self.guide.nudge_reset();
                         self.sync_guide_to_steer_thread();
                     }
-                    if ui.add(egui::Button::new(
-                        egui::RichText::new("◄1").size(24.0)
-                    ).min_size(egui::vec2(64.0, 60.0))).clicked() {
-                        self.guide.nudge_left(0.01);
-                        self.sync_guide_to_steer_thread();
-                    }
+                }
 
-                    let nudge_cm = (self.guide.nudge_m * 100.0).round() as i32;
-                    let nudge_colour = if nudge_cm == 0 {
-                        egui::Color32::GRAY
-                    } else {
-                        egui::Color32::from_rgb(255, 200, 60)
-                    };
-                    let nudge_text = if nudge_cm == 0 {
-                        "0".to_string()
-                    } else if nudge_cm > 0 {
-                        format!("{}R", nudge_cm)
-                    } else {
-                        format!("{}L", nudge_cm.abs())
-                    };
-                    ui.label(
-                        egui::RichText::new(nudge_text)
-                            .size(24.0).strong().color(nudge_colour),
-                    );
+                ui.separator();
 
-                    if ui.add(egui::Button::new(
-                        egui::RichText::new("1►").size(24.0)
-                    ).min_size(egui::vec2(64.0, 60.0))).clicked() {
-                        self.guide.nudge_right(0.01);
-                        self.sync_guide_to_steer_thread();
-                    }
-                    if ui.add(egui::Button::new(
-                        egui::RichText::new(format!("{}►", step_label)).size(24.0)
-                    ).min_size(egui::vec2(64.0, 60.0))).clicked() {
-                        self.guide.nudge_right(step_m);
-                        self.sync_guide_to_steer_thread();
-                    }
-                    if nudge_cm != 0 {
-                        if ui.add(egui::Button::new(
-                            egui::RichText::new("Rst").size(20.0)
-                        ).min_size(egui::vec2(70.0, 60.0))).clicked() {
-                            self.guide.nudge_reset();
-                            self.sync_guide_to_steer_thread();
-                        }
-                    }
-
-                    ui.separator();
-
-                    // Align Passes to Here
-                    let can_align = self.guide.has_complete_line() && self.current_fix.is_some();
-                    let align_btn = egui::Button::new(
-                        egui::RichText::new("⊚ Snap").size(24.0)
-                    ).min_size(egui::vec2(130.0, 60.0));
-                    if ui.add_enabled(can_align, align_btn).clicked() {
-                        if let Some(fix) = self.current_fix.clone() {
-                            match self.guide.align_grid_to_position(&fix) {
-                                Some(shift_m) => {
-                                    self.sync_guide_to_steer_thread();
-                                    let shift_cm = (shift_m * 100.0).round() as i32;
-                                    let nudge_cm = (self.guide.nudge_m * 100.0).round() as i32;
-                                    self.steer_status_msg = Some((
-                                        format!("Line snapped {}cm (nudge now {}cm)", shift_cm, nudge_cm),
-                                        360,
-                                    ));
-                                }
-                                None => {
-                                    self.steer_status_msg = Some((
-                                        "Snap failed".to_string(), 300,
-                                    ));
-                                }
+                // Align Passes to Here
+                let can_align = self.guide.has_complete_line() && self.current_fix.is_some();
+                let align_btn = egui::Button::new(egui::RichText::new("⊚ Snap").size(24.0))
+                    .min_size(egui::vec2(130.0, 60.0));
+                if ui.add_enabled(can_align, align_btn).clicked() {
+                    if let Some(fix) = self.current_fix.clone() {
+                        match self.guide.align_grid_to_position(&fix) {
+                            Some(shift_m) => {
+                                self.sync_guide_to_steer_thread();
+                                let shift_cm = (shift_m * 100.0).round() as i32;
+                                let nudge_cm = (self.guide.nudge_m * 100.0).round() as i32;
+                                self.steer_status_msg = Some((
+                                    format!(
+                                        "Line snapped {}cm (nudge now {}cm)",
+                                        shift_cm, nudge_cm
+                                    ),
+                                    360,
+                                ));
+                            }
+                            None => {
+                                self.steer_status_msg = Some(("Snap failed".to_string(), 300));
                             }
                         }
                     }
-                });
+                }
+            });
 
-                ui.add_space(4.0);
+            ui.add_space(4.0);
 
-                // === Row 2: main action buttons ===
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 12.0;
+            // === Row 2: main action buttons ===
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 12.0;
 
-                    // Large engage button
-                    let engage_text = if self.coverage.is_engaged() { "⏹ DISENGAGE" } else { "▶ ENGAGE" };
-                    let engage_colour = if self.coverage.is_engaged() {
-                        egui::Color32::from_rgb(255, 60, 60)
+                // Large engage button
+                let engage_text = if self.coverage.is_engaged() {
+                    "⏹ DISENGAGE"
+                } else {
+                    "▶ ENGAGE"
+                };
+                let engage_colour = if self.coverage.is_engaged() {
+                    egui::Color32::from_rgb(255, 60, 60)
+                } else {
+                    egui::Color32::from_rgb(60, 200, 60)
+                };
+                let engage_btn = egui::Button::new(
+                    egui::RichText::new(engage_text)
+                        .size(28.0)
+                        .strong()
+                        .color(engage_colour),
+                )
+                .min_size(egui::vec2(220.0, 70.0));
+                if ui.add(engage_btn).clicked() {
+                    self.coverage.toggle_engage(self.db.as_ref());
+                }
+
+                // Auto-steer engage/disengage button
+                let can_auto_steer = self.guide.has_complete_line()
+                    && self.motor_handle.is_connected()
+                    && self.was_centre.is_some()
+                    && self.was_left_lock.is_some()
+                    && self.was_right_lock.is_some();
+
+                let (steer_text, steer_colour) = if self.steer_display.engaged {
+                    ("⊗ STEER OFF", egui::Color32::from_rgb(255, 60, 60))
+                } else {
+                    ("⊕ AUTO-STEER", egui::Color32::from_rgb(100, 200, 255))
+                };
+                let steer_btn = egui::Button::new(
+                    egui::RichText::new(steer_text)
+                        .size(28.0)
+                        .strong()
+                        .color(steer_colour),
+                )
+                .min_size(egui::vec2(220.0, 70.0));
+                let steer_resp =
+                    ui.add_enabled(can_auto_steer || self.steer_display.engaged, steer_btn);
+                if steer_resp.clicked() {
+                    if self.steer_display.engaged {
+                        let mut state = self.steer_state.lock().unwrap();
+                        state.commands.push(SteerCommand::Disengage);
+                        drop(state);
+                        self.steer_status_msg = Some(("Auto-steer OFF".to_string(), 180));
                     } else {
-                        egui::Color32::from_rgb(60, 200, 60)
-                    };
-                    let engage_btn = egui::Button::new(
-                        egui::RichText::new(engage_text).size(28.0).strong().color(engage_colour)
-                    ).min_size(egui::vec2(220.0, 70.0));
-                    if ui.add(engage_btn).clicked() {
-                        self.coverage.toggle_engage(self.db.as_ref());
+                        let mut state = self.steer_state.lock().unwrap();
+                        state.commands.push(SteerCommand::Engage);
+                        drop(state);
+                        self.steer_status_msg = Some(("Auto-steer ON".to_string(), 180));
+                    }
+                }
+
+                // Auto-pass toggle
+                let auto_label = if self.guide.auto_pass_enabled {
+                    "Auto ✓"
+                } else {
+                    "Auto ✗"
+                };
+                let auto_colour = if self.guide.auto_pass_enabled {
+                    egui::Color32::from_rgb(60, 200, 60)
+                } else {
+                    egui::Color32::GRAY
+                };
+                let auto_btn = egui::Button::new(
+                    egui::RichText::new(auto_label)
+                        .size(24.0)
+                        .color(auto_colour),
+                )
+                .min_size(egui::vec2(130.0, 70.0));
+                if ui.add(auto_btn).clicked() {
+                    self.guide.auto_pass_enabled = !self.guide.auto_pass_enabled;
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Page switch: go to setup
+                    let setup_btn = egui::Button::new(egui::RichText::new("⚙ Setup").size(24.0))
+                        .min_size(egui::vec2(140.0, 70.0));
+                    if ui.add(setup_btn).clicked() {
+                        self.active_page = ActivePage::Setup;
                     }
 
-                    // Auto-steer engage/disengage button
-                    let can_auto_steer = self.guide.has_complete_line()
-                        && self.motor_handle.is_connected()
-                        && self.was_centre.is_some()
-                        && self.was_left_lock.is_some()
-                        && self.was_right_lock.is_some();
-
-                    let (steer_text, steer_colour) = if self.steer_display.engaged {
-                        ("⊗ STEER OFF", egui::Color32::from_rgb(255, 60, 60))
-                    } else {
-                        ("⊕ AUTO-STEER", egui::Color32::from_rgb(100, 200, 255))
-                    };
-                    let steer_btn = egui::Button::new(
-                        egui::RichText::new(steer_text).size(28.0).strong().color(steer_colour)
-                    ).min_size(egui::vec2(220.0, 70.0));
-                    let steer_resp = ui.add_enabled(
-                        can_auto_steer || self.steer_display.engaged,
-                        steer_btn,
+                    // Pass indicator
+                    ui.label(
+                        egui::RichText::new(format!("Pass {}", self.guide.pass_number))
+                            .size(28.0)
+                            .color(egui::Color32::from_rgb(80, 160, 255)),
                     );
-                    if steer_resp.clicked() {
-                        if self.steer_display.engaged {
-                            let mut state = self.steer_state.lock().unwrap();
-                            state.commands.push(SteerCommand::Disengage);
-                            drop(state);
-                            self.steer_status_msg = Some(("Auto-steer OFF".to_string(), 180));
-                        } else {
-                            let mut state = self.steer_state.lock().unwrap();
-                            state.commands.push(SteerCommand::Engage);
-                            drop(state);
-                            self.steer_status_msg = Some(("Auto-steer ON".to_string(), 180));
-                        }
-                    }
-
-                    // Auto-pass toggle
-                    let auto_label = if self.guide.auto_pass_enabled { "Auto ✓" } else { "Auto ✗" };
-                    let auto_colour = if self.guide.auto_pass_enabled {
-                        egui::Color32::from_rgb(60, 200, 60)
-                    } else {
-                        egui::Color32::GRAY
-                    };
-                    let auto_btn = egui::Button::new(
-                        egui::RichText::new(auto_label).size(24.0).color(auto_colour)
-                    ).min_size(egui::vec2(130.0, 70.0));
-                    if ui.add(auto_btn).clicked() {
-                        self.guide.auto_pass_enabled = !self.guide.auto_pass_enabled;
-                    }
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Page switch: go to setup
-                        let setup_btn = egui::Button::new(
-                            egui::RichText::new("⚙ Setup").size(24.0)
-                        ).min_size(egui::vec2(140.0, 70.0));
-                        if ui.add(setup_btn).clicked() {
-                            self.active_page = ActivePage::Setup;
-                        }
-
-                        // Pass indicator
-                        ui.label(
-                            egui::RichText::new(format!("Pass {}", self.guide.pass_number))
-                                .size(28.0)
-                                .color(egui::Color32::from_rgb(80, 160, 255)),
-                        );
-                    });
                 });
             });
+        });
 
         // Central panel: field view with overlaid guidance
         let canvas_frame = egui::Frame::default()
@@ -867,7 +972,8 @@ impl GuidanceApp {
                     };
 
                     // Large XTE number — top right, below lightbar
-                    let xte_pos = egui::pos2(overlay_rect.right() - 20.0, overlay_rect.top() + 55.0);
+                    let xte_pos =
+                        egui::pos2(overlay_rect.right() - 20.0, overlay_rect.top() + 55.0);
 
                     // Background pill for readability
                     let text_galley = painter.layout_no_wrap(
@@ -876,10 +982,7 @@ impl GuidanceApp {
                         colour,
                     );
                     let pill_rect = egui::Rect::from_min_size(
-                        egui::pos2(
-                            xte_pos.x - text_galley.size().x - 20.0,
-                            xte_pos.y,
-                        ),
+                        egui::pos2(xte_pos.x - text_galley.size().x - 20.0, xte_pos.y),
                         egui::vec2(text_galley.size().x + 30.0, text_galley.size().y + 10.0),
                     );
                     painter.rect_filled(
@@ -941,7 +1044,8 @@ impl GuidanceApp {
                         self.steer_display.heading_error,
                         self.steer_display.lookahead_m,
                     );
-                    let steer_pos = egui::pos2(overlay_rect.left() + 20.0, overlay_rect.top() + 55.0);
+                    let steer_pos =
+                        egui::pos2(overlay_rect.left() + 20.0, overlay_rect.top() + 55.0);
                     let indicator_colour = egui::Color32::from_rgb(100, 255, 100);
                     let steer_galley = painter.layout_no_wrap(
                         steer_text,
@@ -973,10 +1077,7 @@ impl GuidanceApp {
                         egui::Color32::from_rgb(255, 200, 100),
                     );
                     let msg_rect = egui::Rect::from_min_size(
-                        egui::pos2(
-                            msg_pos.x - msg_galley.size().x / 2.0 - 10.0,
-                            msg_pos.y,
-                        ),
+                        egui::pos2(msg_pos.x - msg_galley.size().x / 2.0 - 10.0, msg_pos.y),
                         egui::vec2(msg_galley.size().x + 20.0, msg_galley.size().y + 10.0),
                     );
                     painter.rect_filled(
@@ -1031,7 +1132,9 @@ impl GuidanceApp {
         // XTE positive = vehicle is RIGHT of line, so the line is to the LEFT
         // of the vehicle → dots shift left (negative segment index).
         // XTE negative = vehicle is LEFT of line → dots shift right.
-        let xtd_cm = self.current_error.as_ref()
+        let xtd_cm = self
+            .current_error
+            .as_ref()
             .map(|e| (e.distance_m * 100.0) as f64)
             .unwrap_or(0.0);
 
@@ -1093,8 +1196,9 @@ impl GuidanceApp {
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
                     let work_btn = egui::Button::new(
-                        egui::RichText::new("◄ Working View").size(18.0).strong()
-                    ).min_size(egui::vec2(160.0, 40.0));
+                        egui::RichText::new("◄ Working View").size(18.0).strong(),
+                    )
+                    .min_size(egui::vec2(160.0, 40.0));
                     if ui.add(work_btn).clicked() {
                         self.active_page = ActivePage::Working;
                     }
@@ -2776,18 +2880,10 @@ fn lightbar_colour(distance: f32, max_distance: f32) -> egui::Color32 {
     if t < 0.5 {
         // Green → Yellow (first half)
         let u = t * 2.0; // 0..1 within this band
-        egui::Color32::from_rgb(
-            (255.0 * u) as u8,
-            255,
-            0,
-        )
+        egui::Color32::from_rgb((255.0 * u) as u8, 255, 0)
     } else {
         // Yellow → Red (second half)
         let u = (t - 0.5) * 2.0; // 0..1 within this band
-        egui::Color32::from_rgb(
-            255,
-            (255.0 * (1.0 - u)) as u8,
-            0,
-        )
+        egui::Color32::from_rgb(255, (255.0 * (1.0 - u)) as u8, 0)
     }
 }

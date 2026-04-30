@@ -1406,3 +1406,66 @@ are removed from the cab entirely.
 - Keep DA module and just move inner loop to ESP32 (rejected: misses the 10Hz GPS
   upgrade and heading fusion improvement. The BA boards are already purchased and
   available — no cost barrier)
+
+---
+
+## #028 — LC29H BA DR remediation: PQTMINS/PQTMIMU with corrected NR11 parsing
+
+**Date:** 30 April 2026
+**Status:** Accepted
+**Context:** Field testing in hilly country showed roll compensation stuck at
+zero, so the tractor drifted laterally on slope. The detailed remediation plan
+is in `docs/DR_REMEDIATION_STRATEGY.md`. Probe work identified the module as
+LC29H BA NR11 two-wheel firmware:
+
+```text
+$PQTMVERNO,LC29HBANR11A02S_CSA2,2023/05/09,20:49:45
+```
+
+The module accepts `PQTMCFGEINSMSG` only with numeric `Type` fields, not the
+literal `W` previously used by `reader.rs`. It streams `$PQTMINS` and `$PQTMIMU`
+once enabled and saved, but roll/pitch remain zero until the module has had a
+proper DR calibration drive.
+
+**Decision:** Use `$PQTMINS` from the LC29H BA NR11 firmware as the attitude and
+DR-fused heading source. Continue to source position from GGA. Enable:
+
+```text
+$PQTMCFGEINSMSG,1,1,1,0,10
+```
+
+This turns on PQTMINS and PQTMIMU at 10Hz while leaving PQTMGPS off. Also assert
+`$PAIR6010,2,1` at startup so `$PQTMDRCAL` remains available for the GUI
+calibration-state indicator.
+
+**Parser mapping:** `$PQTMINS` is:
+
+```text
+$PQTMINS,<Timestamp>,<SolType>,<Lat>,<Lon>,<Height>,
+         <VEL_N>,<VEL_E>,<VEL_D>,<Roll>,<Pitch>,<Heading>
+```
+
+So:
+
+- speed is derived from `sqrt(VEL_N^2 + VEL_E^2)`
+- roll is field 9
+- pitch is field 10
+- heading is field 11
+- lat/lon/height are ignored in favour of GGA
+
+`SolType=0` must still parse roll/pitch. It means DR is not ready, but roll and
+pitch can be ready. Heading is only trusted from PQTMINS when `SolType >= 1`.
+
+**No runtime hot-start:** Although the Quectel docs say config changes take
+effect after reset, probe work showed `$PAIR007` can destroy the current fix for
+longer than a normal field startup can tolerate. The app saves config to NVS and
+expects the next power cycle/startup to stream DR data. If PQTMINS is already
+streaming, startup skips the DR config write to avoid unnecessary NVS wear.
+
+**Required field procedure:** Code fixes alone do not produce non-zero roll.
+Each module still needs a DR calibration drive: rigid mount, clear sky, drive
+above 2 m/s with several turns for roughly three minutes until `$PQTMDRCAL`
+reports calibrated.
+
+**Revises:** The DR portions of #026. The hardware simplification remains, but
+the previous inline comments and parser assumptions about PQTMINS were wrong.
