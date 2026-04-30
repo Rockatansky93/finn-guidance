@@ -384,10 +384,159 @@ CH340, so adjust vendor/product values for your actual boards.
 
 ## 11. Running on boot
 
-For field use, it can be handy to start the app from a desktop launcher instead
-of a terminal.
+For a dedicated tractor laptop, the goal is: power on, no login prompt, app
+starts automatically, app restarts itself if it crashes. This section covers
+the full setup — autologin, then a systemd user service, plus a simpler
+launch-script fallback.
 
-Create a small launch script:
+### 11.1 Autologin
+
+GNOME (default Ubuntu desktop) handles autologin through GDM. Edit the GDM
+config:
+
+```bash
+sudo nano /etc/gdm3/custom.conf
+```
+
+Under the `[daemon]` section, add or uncomment:
+
+```ini
+[daemon]
+AutomaticLoginEnable=true
+AutomaticLogin=tom
+```
+
+Replace `tom` with your actual Linux username (run `whoami` if you're not
+sure). Save, exit, and reboot to test — the laptop should go straight from
+boot splash to desktop with no password prompt.
+
+If you're on a lighter desktop (XFCE/LightDM), the file is
+`/etc/lightdm/lightdm.conf` instead, and the lines are:
+
+```ini
+[Seat:*]
+autologin-user=tom
+autologin-user-timeout=0
+```
+
+### 11.2 Systemd user service
+
+A systemd user service is the cleanest way to autostart `finn-guidance` after
+the graphical session is ready, with automatic restart on crash. User services
+(rather than system services) are preferred here because the egui window needs
+a live graphical session to attach to.
+
+Create the service file:
+
+```bash
+mkdir -p "$HOME/.config/systemd/user"
+nano "$HOME/.config/systemd/user/finn-guidance.service"
+```
+
+Paste this (adjust paths to match your setup):
+
+```ini
+[Unit]
+Description=FINN Guidance
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/tom/finn-guidance
+ExecStart=/home/tom/finn-guidance/target/release/finn-guidance-pc
+Restart=on-failure
+RestartSec=5
+Environment="RUST_LOG=info"
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical-session.target
+```
+
+Notes:
+
+- `Restart=on-failure` with `RestartSec=5` means if the app crashes (panic,
+  serial error, etc.) it will come back automatically after 5 seconds.
+- `WorkingDirectory` ensures relative paths like `data/coverage.db` resolve
+  correctly.
+- `RUST_LOG=info` matches the typical development log level. Bump to `debug`
+  for more verbose output.
+- `StandardOutput=journal` sends app stdout/stderr to the systemd journal,
+  which persists across reboots.
+
+The service expects a release build to exist at
+`target/release/finn-guidance-pc`. Build it first if you haven't:
+
+```bash
+cd "$HOME/finn-guidance"
+cargo build --release -p finn-guidance-pc
+```
+
+Enable and start the service:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable finn-guidance.service
+systemctl --user start finn-guidance.service
+```
+
+Check status:
+
+```bash
+systemctl --user status finn-guidance.service
+```
+
+Live-tail the logs:
+
+```bash
+journalctl --user -u finn-guidance.service -f
+```
+
+View logs from the current boot:
+
+```bash
+journalctl --user -u finn-guidance.service -b
+```
+
+### 11.3 Enable lingering
+
+By default, user services stop when the user logs out and don't start until
+the user logs in. With autologin (section 11.1) that's fine in normal
+operation, but to make user services start at boot regardless of login
+state — useful for recovery and edge cases — enable lingering:
+
+```bash
+sudo loginctl enable-linger tom
+```
+
+Replace `tom` with your username. This is generally a good idea for a
+dedicated appliance machine.
+
+### 11.4 Test the full boot flow
+
+Reboot the laptop. You should see:
+
+1. BIOS/POST
+2. Ubuntu boot splash
+3. Desktop appears (no login prompt)
+4. `finn-guidance` window opens within a few seconds
+
+If the app doesn't appear, check:
+
+```bash
+systemctl --user status finn-guidance.service
+journalctl --user -u finn-guidance.service -b
+```
+
+### 11.5 Alternative: simple launch script
+
+If you don't want a systemd service — for example during early development
+where you want to start and stop the app manually — a launch script is
+simpler.
+
+Create the script:
 
 ```bash
 nano "$HOME/finn-guidance/run-finn-guidance.sh"
@@ -409,7 +558,7 @@ Make it executable:
 chmod +x "$HOME/finn-guidance/run-finn-guidance.sh"
 ```
 
-You can then create a normal desktop launcher that runs:
+Create a desktop launcher that runs:
 
 ```bash
 /home/YOUR_USER/finn-guidance/run-finn-guidance.sh
@@ -417,8 +566,8 @@ You can then create a normal desktop launcher that runs:
 
 Replace `YOUR_USER` with your Linux username.
 
-For a more polished field install later, build once with `cargo build --release`
-and launch the compiled binary directly from `target/release/`.
+This approach uses `cargo run` rather than the compiled binary directly, so it
+will rebuild on changes — handy during development, slower at startup.
 
 ---
 
