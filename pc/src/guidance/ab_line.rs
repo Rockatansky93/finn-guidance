@@ -277,8 +277,9 @@ impl AbLineGuide {
                     b.0, b.1,
                 );
 
-                // Apply pass offset and nudge
-                let adjusted_xtd = raw_xtd - self.pass_offset_m - self.nudge_m;
+                // Apply pass offset only — nudge is applied AFTER the
+                // direction flip because it's world-fixed (see below).
+                let pass_xtd = raw_xtd - self.pass_offset_m;
 
                 // Heading error: difference between current heading and line bearing.
                 //
@@ -296,13 +297,18 @@ impl AbLineGuide {
                 let line_bearing = coords::bearing(a.0, a.1, b.0, b.1);
                 let raw_heading_error = normalise_angle(fix.heading - line_bearing);
 
+                // Direction flip first, then apply nudge. Nudge is world-fixed:
+                // "nudge left 50cm" always shifts the target 50cm to the left in
+                // the real world, regardless of whether driving A→B or B→A.
+                // Previously nudge was applied before the flip, which caused it
+                // to reverse direction on return passes.
                 let (heading_error, final_xtd) = if raw_heading_error.abs() > 90.0 {
-                    // Return pass: flip bearing and negate XTE
+                    // Return pass: flip bearing and negate XTE, then apply nudge
                     let return_error = normalise_angle(raw_heading_error - 180.0);
-                    (return_error, -adjusted_xtd)
+                    (return_error, -pass_xtd - self.nudge_m)
                 } else {
-                    // Forward pass: use as-is
-                    (raw_heading_error, adjusted_xtd)
+                    // Forward pass: apply nudge directly
+                    (raw_heading_error, pass_xtd - self.nudge_m)
                 };
 
                 Some(CrossTrackError {
