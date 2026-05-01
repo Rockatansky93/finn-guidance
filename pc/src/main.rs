@@ -123,6 +123,7 @@ fn main() {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([800.0, 600.0])
+            .with_maximized(true)
             .with_title("FINN Guidance"),
         ..Default::default()
     };

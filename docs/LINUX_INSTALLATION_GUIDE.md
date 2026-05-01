@@ -22,18 +22,20 @@ packages.
 | RAM | 8 GB minimum recommended |
 | Storage | 10 GB free for Rust build cache and PlatformIO |
 | Display | Touchscreen helpful, not required |
-| USB | Two reliable USB ports for sensor ESP32 and motor ESP32 |
+| USB | Two reliable USB ports for the LC29H GPS module and motor ESP32 |
 
 ### Hardware used by FINN Guidance
 
 | Device | Linux device name usually looks like |
 |--------|--------------------------------------|
-| Sensor ESP32 | `/dev/ttyUSB0`, `/dev/ttyUSB1`, or `/dev/ttyACM0` |
+| LC29H BA GPS module | `/dev/ttyUSB0`, `/dev/ttyUSB1`, or `/dev/ttyACM0` |
 | Motor ESP32 | `/dev/ttyUSB0`, `/dev/ttyUSB1`, or `/dev/ttyACM1` |
-| Direct GPS USB serial, if used | `/dev/ttyUSB*` or `/dev/ttyACM*` |
 
-The app auto-detects serial devices, so exact port names usually do not need to
-be configured manually.
+The LC29H is the source of position, velocity, and DR attitude (roll/pitch/heading
+via `$PQTMINS`). The motor ESP32 reads the WAS locally and reports calibrated
+angle in `$FINNMTR` status messages — there is no longer a separate sensor
+ESP32. The app auto-detects serial devices, so exact port names usually do not
+need to be configured manually.
 
 ---
 
@@ -191,8 +193,8 @@ cargo run --release -p finn-guidance-pc
 The application will:
 
 - scan available serial ports
-- find the GPS/sensor stream
-- find the motor ESP32 on the second serial port
+- find the LC29H GPS module (NMEA + `$PQTMINS`)
+- find the motor ESP32 (`$FINNMTR` status, accepts `$FINNSTEER` and `$FINNCFG`)
 - create `data/coverage.db` if needed
 - create `logs/` if steer telemetry logging is enabled
 
@@ -201,9 +203,11 @@ correctly.
 
 ---
 
-## 7. Install PlatformIO for ESP32 firmware
+## 7. Install PlatformIO for motor ESP32 firmware
 
-The ESP32 firmware uses Arduino/PlatformIO.
+The motor ESP32 firmware uses Arduino/PlatformIO. The LC29H runs Quectel
+firmware and is configured over its NMEA serial interface — no PlatformIO
+involvement on the GPS side.
 
 Install PlatformIO:
 
@@ -229,14 +233,14 @@ several minutes.
 
 ---
 
-## 8. Flash the ESP32 firmware
+## 8. Flash the motor ESP32 firmware
 
-### 8.1 Flash the Sensor Module
+### 8.1 Flash the Motor Controller
 
-Plug in only the sensor ESP32.
+Unplug the LC29H if it is connected. Plug in only the motor ESP32.
 
 ```bash
-cd firmware-sensor-pio
+cd firmware-motor-pio
 pio run --target upload
 ```
 
@@ -246,43 +250,21 @@ Open the serial monitor:
 pio device monitor
 ```
 
-You should see sensor output such as:
+You should see motor status output at 10Hz, including the calibrated WAS
+angle (the third field is `angle_x100`, e.g. `-523` = -5.23°):
 
 ```text
-$FINNWAS,2048,1650*4A
-$FINNIMU,1.2,-0.5,182.3,3,3,2,1*3B
-$GPGGA,...
-$FINNHB,2000*1C
+$FINNMTR,0,1832,0,0,200*XX
+$FINNMTR,0,1834,12,0,400*XX
 ```
 
-Press `Ctrl+C` to exit the monitor.
+The motor should stay disabled until it receives valid `$FINNSTEER`
+commands from the PC application. The WAS pipeline (oversample → EMA →
+linear map → dead zone → curve) runs continuously regardless of motor
+enable state, so you should see the angle field respond as the
+steering shaft moves even with the motor inactive.
 
-### 8.2 Flash the Motor Controller
-
-Unplug the sensor ESP32. Plug in only the motor ESP32.
-
-```bash
-cd ../firmware-motor-pio
-pio run --target upload
-```
-
-Open the serial monitor:
-
-```bash
-pio device monitor
-```
-
-You should see motor status output:
-
-```text
-$FINNMTR,0,0,200*XX
-$FINNMTR,0,0,400*XX
-```
-
-The motor should stay disabled until it receives valid steer commands from the
-PC application.
-
-### 8.3 Specify a port manually
+### 8.2 Specify a port manually
 
 If PlatformIO chooses the wrong port:
 
@@ -324,10 +306,11 @@ Create a rules file:
 sudo nano /etc/udev/rules.d/99-finn-guidance.rules
 ```
 
-Example rules:
+Example rules (vendor/product IDs will differ for your specific LC29H eval
+board and ESP32 — read them off `lsusb` or `udevadm info` and substitute):
 
 ```text
-SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", SYMLINK+="finn-sensor", GROUP="dialout", MODE="0660"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", SYMLINK+="finn-gps", GROUP="dialout", MODE="0660"
 SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", SYMLINK+="finn-motor", GROUP="dialout", MODE="0660"
 ```
 
@@ -338,21 +321,22 @@ sudo udevadm control --reload-rules
 sudo udevadm trigger
 ```
 
-Unplug and replug the ESP32s, then check:
+Unplug and replug both devices, then check:
 
 ```bash
 ls -l /dev/finn-*
 ```
 
-Different ESP32 boards use different USB serial chips, commonly CP210x or
-CH340, so adjust vendor/product values for your actual boards.
+The LC29H eval board typically uses a CP210x USB-serial chip. Different
+ESP32 boards use either CP210x or CH340. Adjust vendor/product values for
+your actual hardware.
 
 ---
 
 ## 10. Bench test on Linux
 
-1. Plug in both ESP32 modules.
-2. Confirm Linux can see them:
+1. Plug in the LC29H GPS module and the motor ESP32.
+2. Confirm Linux can see both:
 
    ```bash
    ls -l /dev/ttyUSB* /dev/ttyACM* 2>/dev/null
@@ -365,8 +349,12 @@ CH340, so adjust vendor/product values for your actual boards.
    ```
 
 4. Check the app status:
-   - GPS fix appears in the status bar
-   - WAS/IMU readings appear on the Setup page
+   - GPS fix appears in the status bar (needs sky view — see §12)
+   - Roll/pitch/heading from `$PQTMINS` appear once DR is calibrated
+     (will read zero on the bench until the calibration drive in
+     `DR_REMEDIATION_STRATEGY.md` §Step 5 has been performed)
+   - WAS angle reading appears on the Setup page (sourced from the motor
+     ESP32's `$FINNMTR` status)
    - Motor ESP32 shows connected
    - Motor test controls can command the motor
 
@@ -595,10 +583,11 @@ dmesg | tail -50
 
 Try another USB port.
 
-### ESP32 appears, then disappears
+### Serial device appears, then disappears
 
 This is often a weak cable, loose connector, or power issue. Use short, good
-quality USB cables and secure them against vibration in the tractor cab.
+quality USB cables and secure them against vibration in the tractor cab. The
+LC29H eval boards in particular are sensitive to marginal cables.
 
 ### `cargo build` fails with missing X11, XCB, GL, or udev libraries
 
@@ -657,8 +646,18 @@ Check each item on the Setup page.
 
 Secure the USB connections first. Field vibration can create brief disconnects.
 
-GPS timeout normally means no fresh fix is arriving. WAS timeout means the
-sensor ESP32 is not sending fresh `$FINNWAS` messages.
+GPS timeout normally means no fresh fix is arriving from the LC29H. WAS
+timeout means the motor ESP32 is not sending fresh `$FINNMTR` status
+messages (it should report at 10Hz continuously regardless of motor enable
+state).
+
+### Roll reads zero on slope
+
+If the GUI roll indicator stays at zero even when the vehicle is on a
+visible slope, the LC29H's onboard DR has not yet been calibrated. See
+`DR_REMEDIATION_STRATEGY.md` for the full background, and §Step 5 for the
+calibration drive procedure (>2 m/s, 3–4 turns, ~3 minutes of varied
+driving with a clear sky view).
 
 ---
 
