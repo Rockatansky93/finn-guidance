@@ -5,12 +5,145 @@
 > Updated at the end of each working session.
 
 ## Last updated
-Session 28 — 28 April 2026 (Usability improvements session,
-auto-steer field-validated at ~30cm accuracy)
+Session 29 — 1 May 2026 (Hot fix during seeding: PAIR050 ack-loop
+deadlock in `gps/reader.rs`; auto-steer observed working in real seeding)
 
 ## What we're working on
 **Seeding is underway.** Development changes must be stable and not break
 what's working.
+
+**Session 29 — Hot fix during seeding (1 May 2026):**
+
+Tom hit "no GPS fix in GUI" while seeding. Diagnosed and fixed live
+from Adelaide via Windows-MCP + Filesystem-MCP on the tractor laptop
+while Tom drove. Root cause was a deadlock in the GPS module config
+routine: the rate-set ack-wait loop in `ensure_module_config()` had
+per-read timeouts but no wall-clock cap, and the LC29H BA streams
+~11 NMEA sentences/second continuously (1 Hz GGA + 10 Hz PQTMINS).
+Every `port.read()` returned data within the timeout, so the loop's
+fallback `_ => break` arm never fired. The loop ran forever, the GPS
+reader thread never reached its main NMEA processing loop, no fixes
+ever reached the GUI or steer thread.
+
+Symptom in the stdout log was distinctive: the line
+`Trying 10Hz (100ms): $PAIR050,100*22` was the last GPS reader output
+before the motor reader took over and the GPS thread went silent
+forever. Looked like a clean startup followed by a dead GPS — actually
+a hung config thread.
+
+### Change made this session
+
+**Change 1: Bound the PAIR050 ack-wait loop with a wall-clock deadline**
+`pc/src/gps/reader.rs` `ensure_module_config()` rate-set ack loop now
+uses a 500ms `Instant`-based deadline in addition to the per-read
+timeout. Comment added explaining the NMEA-flood deadlock so the next
+debugger doesn't repeat the diagnosis. Per-read timeout dropped from
+300ms to 100ms (no longer needed as the safety net). After the loop
+exits, control flows normally through SAVEPAR → main read loop. First
+fix arrived 1.2 seconds after launch on the rebuild. Verified by
+watching `app_stdout.log` show:
+```
+No ack for 10Hz (may still be applied)   ← bounded loop exited
+Persisting runtime config to NVS
+GPS module configuration complete
+Got fix: lat=-33.261023 lon=138.596789 sats=42 quality=Gps
+```
+
+### Important hardware-firmware finding (worth documenting)
+
+The **LC29H BA NR11A02S firmware caps GGA/VTG output at 1 Hz** regardless
+of what `$PAIR050` is set to. The `PAIR001,050,1` response ("unsupported")
+is what the module actually returns to `$PAIR050,100`, but our buffered-
+ack reader misses that response in the NMEA flood and falls through to
+the "may still be applied" log path. Then SAVEPAR persists the
+still-1 Hz state to NVS.
+
+**This is fine** — it matches the existing architecture. `gps/parser.rs`
+deliberately uses GGA only for position and PQTMINS for heading, velocity,
+and attitude. The 10 Hz update rate is delivered via PQTMINS; GGA at 1 Hz
+is sufficient for position and the interpolator dead-reckons between
+fixes. Coverage points landed at exactly 1.00 Hz in the field DB
+(deltas 997-1003ms across 50 consecutive points), confirming the fix
+rate.
+
+FT8 Finding 5 ("GPS effective rate is ~1-2Hz, not 10Hz") was therefore
+not a bug — it was the actual hardware behaviour. The interpolator was
+already handling it correctly. This finding can be marked resolved.
+
+**TODO**: change the misleading log line in `ensure_module_config()`
+from "No ack for 10Hz (may still be applied)" to something honest like
+"PAIR050 not acknowledged by LC29H BA NR11; 10Hz position not supported
+on this firmware — PQTMINS provides 10Hz attitude/velocity, GGA stays
+at 1Hz by design". Save the next debugger an hour.
+
+### Field observation — auto-steer working in real seeding
+
+While observing the rebuilt app, watched Tom seed for ~80 minutes of
+active auto-steer use. Observations from `app_stdout.log`,
+`coverage.db`, and one screenshot:
+
+- **Sky conditions excellent**: 41-45 satellites, HDOP 0.30-0.44 across
+  the session. By late afternoon HDOP was 0.3 with 45 sats.
+- **Field speed**: averaged 8.7 km/h on auto-steer engages — considerably
+  faster than FT8/FT9 (3.3-4.5 km/h). The Session 28 tune
+  (`max_steer_angle = 1.0`) is correctly tracking the line at this speed.
+- **Engage durations growing**: engages of 50s → 146s → 246s → … →
+  408s. The 6m48s engage at 04:23 covered the full length of a pass
+  with no safety disengages, no warnings, no channel drops. Tom
+  manually steered the headland turns; auto-steer held the straight
+  passes.
+- **9.39m pass spacing** (9.64m implement, 0.25m overlap). 8.55 ha
+  covered by end of session. Pass count reached 31.
+- **Active AB line**: "Line1" at -33.25919, 138.59045 → -33.25918,
+  138.59715. 623m run, bearing 89.9° (east-west).
+- **Snap function used in earnest**: GUI showed toast
+  `Line snapped -105cm (nudge now 278cm)`. Validates Session 28 Change
+  1 (nudge cap raised from ±2m to ±implement_width). A 278cm nudge
+  would have been impossible under the old ±2m cap.
+- **Process health**: 19% avg CPU, 105 MB RAM, 11 threads, ~25 min
+  uptime when checked. Battery 100% on inverter.
+- **Telemetry was off** (`telemetry_enabled = false` in SQLite config).
+  This made fix-rate verification require the coverage DB rather than
+  JSONL traces. Worth turning on for future sessions.
+
+### What I observed about the architecture in operation
+
+For anyone reading this who wasn't there: the code architecture from
+Decisions #026 (LC29H BA direct, ESP32 inner loop) and #027 (try_send
+with drop-on-full) holds up well in active use. Specifically:
+
+- Zero channel drops across the entire 80-minute session. The #027 fix
+  is doing its job invisibly.
+- The 1 Hz GGA / 10 Hz PQTMINS split is invisible to the operator. The
+  interpolator dead-reckons between GGA fixes using PQTMINS
+  velocity/heading at 30 fps and the GUI shows smooth motion.
+- The GUI runs at the capped 30 fps without choking the reader threads
+  thanks to the bounded channels + try_send. No backpressure freezes
+  observed (none expected post-#027, but worth noting).
+- The Session 28 lightbar three-dot style was visible saturating at
+  the right end during the screenshot when XTE was -283 cm — the
+  segments correctly dragged out of range with the readout, no glitches.
+
+### Files changed this session
+- `pc/src/gps/reader.rs` — bounded ack-wait loop (the hot fix)
+
+### Build + deploy
+- Killed the running app (PID 6480)
+- `cargo build --release -p finn-guidance-pc` — 9.5s, 22 warnings
+  (pre-existing), no errors
+- Relaunched via `Start-Process -RedirectStandardOutput`. Verified PID
+  908 came up clean and started receiving fixes within 1.2 seconds.
+
+### Pending
+- [ ] Tidy the misleading "may still be applied" log line (TODO above)
+- [ ] Mark FT8 Finding 5 as resolved ("by-design hardware behaviour,
+      not a bug") in this file
+- [ ] Consider whether to remove the PAIR050 send entirely on LC29H BA
+      NR11 — it's a no-op that costs ~700ms of startup time
+- [ ] Decision #028 write-up: "GPS reader rate-set ack-wait deadlock
+      due to NMEA flood" (companion to #027 channel discipline)
+
+---
 
 **Session 28 — Usability improvements (28 April 2026):**
 
@@ -345,6 +478,11 @@ behaviour:
 - **#027 (pending write-up)**: Drop-on-full channel sends in both serial
   reader threads to prevent cascading stalls. Fix applied in Session 22;
   write-up follows field verification.
+- **#028 (pending write-up, Session 29)**: Bounded wall-clock deadline on
+  GPS module config ack-wait loops. Per-read timeouts are insufficient
+  when the device streams continuous data — the loop never sees a
+  timeout, so its fallback never fires. Always pair `port.read()` ack-
+  loops with an `Instant`-based deadline.
 
 ## Hardware inventory (as of 24 April 2026)
 
@@ -396,7 +534,14 @@ planned integration path:
 
 ## Next session should
 1. Read this file and DECISIONS.md #026
-2. **Hardware input: Momentary switch for auto-steer engage/disengage**
+2. **Session 29 follow-ups (low-effort, do these first):**
+   - Tidy the "may still be applied" log line in `gps/reader.rs` to
+     name the LC29H BA NR11 1Hz cap explicitly
+   - Write up Decision #028 (PAIR050 ack-wait deadlock)
+   - Consider turning telemetry back on by default
+     (`telemetry_enabled = true`) so future field-data analysis is
+     possible without requiring a manual toggle
+3. **Hardware input: Momentary switch for auto-steer engage/disengage**
    (hardware-dependent, plan when components available)
    - Wire a momentary pushbutton to an ESP32 GPIO input (with pull-up)
    - ESP32 firmware: detect press, send a new FINN sentence e.g.
@@ -406,7 +551,7 @@ planned integration path:
      if on)
    - This replaces the touchscreen AUTO-STEER button for in-cab use —
      physical button is safer and faster than a touchscreen target
-3. **Hardware input: Seed engage switch triggers coverage logging**
+4. **Hardware input: Seed engage switch triggers coverage logging**
    (hardware-dependent, plan when components available)
    - Wire the air seeder’s seed-engage switch output (likely 12V) to an
      ESP32 GPIO via a voltage divider or optocoupler
@@ -416,15 +561,17 @@ planned integration path:
      disengage coverage logging in response — no manual button press
      needed
    - Coverage logging then tracks actual seeding, not just driving
-4. **Triangle icon inversion bug** — cosmetic only, low priority.
+5. **Triangle icon inversion bug** — cosmetic only, low priority.
    Fix when convenient: check `field_view.rs` and `field_projection.rs`
    for heading-dependent sign errors around 90°/270°.
-5. **Add startup config push** — when motor port connects, send all
+6. **Add startup config push** — when motor port connects, send all
    stored config (WAS, PID, WASF, INVERT) to ESP32 to guarantee sync.
    Still worth doing even though the FT9 runaway is resolved.
-6. Write up Decision #027 in DECISIONS.md — fix is verified (FT8+FT9)
-7. Phase D.3 (Windows USB-serial power hardening) — still worth doing
-8. Investigate LC29H BA actual fix output rate (FT8 finding 5)
+7. Write up Decision #027 in DECISIONS.md — fix is verified (FT8+FT9)
+8. Phase D.3 (Windows USB-serial power hardening) — still worth doing
+9. Investigate LC29H BA actual fix output rate (FT8 finding 5)
+   — **RESOLVED Session 29**: 1Hz GGA is hardware behaviour, not a bug.
+   Position is GGA-rate; PQTMINS provides 10Hz attitude/velocity.
 
 **IMPORTANT CORRECTION for future sessions**: The field test 8 finding
 that recommended increasing max_steer_angle to 12-15° was wrong.

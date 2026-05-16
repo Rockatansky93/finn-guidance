@@ -332,9 +332,16 @@ fn ensure_module_config(port: &mut Box<dyn serialport::SerialPort>, fix_rate_hz:
         let mut response_data = String::new();
 
         let original_timeout = port.timeout();
-        let _ = port.set_timeout(Duration::from_millis(300));
+        let _ = port.set_timeout(Duration::from_millis(100));
 
-        loop {
+        // BUGFIX: bound the ack-wait by wall-clock, not just per-read timeout.
+        // The LC29H BA streams NMEA continuously (GGA + PQTMINS = ~11 sentences/sec),
+        // so per-read timeout never fires — we always have data to read. Without
+        // a wall-clock cap, this loop runs forever and the reader thread never
+        // reaches the main NMEA processing loop. Symptom: app starts, port opens,
+        // module gets configured, but no fixes ever reach the GUI.
+        let ack_deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < ack_deadline {
             match port.read(&mut buf) {
                 Ok(n) if n > 0 => {
                     response_data.push_str(&String::from_utf8_lossy(&buf[..n]));
@@ -378,6 +385,28 @@ fn ensure_module_config(port: &mut Box<dyn serialport::SerialPort>, fix_rate_hz:
 
     if !rate_set {
         tracing::warn!("Could not set any fix rate — module may be running at default");
+    }
+
+    // Step 4: Persist runtime config to NVS so it survives power cycles.
+    //
+    // Without this, every GPS power-cycle (USB unplug, inverter blip, laptop
+    // sleep + USB re-enumerate) reverts the module to its NVS defaults — most
+    // critically the 1Hz fix rate — and the next launch of this app is
+    // required to bump it back to 10Hz. If the app crashes or hasn't started
+    // yet when the operator queries the GPS, position updates land at 1Hz.
+    //
+    // PQTMSAVEPAR commits the disable-sentences config + PAIR050 fix rate
+    // (and any earlier writes) to flash. The PQTMCFGEINSMSG block above has
+    // its own SAVEPAR call only when DR is freshly written; this one covers
+    // the rate + sentence filter so they persist independently.
+    if rate_set {
+        let save_cmd = "$PQTMSAVEPAR*5A\r\n";
+        tracing::info!("  Persisting runtime config to NVS: {}", save_cmd.trim());
+        if let Err(e) = port.write_all(save_cmd.as_bytes()) {
+            tracing::warn!("  Failed to send PQTMSAVEPAR: {}", e);
+        }
+        let _ = port.flush();
+        std::thread::sleep(Duration::from_millis(300));
     }
 
     tracing::info!("GPS module configuration complete");
