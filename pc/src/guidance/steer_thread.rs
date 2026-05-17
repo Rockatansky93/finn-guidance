@@ -41,6 +41,7 @@
 use crate::comms::serial::MotorHandle;
 use crate::guidance::ab_line::AbLineGuide;
 use crate::guidance::steering::SteeringController;
+use crate::guidance::was_centre_learner::{LearnerTick, WasCentreLearner};
 use crate::position::interpolator::PositionInterpolator;
 use crate::telemetry::logger::{
     fix_quality_to_u8, DropCounts, IterRecord, TelemetryLogger, TuningSnapshot,
@@ -128,6 +129,26 @@ pub struct SharedSteerState {
     /// When false, no `.jsonl` files are written — reduces filesystem I/O
     /// and CPU overhead. Persisted in SQLite config.
     pub telemetry_enabled: bool,
+
+    /// Current manual three-point WAS calibration centre value (raw ADC).
+    /// Updated whenever the user runs the three-point cal wizard. The
+    /// steer thread reads this to seed and bound the auto-centre learner.
+    pub was_centre_manual: u16,
+
+    /// Whether the auto-centre learner is enabled. When true, the steer
+    /// thread runs the `WasCentreLearner` while auto-steer is engaged
+    /// and pushes live `$FINNCFG,WASCNT` updates to the ESP32 to track
+    /// thermal drift in the WAS pot. Persisted in SQLite.
+    pub was_auto_learn_enabled: bool,
+
+    /// Latest learned centre value (for GUI display). Written by the
+    /// steer thread, read by the GUI. Equals `was_centre_manual` when
+    /// learning is disabled or hasn't started.
+    pub was_learned_centre: u16,
+
+    /// Whether the learner is currently meeting all gate conditions
+    /// ("definitely going straight"). For GUI status indicator.
+    pub was_learner_gate_passed: bool,
 }
 
 /// Minimal AB line data for the steer thread's own AbLineGuide copy.
@@ -166,6 +187,10 @@ impl SharedSteerState {
             nudge_m: 0.0,
             ab_line_dirty: false,
             telemetry_enabled: false,
+            was_centre_manual: 1832,
+            was_auto_learn_enabled: true,
+            was_learned_centre: 1832,
+            was_learner_gate_passed: false,
         }
     }
 }
@@ -204,6 +229,17 @@ pub fn run_steer_thread(
     let mut latest_fix_time: Option<Instant> = None;
     let mut latest_motor_angle: f64 = 0.0;
     let mut latest_motor_pwm: i16 = 0;
+    let mut latest_was_raw: u16 = 0;
+
+    // XTE rate tracking for the centre learner (separate from the
+    // steering controller's own internal xte_rate which we can't read).
+    let mut prev_xte_for_rate: Option<(f64, Instant)> = None;
+
+    // Centre learner — created on first engage, then persists across
+    // engage/disengage cycles within this process. Recreated only when
+    // the manual cal value changes (the user reran the three-point wizard).
+    let mut centre_learner: Option<WasCentreLearner> = None;
+    let mut last_manual_centre: u16 = 0;
 
     // Telemetry logger — created on engage, dropped on disengage.
     let mut telemetry: Option<TelemetryLogger> = None;
@@ -233,6 +269,7 @@ pub fn run_steer_thread(
                 FinnMessage::MotorStatus(mtr) => {
                     latest_motor_angle = mtr.actual_angle;
                     latest_motor_pwm = mtr.current_pwm;
+                    latest_was_raw = mtr.was_raw;
                 }
                 FinnMessage::ConfigAck(_) => {
                     // Config acks are informational; GUI handles display
@@ -242,6 +279,8 @@ pub fn run_steer_thread(
 
         // ── 3. Process commands and sync tuning from GUI ────────────
         let (current_pass, current_implement_w, current_overlap);
+        let auto_learn_enabled;
+        let manual_centre_now;
         {
             let mut state = shared.lock().unwrap();
 
@@ -326,6 +365,20 @@ pub fn run_steer_thread(
             current_pass = state.pass_number;
             current_implement_w = state.implement_width_m;
             current_overlap = state.overlap_m;
+            auto_learn_enabled = state.was_auto_learn_enabled;
+            manual_centre_now = state.was_centre_manual;
+        }
+
+        // ── 3b. Maintain the centre learner ─────────────────────────
+        // Recreate the learner if the manual cal value changed (user
+        // reran the three-point wizard). Otherwise leave it persistent.
+        if centre_learner.is_none() || manual_centre_now != last_manual_centre {
+            centre_learner = Some(WasCentreLearner::new(manual_centre_now, Instant::now()));
+            last_manual_centre = manual_centre_now;
+            tracing::info!(
+                "Centre learner (re)initialised to manual centre {}",
+                manual_centre_now
+            );
         }
 
         // Log pass changes
@@ -375,6 +428,71 @@ pub fn run_steer_thread(
                     } else {
                         // Send steer command to ESP32
                         let _ = motor_handle.send_steer_angle(desired_angle);
+
+                        // ── Centre learner: feed this tick, push updates ─────
+                        // We compute xte_rate locally rather than reaching into
+                        // the steering controller's private state.
+                        let now = Instant::now();
+                        let xte_rate = match prev_xte_for_rate {
+                            Some((prev_xte, prev_t)) => {
+                                let dt = now.duration_since(prev_t).as_secs_f64();
+                                if dt > 0.001 && dt < 1.0 {
+                                    (err.distance_m - prev_xte) / dt
+                                } else {
+                                    0.0
+                                }
+                            }
+                            None => 0.0,
+                        };
+                        prev_xte_for_rate = Some((err.distance_m, now));
+
+                        let (learned_centre, gate_passed) = if auto_learn_enabled {
+                            if let Some(ref mut learner) = centre_learner {
+                                let lt = LearnerTick {
+                                    xte_m: err.distance_m,
+                                    heading_error_deg: err.heading_error,
+                                    speed_mps: interp_fix.speed,
+                                    desired_angle_deg: desired_angle,
+                                    was_raw: latest_was_raw,
+                                    now,
+                                };
+                                let out = learner.tick(&lt, xte_rate);
+                                if let Some(new_centre) = out.new_centre {
+                                    match motor_handle.send_was_centre_live(new_centre) {
+                                        Ok(()) => {
+                                            tracing::info!(
+                                                "WAS centre learner update: {} (manual={}, offset={:+})",
+                                                new_centre,
+                                                manual_centre_now,
+                                                new_centre as i32 - manual_centre_now as i32,
+                                            );
+                                            if let Some(ref mut tl) = telemetry {
+                                                tl.log_event(
+                                                    "was_centre_learn",
+                                                    Some(format!(
+                                                        "centre={} offset={:+}",
+                                                        new_centre,
+                                                        new_centre as i32
+                                                            - manual_centre_now as i32,
+                                                    )),
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "Failed to send WASCNT update: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                                (out.current_learned_centre, out.gate_passed)
+                            } else {
+                                (manual_centre_now, false)
+                            }
+                        } else {
+                            (manual_centre_now, false)
+                        };
 
                         // ── Telemetry: log this iteration ────────────
                         if let Some(ref mut tl) = telemetry {
@@ -436,6 +554,8 @@ pub fn run_steer_thread(
                         state.display.actual_angle = latest_motor_angle;
                         state.display.output_pwm = latest_motor_pwm;
                         state.display.just_disengaged = false;
+                        state.was_learned_centre = learned_centre;
+                        state.was_learner_gate_passed = gate_passed;
                     }
                 } else {
                     // No AB line or no error — send zero
@@ -445,11 +565,15 @@ pub fn run_steer_thread(
                     state.display.engaged = steering.engaged;
                 }
             } else {
-                // Not engaged — just update display state
+                // Not engaged — just update display state.
+                // Clear the xte-rate history so the first engaged tick
+                // doesn't compute a huge spurious rate from a stale sample.
+                prev_xte_for_rate = None;
                 let mut state = shared.lock().unwrap();
                 state.display.engaged = false;
                 state.display.actual_angle = latest_motor_angle;
                 state.display.output_pwm = latest_motor_pwm;
+                state.was_learner_gate_passed = false;
             }
         }
 

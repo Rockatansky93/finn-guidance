@@ -23,6 +23,13 @@
  *     $FINNCFG,WAS,<centre>,<left>,<right>*<checksum>\r\n
  *       Three-point WAS calibration. Stored in NVS. Values are raw ADC counts.
  *
+ *     $FINNCFG,WASCNT,<centre>*<checksum>\r\n
+ *       Live WAS centre adjustment. Updates in-RAM centre only. Does NOT
+ *       write NVS and does NOT reset the EMA smoother — used by the PC's
+ *       auto-centre learner to track WAS thermal drift in real time during
+ *       auto-steer. Power-cycle reverts to the NVS three-point cal centre.
+ *       PC bounds the value to manual_centre ±100 counts.
+ *
  *     $FINNCFG,PID,<kp_x100>,<min_pwm>,<max_pwm>*<checksum>\r\n
  *       Inner loop tuning. kp_x100 = kp_angle x 100 (e.g. 1500 = 15.0 PWM/deg).
  *
@@ -211,6 +218,26 @@ void saveWasCal(int16_t c, int16_t l, int16_t r) {
     wasEmaSmoothed = -1.0f;
 
     Serial.printf("NVS saved WAS — C:%d L:%d R:%d\r\n", c, l, r);
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Live WAS centre adjustment (RAM only).
+//
+// Updates the working centre value without touching NVS or resetting the
+// EMA smoother. Used by the PC's auto-centre learner during engaged
+// auto-steer to track WAS thermal drift in real time. The PC bounds the
+// value to manual_centre ±100 counts; we apply a wider sanity clamp here
+// against the current centre as belt-and-braces protection.
+// ═════════════════════════════════════════════════════════════════════
+void setWasCentreLive(int16_t c) {
+    int delta = (int)c - (int)wasCentre;
+    if (delta > 200)  c = wasCentre + 200;
+    if (delta < -200) c = wasCentre - 200;
+
+    wasCentre = c;
+    // Deliberately do NOT reset wasEmaSmoothed — we want a continuous
+    // signal across centre updates.
+    // Deliberately do NOT touch NVS — power-cycle restores manual cal.
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -476,6 +503,21 @@ bool handleSentence(const char* body, unsigned long now) {
         return true;
     }
 
+    // $FINNCFG,WASCNT,<centre>  — live centre adjustment, RAM only.
+    // Must come BEFORE the WAS, prefix check, since "FINNCFG,WAS," is a
+    // prefix of "FINNCFG,WASCNT,". We disambiguate by checking the
+    // longer prefix first.
+    if (strncmp(body, "FINNCFG,WASCNT,", 15) == 0) {
+        int c;
+        if (sscanf(body + 15, "%d", &c) == 1) {
+            setWasCentreLive((int16_t)c);
+            sendSentence("FINNACK,WASCNT,OK");
+        } else {
+            sendSentence("FINNACK,WASCNT,ERR");
+        }
+        return true;
+    }
+
     // $FINNCFG,WAS,<centre>,<left>,<right>
     if (strncmp(body, "FINNCFG,WAS,", 12) == 0) {
         int c, l, r;
@@ -580,7 +622,7 @@ void setup() {
     while (!Serial && millis() < 2000) {
         // Wait up to 2s for USB serial connection
     }
-    Serial.println("FINN Motor Controller v3 starting (#026 + WAS filtering)...");
+    Serial.println("FINN Motor Controller v3 starting (#026 + WAS filtering + live centre)...");
 
     // WAS pot power — drive GPIO 33 HIGH to provide 3.3V reference
     pinMode(WAS_POWER_PIN, OUTPUT);

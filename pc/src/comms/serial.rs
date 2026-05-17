@@ -64,6 +64,14 @@ impl MotorHandle {
         self.send_raw(&cmd)
     }
 
+    /// Send a live WAS centre update (RAM only, no NVS write, no EMA reset).
+    /// Used by the auto-centre learner during engaged auto-steer to track
+    /// thermal drift in the WAS pot.
+    pub fn send_was_centre_live(&self, centre: u16) -> Result<(), String> {
+        let cmd = protocol::format_was_centre_live(centre);
+        self.send_raw(&cmd)
+    }
+
     /// Send PID tuning parameters to the ESP32 NVS.
     pub fn send_pid_config(&self, kp_x100: u16, min_pwm: u16, max_pwm: u16) -> Result<(), String> {
         let cmd = protocol::format_pid_config(kp_x100, min_pwm, max_pwm);

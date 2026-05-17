@@ -7,7 +7,8 @@
 //!
 //! ## PC -> Motor ESP32
 //! - `$FINNSTEER,<desired_angle_x100>*<checksum>`  (desired angle x 100, ~10Hz)
-//! - `$FINNCFG,WAS,<centre>,<left>,<right>*<checksum>`  (WAS calibration)
+//! - `$FINNCFG,WAS,<centre>,<left>,<right>*<checksum>`  (WAS calibration — writes NVS, resets EMA)
+//! - `$FINNCFG,WASCNT,<centre>*<checksum>`  (live WAS centre update — RAM only, no EMA reset)
 //! - `$FINNCFG,PID,<kp_x100>,<min_pwm>,<max_pwm>*<checksum>`  (inner loop tuning)
 //! - `$FINNCFG,INVERT,<0|1>*<checksum>`  (motor direction)
 //! - `$FINNCFG,WASF,<ema_alpha_x100>,<deadzone_x100>,<curve_exp_x100>*<checksum>`  (WAS filtering)
@@ -75,6 +76,22 @@ pub fn format_pid_config(kp_x100: u16, min_pwm: u16, max_pwm: u16) -> String {
 /// Format a motor invert config command.
 pub fn format_invert_config(invert: bool) -> String {
     let body = format!("FINNCFG,INVERT,{}", if invert { 1 } else { 0 });
+    format_finn_sentence(&body)
+}
+
+/// Format a live WAS centre update command.
+///
+/// Updates the ESP32's working `wasCentre` value in RAM only. Does NOT
+/// write to NVS, and does NOT reset the EMA smoother state. Intended for
+/// continuous fine adjustment from the PC's auto-centre learner during
+/// auto-steer engagement, where we want to track thermal drift in the
+/// WAS pot without grinding through flash write cycles.
+///
+/// The manual three-point calibration (`format_was_config`) remains the
+/// source of truth on power-up; this command applies a session-only
+/// adjustment on top of it.
+pub fn format_was_centre_live(centre: u16) -> String {
+    let body = format!("FINNCFG,WASCNT,{}", centre);
     format_finn_sentence(&body)
 }
 
