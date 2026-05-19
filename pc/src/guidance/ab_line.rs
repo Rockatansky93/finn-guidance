@@ -142,14 +142,26 @@ impl AbLineGuide {
 
                 // Get raw cross-track distance in the A→B frame.
                 let raw_xtd =
-                    coords::cross_track_distance(fix.latitude, fix.longitude, a.0, a.1, b.0, b.1);
+                    coords::cross_track_distance_local(fix.latitude, fix.longitude, a.0, a.1, b.0, b.1);
 
-                // The residual error in the A→B frame is:
-                //   adjusted_xtd = raw_xtd - pass_offset_m - nudge_m
-                // We want adjusted_xtd = 0, so:
-                //   nudge_m_new = raw_xtd - pass_offset_m
+                // Detect travel direction — same logic as calculate_error().
+                // On a return pass the XTE sign is flipped in the operator's
+                // frame, so we must use the flipped value to zero the error
+                // they actually see.
+                let line_bearing = coords::bearing_local(a.0, a.1, b.0, b.1);
+                let raw_heading_error = normalise_angle(fix.heading - line_bearing);
+                let effective_xtd = if raw_heading_error.abs() > 90.0 {
+                    -raw_xtd // return pass: operator's XTE frame is inverted
+                } else {
+                    raw_xtd
+                };
+
+                // We want calculate_error() to return 0 for this position.
+                // Forward:  final_xtd = (raw_xtd - pass_offset) - nudge = 0
+                // Return:   final_xtd = -(raw_xtd - pass_offset) + nudge = 0
+                // Both solve to: nudge = effective_xtd - pass_offset
                 let old_nudge = self.nudge_m;
-                self.nudge_m = raw_xtd - self.pass_offset_m;
+                self.nudge_m = effective_xtd - self.pass_offset_m;
 
                 // Clamp to hard cap (±implement width covers full pass shifts).
                 let cap = self.implement_width_m;
@@ -245,7 +257,7 @@ impl AbLineGuide {
         match &self.line {
             Some(GuidanceLine::AbLine { a, b }) => {
                 let raw_xtd =
-                    coords::cross_track_distance(fix.latitude, fix.longitude, a.0, a.1, b.0, b.1);
+                    coords::cross_track_distance_local(fix.latitude, fix.longitude, a.0, a.1, b.0, b.1);
                 // Subtract nudge before rounding so the nearest pass is found
                 // relative to the nudged line system, not the raw AB origin.
                 let nudge_adjusted = raw_xtd - self.nudge_m;
@@ -265,10 +277,9 @@ impl AbLineGuide {
                 }
 
                 let raw_xtd =
-                    coords::cross_track_distance(fix.latitude, fix.longitude, a.0, a.1, b.0, b.1);
+                    coords::cross_track_distance_local(fix.latitude, fix.longitude, a.0, a.1, b.0, b.1);
 
-                // Apply pass offset only — nudge is applied AFTER the
-                // direction flip because it's world-fixed (see below).
+                // Apply pass offset in the A→B frame (direction-neutral).
                 let pass_xtd = raw_xtd - self.pass_offset_m;
 
                 // Heading error: difference between current heading and line bearing.
@@ -284,18 +295,18 @@ impl AbLineGuide {
                 // flip the bearing for a return pass, the "right of line" / "left
                 // of line" sense inverts, so we also negate the XTE to keep the
                 // sign convention consistent with the flipped bearing.
-                let line_bearing = coords::bearing(a.0, a.1, b.0, b.1);
+                let line_bearing = coords::bearing_local(a.0, a.1, b.0, b.1);
                 let raw_heading_error = normalise_angle(fix.heading - line_bearing);
 
-                // Direction flip first, then apply nudge. Nudge is world-fixed:
-                // "nudge left 50cm" always shifts the target 50cm to the left in
-                // the real world, regardless of whether driving A→B or B→A.
-                // Previously nudge was applied before the flip, which caused it
-                // to reverse direction on return passes.
+                // Nudge is world-fixed: "nudge right 50cm" always shifts the
+                // target line 50cm to the right in the real world, regardless
+                // of travel direction. Both XTE and nudge live in the A→B
+                // frame, so when we negate XTE for a return pass, we must
+                // also negate the nudge to keep it world-consistent.
                 let (heading_error, final_xtd) = if raw_heading_error.abs() > 90.0 {
-                    // Return pass: flip bearing and negate XTE, then apply nudge
+                    // Return pass: flip bearing, negate XTE and nudge together
                     let return_error = normalise_angle(raw_heading_error - 180.0);
-                    (return_error, -pass_xtd - self.nudge_m)
+                    (return_error, -pass_xtd + self.nudge_m)
                 } else {
                     // Forward pass: apply nudge directly
                     (raw_heading_error, pass_xtd - self.nudge_m)
