@@ -179,13 +179,13 @@ impl AbLineGuide {
     /// Hard cap at ±implement_width_m to allow full pass-width shifts.
     pub fn nudge_right(&mut self, amount_m: f64) {
         let cap = self.implement_width_m;
-        self.nudge_m = (self.nudge_m + amount_m).clamp(-cap, cap);
+        self.nudge_m = (self.nudge_m - amount_m).clamp(-cap, cap);
     }
 
     /// Shift the AB line to the left by `amount_m` metres.
     pub fn nudge_left(&mut self, amount_m: f64) {
         let cap = self.implement_width_m;
-        self.nudge_m = (self.nudge_m - amount_m).clamp(-cap, cap);
+        self.nudge_m = (self.nudge_m + amount_m).clamp(-cap, cap);
     }
 
     /// Reset nudge back to zero.
@@ -311,10 +311,12 @@ impl AbLineGuide {
                     // Forward pass: apply nudge directly
                     (raw_heading_error, pass_xtd - self.nudge_m)
                 };
+                let is_return = raw_heading_error.abs() > 90.0;
 
                 Some(CrossTrackError {
                     distance_m: final_xtd,
                     heading_error,
+                    is_return_pass: is_return,
                 })
             }
             _ => None,

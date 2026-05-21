@@ -121,8 +121,8 @@ float wasEmaSmoothed  = -1.0f;  // -1 sentinel = uninitialised (takes first read
 
 // ── Inner loop parameters (from NVS) ─────────────────────────────────
 float kpAngle   = 15.0f;    // PWM per degree of error beyond deadband (was 10, bumped per field test 8 finding 3)
-int16_t minPwm  = 90;       // Motor stall floor — bumped from 80, motor stalls below ~90 (field test 8 finding)
-int16_t maxPwm  = 180;      // Maximum PWM output
+int16_t minPwm  = 100;       // Motor stall floor — bumped from 80, motor stalls below ~90 (field test 8 finding)
+int16_t maxPwm  = 200;      // Maximum PWM output
 bool motorInvert = false;    // Flip PWM sign after control calc
 
 // ── Inner loop constants ─────────────────────────────────────────────

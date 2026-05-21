@@ -260,20 +260,20 @@ impl NmeaState {
         // laterally by `antenna_height * sin(roll)`. We subtract this
         // offset to get the position at ground/axle level.
         //
-        // Convention: positive roll = right side down. When the right
-        // side is down, the antenna moves LEFT relative to the heading.
-        // We correct by shifting the position RIGHT (perpendicular
-        // clockwise from heading), i.e. bearing = heading + 90°.
+        // Convention: positive roll = right side down. When right side is
+        // down, the antenna moves RIGHT relative to the ground contact
+        // point. We correct by shifting the position LEFT (perpendicular
+        // counter-clockwise from heading), i.e. bearing = heading - 90°.
         let (corrected_lat, corrected_lon) = if self.has_ins_attitude
             && self.antenna_height_m > 0.0
             && self.smoothed_roll.abs() > 0.1
         // Skip tiny roll (< 0.1°)
         {
             let lateral_offset_m = self.antenna_height_m * self.smoothed_roll.to_radians().sin();
-            // Shift perpendicular to heading: heading + 90° = rightward.
+            // Shift perpendicular to heading: heading - 90° = leftward.
             // lateral_offset_m is positive when roll is positive (right down),
-            // meaning the antenna moved left, so we correct rightward.
-            let correction_bearing = normalise_heading(corrected_heading + 90.0);
+            // meaning the antenna moved right, so we correct leftward.
+            let correction_bearing = normalise_heading(corrected_heading - 90.0);
             apply_offset(lat, lon, correction_bearing, lateral_offset_m)
         } else {
             (lat, lon)

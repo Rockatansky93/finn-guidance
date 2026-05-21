@@ -26,9 +26,10 @@
 //! it to the ESP32. When converging on the line, the damping reduces the
 //! correction to prevent overshoot.
 //!
-//! ## Sign convention
+//! ## Sign convention (post cross_track_distance_local migration)
 //!
-//!   - Positive XTE = vehicle is RIGHT of the line
+//!   - Negative XTE = vehicle is RIGHT of the line
+//!   - Positive XTE = vehicle is LEFT of the line
 //!   - Positive heading_error = nose pointed RIGHT of line bearing
 //!   - Positive angle = wheels turned RIGHT
 //!
@@ -261,7 +262,7 @@ impl SteeringController {
         self.last_lookahead_m = lookahead_m;
 
         let psi_rad = heading_error_deg.to_radians();
-        let alpha_line_frame = (-xte_m).atan2(lookahead_m);
+        let alpha_line_frame = (xte_m).atan2(lookahead_m);
         let alpha_rad = alpha_line_frame - psi_rad;
 
         let delta_rad = (2.0 * self.wheelbase_m * alpha_rad.sin()).atan2(lookahead_m);
@@ -272,16 +273,17 @@ impl SteeringController {
         // We want to REDUCE the desired angle when converging (prevent
         // overshoot) and INCREASE it when diverging (add urgency).
         //
-        // Sign analysis: if XTE > 0 (right of line), desired_angle < 0
-        // (steer left). When converging, xte_rate < 0 (XTE shrinking).
+        // Sign analysis (post local-XTE migration):
+        // If xte < 0 (right of line), desired_angle < 0 (steer left).
+        // When converging, xte_rate > 0 (xte moving toward zero).
         // We want to make desired_angle less negative (reduce magnitude).
-        // Since xte_rate is negative and desired_angle is negative, we
-        // SUBTRACT kd * xte_rate: desired_angle -= kd * (-rate) means
-        // desired_angle += kd * |rate|, which makes it less negative. Correct.
+        // So we ADD kd * xte_rate: desired_angle += kd * (+rate) makes
+        // it less negative. Correct.
         //
-        // When diverging, xte_rate > 0, so desired_angle -= kd * (+rate)
-        // makes it more negative (stronger correction). Also correct.
-        desired_angle -= self.kd_xte * xte_rate;
+        // When diverging, xte_rate < 0 (xte moving away from zero),
+        // so desired_angle += kd * (-rate) makes it more negative
+        // (stronger correction). Also correct.
+        desired_angle += self.kd_xte * xte_rate;
 
         // === Smooth taper near the line ===
         if self.deadband_m > 0.0 {
@@ -303,6 +305,7 @@ impl SteeringController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn engaged_controller() -> SteeringController {
         let mut c = SteeringController::new();
@@ -324,8 +327,8 @@ mod tests {
     #[test]
     fn test_right_of_line_steers_left() {
         let mut c = engaged_controller();
-        c.prev_xte_m = Some(1.0);
-        let (angle, _) = c.compute(1.0, 0.0, 2.0);
+        c.prev_xte_m = Some(-1.0);
+        let (angle, _) = c.compute(-1.0, 0.0, 2.0);
         assert!(
             angle < 0.0,
             "Right of line should command left steering, got {}",
@@ -336,8 +339,8 @@ mod tests {
     #[test]
     fn test_left_of_line_steers_right() {
         let mut c = engaged_controller();
-        c.prev_xte_m = Some(-1.0);
-        let (angle, _) = c.compute(-1.0, 0.0, 2.0);
+        c.prev_xte_m = Some(1.0);
+        let (angle, _) = c.compute(1.0, 0.0, 2.0);
         assert!(
             angle > 0.0,
             "Left of line should command right steering, got {}",
@@ -400,15 +403,17 @@ mod tests {
         // When XTE is shrinking (converging), the damping term should
         // reduce the desired angle magnitude compared to steady-state.
         let mut c = engaged_controller();
-        c.prev_xte_m = Some(1.0);
-        c.compute(1.0, 0.0, 2.0);
+        c.prev_xte_m = Some(-1.0);
+        // Set prev_compute_time 100ms ago so dt is meaningful
+        c.prev_compute_time = Some(Instant::now() - Duration::from_millis(100));
+        c.compute(-1.0, 0.0, 2.0);
         let steady_angle = c.last_desired_angle;
 
-        // Converging XTE (was 1.5, now 1.0 -> negative rate).
-        // With kd subtracted, converging should produce LESS aggressive correction.
+        // Converging XTE (was -1.5, now -1.0 -> positive rate = shrinking magnitude).
         let mut c2 = engaged_controller();
-        c2.prev_xte_m = Some(1.5);
-        c2.compute(1.0, 0.0, 2.0);
+        c2.prev_xte_m = Some(-1.5);
+        c2.prev_compute_time = Some(Instant::now() - Duration::from_millis(100));
+        c2.compute(-1.0, 0.0, 2.0);
         let converging_angle = c2.last_desired_angle;
 
         assert!(
@@ -424,14 +429,16 @@ mod tests {
         // When XTE is growing (diverging), the damping term should
         // increase the desired angle magnitude compared to steady-state.
         let mut c = engaged_controller();
-        c.prev_xte_m = Some(1.0);
-        c.compute(1.0, 0.0, 2.0);
+        c.prev_xte_m = Some(-1.0);
+        c.prev_compute_time = Some(Instant::now() - Duration::from_millis(100));
+        c.compute(-1.0, 0.0, 2.0);
         let steady_angle = c.last_desired_angle;
 
-        // Diverging XTE (was 0.5, now 1.0 -> positive rate).
+        // Diverging XTE (was -0.5, now -1.0 -> negative rate = growing magnitude).
         let mut c2 = engaged_controller();
-        c2.prev_xte_m = Some(0.5);
-        c2.compute(1.0, 0.0, 2.0);
+        c2.prev_xte_m = Some(-0.5);
+        c2.prev_compute_time = Some(Instant::now() - Duration::from_millis(100));
+        c2.compute(-1.0, 0.0, 2.0);
         let diverging_angle = c2.last_desired_angle;
 
         assert!(

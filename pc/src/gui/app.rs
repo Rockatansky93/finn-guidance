@@ -150,6 +150,9 @@ pub struct GuidanceApp {
     /// Import/export status message
     io_status_msg: Option<(String, u32)>,
 
+    /// ID of the currently loaded AB line (for nudge/pass persistence)
+    current_line_id: Option<i64>,
+
     /// Whether steer telemetry logging is enabled (persisted in SQLite)
     telemetry_enabled: bool,
 }
@@ -309,12 +312,26 @@ impl GuidanceApp {
         // Auto-load last-used AB line on startup
         let mut guide = AbLineGuide::new(implement_width);
         guide.overlap_m = overlap;
+        let mut current_line_id: Option<i64> = None;
         if let Some(db_ref) = &db {
             if let Some(line_id_str) = db_ref.get_config("last_ab_line_id") {
                 if let Ok(line_id) = line_id_str.parse::<i64>() {
                     // Find this line in the saved list and load it
                     if let Some(line) = saved_ab_lines.iter().find(|l| l.id == line_id) {
                         guide.load_ab_line(line.a_lat, line.a_lon, line.b_lat, line.b_lon);
+                        current_line_id = Some(line_id);
+                        // Restore persisted nudge and pass number for this line
+                        if let Some(nudge_str) = db_ref.get_config(&format!("nudge_m:{}", line_id)) {
+                            if let Ok(nudge) = nudge_str.parse::<f64>() {
+                                guide.nudge_m = nudge;
+                            }
+                        }
+                        if let Some(pass_str) = db_ref.get_config(&format!("pass_number:{}", line_id)) {
+                            if let Ok(pass) = pass_str.parse::<i32>() {
+                                guide.pass_number = pass;
+                                guide.pass_offset_m = guide.pass_spacing() * pass as f64;
+                            }
+                        }
                     }
                 }
             }
@@ -394,6 +411,7 @@ impl GuidanceApp {
             new_field_name: String::new(),
             ab_status_msg: None,
             io_status_msg: None,
+            current_line_id,
             telemetry_enabled,
         }
     }
@@ -403,6 +421,21 @@ impl GuidanceApp {
         if let Some(db) = &self.db {
             self.saved_fields = db.list_fields().unwrap_or_default();
             self.saved_ab_lines = db.list_ab_lines().unwrap_or_default();
+        }
+    }
+
+    /// Persist the current nudge and pass number for the active AB line.
+    /// Called after any nudge or pass change so values survive restart.
+    fn persist_nudge_and_pass(&self) {
+        if let (Some(db), Some(line_id)) = (&self.db, self.current_line_id) {
+            let _ = db.set_config(
+                &format!("nudge_m:{}", line_id),
+                &format!("{:.4}", self.guide.nudge_m),
+            );
+            let _ = db.set_config(
+                &format!("pass_number:{}", line_id),
+                &self.guide.pass_number.to_string(),
+            );
         }
     }
 
@@ -524,6 +557,7 @@ impl eframe::App for GuidanceApp {
                 let mut state = self.steer_state.lock().unwrap();
                 state.pass_number = self.guide.pass_number;
                 drop(state);
+                self.persist_nudge_and_pass();
                 self.auto_pass_notification = Some((
                     format!("Auto → Pass {}", event.new_pass),
                     180, // ~3 seconds at 60fps
@@ -724,8 +758,10 @@ impl GuidanceApp {
 
                 // Nudge buttons: ◄N  ◄1  [value]  1►  N►  Reset
                 // Coarse step is configurable (nudge_step_cm), fine step is always 1cm.
+                // On return passes, swap left/right so buttons match the cab perspective.
                 let step_m = self.nudge_step_cm as f64 / 100.0;
                 let step_label = self.nudge_step_cm.to_string();
+                let is_return = self.current_error.as_ref().map_or(false, |e| e.is_return_pass);
                 if ui
                     .add(
                         egui::Button::new(
@@ -735,8 +771,9 @@ impl GuidanceApp {
                     )
                     .clicked()
                 {
-                    self.guide.nudge_left(step_m);
+                    if is_return { self.guide.nudge_right(step_m); } else { self.guide.nudge_left(step_m); }
                     self.sync_guide_to_steer_thread();
+                    self.persist_nudge_and_pass();
                 }
                 if ui
                     .add(
@@ -745,8 +782,9 @@ impl GuidanceApp {
                     )
                     .clicked()
                 {
-                    self.guide.nudge_left(0.01);
+                    if is_return { self.guide.nudge_right(0.01); } else { self.guide.nudge_left(0.01); }
                     self.sync_guide_to_steer_thread();
+                    self.persist_nudge_and_pass();
                 }
 
                 let nudge_cm = (self.guide.nudge_m * 100.0).round() as i32;
@@ -776,8 +814,9 @@ impl GuidanceApp {
                     )
                     .clicked()
                 {
-                    self.guide.nudge_right(0.01);
+                    if is_return { self.guide.nudge_left(0.01); } else { self.guide.nudge_right(0.01); }
                     self.sync_guide_to_steer_thread();
+                    self.persist_nudge_and_pass();
                 }
                 if ui
                     .add(
@@ -788,8 +827,9 @@ impl GuidanceApp {
                     )
                     .clicked()
                 {
-                    self.guide.nudge_right(step_m);
+                    if is_return { self.guide.nudge_left(step_m); } else { self.guide.nudge_right(step_m); }
                     self.sync_guide_to_steer_thread();
+                    self.persist_nudge_and_pass();
                 }
                 if nudge_cm != 0 {
                     if ui
@@ -801,6 +841,7 @@ impl GuidanceApp {
                     {
                         self.guide.nudge_reset();
                         self.sync_guide_to_steer_thread();
+                        self.persist_nudge_and_pass();
                     }
                 }
 
@@ -815,6 +856,7 @@ impl GuidanceApp {
                         match self.guide.align_grid_to_position(&fix) {
                             Some(shift_m) => {
                                 self.sync_guide_to_steer_thread();
+                                self.persist_nudge_and_pass();
                                 let shift_cm = (shift_m * 100.0).round() as i32;
                                 let nudge_cm = (self.guide.nudge_m * 100.0).round() as i32;
                                 self.steer_status_msg = Some((
@@ -1138,11 +1180,11 @@ impl GuidanceApp {
             .map(|e| (e.distance_m * 100.0) as f64)
             .unwrap_or(0.0);
 
-        // Full scale = SEGS_PER_SIDE segments × cm_per_seg.
-        // Dot position in fractional segments from centre (negative = left).
-        // Sign: negative XTE (left of line) → line is right → positive dot pos.
+        // XTE positive = vehicle is RIGHT of line, dots should show line to LEFT.
+        // XTE negative = vehicle is LEFT of line, dots should show line to RIGHT.
+        // Dots represent where the line is — chase them to get on track.
         let dot_pos_segs: f64 = if self.current_error.is_some() && self.guide.line.is_some() {
-            (-xtd_cm / self.lightbar_cm_per_seg).clamp(-SEGS_PER_SIDE as f64, SEGS_PER_SIDE as f64)
+            (xtd_cm / self.lightbar_cm_per_seg).clamp(-SEGS_PER_SIDE as f64, SEGS_PER_SIDE as f64)
         } else {
             0.0
         };
@@ -1239,6 +1281,7 @@ impl GuidanceApp {
                         if ui.add(egui::Button::new("◄ Pass").min_size(egui::vec2(70.0, 30.0))).clicked() {
                             self.guide.prev_pass();
                             self.sync_guide_to_steer_thread();
+                            self.persist_nudge_and_pass();
                         }
                         ui.label(
                             egui::RichText::new(format!("Pass {}", self.guide.pass_number))
@@ -1247,6 +1290,7 @@ impl GuidanceApp {
                         if ui.add(egui::Button::new("Pass ►").min_size(egui::vec2(70.0, 30.0))).clicked() {
                             self.guide.next_pass();
                             self.sync_guide_to_steer_thread();
+                            self.persist_nudge_and_pass();
                         }
                     });
 
@@ -1282,6 +1326,7 @@ impl GuidanceApp {
                             match self.guide.align_grid_to_position(&fix) {
                                 Some(shift_m) => {
                                     self.sync_guide_to_steer_thread();
+                                    self.persist_nudge_and_pass();
                                     let shift_cm = (shift_m * 100.0).round() as i32;
                                     let nudge_cm = (self.guide.nudge_m * 100.0).round() as i32;
                                     self.ab_status_msg = Some((
@@ -1462,6 +1507,21 @@ impl GuidanceApp {
                                         ui.horizontal(|ui| {
                                             if ui.small_button("Load").clicked() {
                                                 self.guide.load_ab_line(*a_lat, *a_lon, *b_lat, *b_lon);
+                                                self.current_line_id = Some(*id);
+                                                // Restore persisted nudge and pass for this line
+                                                if let Some(db) = &self.db {
+                                                    if let Some(nudge_str) = db.get_config(&format!("nudge_m:{}", id)) {
+                                                        if let Ok(nudge) = nudge_str.parse::<f64>() {
+                                                            self.guide.nudge_m = nudge;
+                                                        }
+                                                    }
+                                                    if let Some(pass_str) = db.get_config(&format!("pass_number:{}", id)) {
+                                                        if let Ok(pass) = pass_str.parse::<i32>() {
+                                                            self.guide.pass_number = pass;
+                                                            self.guide.pass_offset_m = self.guide.pass_spacing() * pass as f64;
+                                                        }
+                                                    }
+                                                }
                                                 self.sync_guide_to_steer_thread();
                                                 if let Some(db) = &self.db {
                                                     let _ = db.set_config("last_ab_line_id", &id.to_string());
@@ -1504,6 +1564,21 @@ impl GuidanceApp {
                                             ui.horizontal(|ui| {
                                                 if ui.small_button("Load").clicked() {
                                                     self.guide.load_ab_line(a_lat, a_lon, b_lat, b_lon);
+                                                    self.current_line_id = Some(id);
+                                                    // Restore persisted nudge and pass for this line
+                                                    if let Some(db) = &self.db {
+                                                        if let Some(nudge_str) = db.get_config(&format!("nudge_m:{}", id)) {
+                                                            if let Ok(nudge) = nudge_str.parse::<f64>() {
+                                                                self.guide.nudge_m = nudge;
+                                                            }
+                                                        }
+                                                        if let Some(pass_str) = db.get_config(&format!("pass_number:{}", id)) {
+                                                            if let Ok(pass) = pass_str.parse::<i32>() {
+                                                                self.guide.pass_number = pass;
+                                                                self.guide.pass_offset_m = self.guide.pass_spacing() * pass as f64;
+                                                            }
+                                                        }
+                                                    }
                                                     self.sync_guide_to_steer_thread();
                                                     if let Some(db) = &self.db {
                                                         let _ = db.set_config("last_ab_line_id", &id.to_string());
@@ -1763,21 +1838,26 @@ impl GuidanceApp {
                     ui.add_space(4.0);
 
                     // Coarse nudge buttons (use configurable step)
+                    // On return passes, swap left/right so buttons match cab perspective.
                     let setup_step_m = self.nudge_step_cm as f64 / 100.0;
                     let setup_step_label = self.nudge_step_cm.to_string();
+                    let is_return_setup = self.current_error.as_ref().map_or(false, |e| e.is_return_pass);
                     ui.label(egui::RichText::new(format!("{} cm steps:", self.nudge_step_cm)).size(11.0).weak());
                     ui.horizontal(|ui| {
                         if ui.add(egui::Button::new(format!("◄◄ {}", setup_step_label)).min_size(egui::vec2(56.0, 30.0))).clicked() {
-                            self.guide.nudge_left(setup_step_m);
+                            if is_return_setup { self.guide.nudge_right(setup_step_m); } else { self.guide.nudge_left(setup_step_m); }
                             self.sync_guide_to_steer_thread();
+                            self.persist_nudge_and_pass();
                         }
                         if ui.add(egui::Button::new("Reset").min_size(egui::vec2(50.0, 30.0))).clicked() {
                             self.guide.nudge_reset();
                             self.sync_guide_to_steer_thread();
+                            self.persist_nudge_and_pass();
                         }
                         if ui.add(egui::Button::new(format!("{} ►►", setup_step_label)).min_size(egui::vec2(56.0, 30.0))).clicked() {
-                            self.guide.nudge_right(setup_step_m);
+                            if is_return_setup { self.guide.nudge_left(setup_step_m); } else { self.guide.nudge_right(setup_step_m); }
                             self.sync_guide_to_steer_thread();
+                            self.persist_nudge_and_pass();
                         }
                     });
 
@@ -1787,13 +1867,15 @@ impl GuidanceApp {
                     ui.label(egui::RichText::new("1 cm fine:").size(11.0).weak());
                     ui.horizontal(|ui| {
                         if ui.add(egui::Button::new("◄ 1").min_size(egui::vec2(56.0, 30.0))).clicked() {
-                            self.guide.nudge_left(0.01);
+                            if is_return_setup { self.guide.nudge_right(0.01); } else { self.guide.nudge_left(0.01); }
                             self.sync_guide_to_steer_thread();
+                            self.persist_nudge_and_pass();
                         }
                         ui.add_space(50.0); // keep alignment with row above
                         if ui.add(egui::Button::new("1 ►").min_size(egui::vec2(56.0, 30.0))).clicked() {
-                            self.guide.nudge_right(0.01);
+                            if is_return_setup { self.guide.nudge_left(0.01); } else { self.guide.nudge_right(0.01); }
                             self.sync_guide_to_steer_thread();
+                            self.persist_nudge_and_pass();
                         }
                     });
 

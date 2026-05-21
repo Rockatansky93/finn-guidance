@@ -124,4 +124,5 @@ pub enum GuidanceLine {
 pub struct CrossTrackError {
     pub distance_m: f64,    // Metres from line (negative = left, positive = right)
     pub heading_error: f64, // Degrees difference from desired heading
+    pub is_return_pass: bool, // True when travelling B→A (opposite to line direction)
 }
