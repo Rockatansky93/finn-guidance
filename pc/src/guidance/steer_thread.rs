@@ -278,7 +278,7 @@ pub fn run_steer_thread(
         }
 
         // ── 3. Process commands and sync tuning from GUI ────────────
-        let (current_pass, current_implement_w, current_overlap);
+        let current_pass;
         let auto_learn_enabled;
         let manual_centre_now;
         {
@@ -363,8 +363,6 @@ pub fn run_steer_thread(
 
             // Capture current values for telemetry (outside the lock)
             current_pass = state.pass_number;
-            current_implement_w = state.implement_width_m;
-            current_overlap = state.overlap_m;
             auto_learn_enabled = state.was_auto_learn_enabled;
             manual_centre_now = state.was_centre_manual;
         }
@@ -528,6 +526,7 @@ pub fn run_steer_thread(
                                 sats: interp_fix.satellites,
                                 hdop: interp_fix.hdop,
                                 roll: interp_fix.roll,
+                                roll_corr_m: interp_fix.roll_corr_m,
                                 pass: current_pass,
                                 xte_m: err.distance_m,
                                 heading_err: err.heading_error,

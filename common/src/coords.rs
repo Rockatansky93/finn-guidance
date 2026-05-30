@@ -99,7 +99,13 @@ pub fn to_local_en(ref_lat: f64, ref_lon: f64, lat: f64, lon: f64) -> (f64, f64)
 /// artefacts of the spherical formula and gives a geometrically stable line
 /// that doesn't drift with distance from the AB segment.
 ///
-/// Returns signed distance in metres: positive = right of A→B, negative = left.
+/// Returns signed distance in metres: positive = LEFT of A→B, negative = right.
+///
+/// NOTE: this is the OPPOSITE sign convention to the deprecated spherical
+/// `cross_track_distance` above (which returns positive = right). Guidance
+/// uses this local function exclusively, and the entire XTE chain — ab_line.rs,
+/// steering.rs, the lightbar — is built on "positive = left". Do not try to
+/// reconcile the two conventions without flipping every consumer.
 pub fn cross_track_distance_local(
     point_lat: f64,
     point_lon: f64,
@@ -116,8 +122,9 @@ pub fn cross_track_distance_local(
         return 0.0;
     }
 
-    // 2D cross product (B−A) × (P−A) / |B−A|.
-    // Positive when P is to the right of the A→B direction.
+    // 2D cross product (B−A) × (P−A) / |B−A| in the East-North (right-handed)
+    // frame: a positive result means P is counter-clockwise from A→B, i.e. to
+    // the LEFT of the A→B direction of travel.
     (be * pn - bn * pe) / line_len
 }
 
@@ -179,8 +186,9 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_track_local_right_of_line() {
-        // Point east of a N-S line should be positive (right of A→B going south)
+    fn test_cross_track_local_left_of_line() {
+        // A→B runs north→south here, so a point to the EAST is to the LEFT of
+        // the direction of travel → positive XTE.
         let xtd = cross_track_distance_local(
             -33.5, 138.6001, // point slightly east
             -33.0, 138.6,    // A (north)

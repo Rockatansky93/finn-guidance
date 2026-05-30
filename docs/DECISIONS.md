@@ -1409,6 +1409,56 @@ are removed from the cab entirely.
 
 ---
 
+## #027 — Drop-on-full channel sends in the serial reader threads
+
+**Date:** 22 April 2026 (Session 22; verified field tests 8 & 9)
+**Status:** Accepted
+**Context:** Field test 7 with the air seeder hitched showed intermittent ~3-second
+freezes — the GUI locked and the tractor physically drifted ~1 m before recovering.
+A code audit of `main.rs` and the two reader threads found the cause. All four
+channels between the serial readers and their consumers are bounded (GPS: 64,
+FINN: 128), and both reader threads (`gps/reader.rs`, `comms/serial.rs`) used
+blocking `send()`. Each reader feeds *two* consumers from a single thread: the GUI
+and the steer thread. When the GUI had a slow frame its channel filled, the reader
+blocked on that `send()`, and — because the same thread also feeds the steer-thread
+channel — the steer thread stopped receiving fixes too. The steer thread starved,
+emitted no `$FINNSTEER`, the motor ESP32 correctly held its last commanded angle
+(~5°), and the tractor drifted until the GUI recovered and the channels drained.
+The slow consumer was backpressuring the fast one through the shared reader thread.
+
+**Decision:** Both reader threads use `try_send` and drop the message when a
+channel is full, instead of blocking. Drop counts are tracked two ways: a local
+rolling counter logged as WARN every ~5 s (human-visible in field logs), and shared
+atomic counters (`SharedDropCounters`, `Arc<AtomicU64>`) that the steer thread
+reads-and-resets each second for the telemetry summary records. Guidance gets the
+latest-value semantics a real-time control loop actually wants — a stale 3-second
+fix is worse than a skipped one, so dropping and computing off the next fix is
+correct.
+
+**Trade-off (drop vs block):** dropping can lose a fix under load, but at 1 Hz GGA
+/ 10 Hz PQTMINS into a 64-deep channel, drops only occur once a consumer has
+stalled across many fixes — exactly when the freshest fix matters and the backlog
+is worthless. The drop counters make any sustained dropping visible, so a genuine
+throughput problem can't hide behind the silent discard.
+
+**Verified:** field tests 8 (25 April) and 9 (28 April) both logged zero channel
+drops across all four counters with no backpressure freezes. The single residual
+3.2 s stall in FT8 originated upstream of the reader thread (USB serial / GPS
+module pause), not from channel backpressure.
+
+**Alternatives considered:** larger channel buffers (rejected: only delays the
+freeze and adds latency — accumulating stale fixes is the wrong thing for real-time
+guidance); a separate reader thread per consumer (rejected: doubles serial parsing
+and still wouldn't help when a consumer stalls — the bottleneck is consumer speed,
+not reader throughput); unbounded channels (rejected: a stalled consumer would grow
+memory without bound — trades a freeze for a leak).
+
+**Hardens:** the threading model established in #026. Never re-introduce blocking
+`send()` on a reader → consumer channel without explicitly considering the
+shared-thread starvation risk.
+
+---
+
 ## #028 — LC29H BA DR remediation: PQTMINS/PQTMIMU with corrected NR11 parsing
 
 **Date:** 30 April 2026
@@ -1469,3 +1519,175 @@ reports calibrated.
 
 **Revises:** The DR portions of #026. The hardware simplification remains, but
 the previous inline comments and parser assumptions about PQTMINS were wrong.
+
+
+---
+
+## #029 — Manual roll calibration: mounting-bias capture + direction toggle
+
+**Date:** 30 May 2026
+**Status:** Accepted
+**Context:** Roll compensation (the lateral antenna-swing correction added under
+#028) assumed two things that are not true across different tractor installs:
+(1) that the GPS module reads exactly 0° roll when the vehicle is level, and
+(2) that positive `$PQTMINS` roll means right-side-down with the antenna swinging
+right (corrected leftward). Neither holds in general. A module bolted to a cab
+roof that isn't perfectly flat, or on an angled bracket, reads a constant non-zero
+roll on level ground — so the correction injects a constant lateral position error
+(`antenna_height × sin(bias)`, e.g. ~10 cm at 3 m and 2°) on every pass, even on
+the flat. And the roll *sign* depends on module orientation/firmware, which the
+code could only assume, not verify. Both are install-to-install differences that
+made deployment to a second tractor a guessing game, and a wrong sign would only
+show up as unexplained XTE drift on slopes — exactly the kind of error that gets
+harder to attribute as the rest of the stack improves.
+
+**Decision:** Add a manual roll calibration with two persisted, per-machine
+parameters, plus telemetry of the actually-applied correction.
+
+1. **Roll mounting-bias offset** (`roll_offset_deg`, config key `roll_offset_deg`).
+   The parser computes `effective_roll = smoothed_roll - roll_offset_deg` and uses
+   that for the correction. Captured at install by parking on flat, level ground
+   and pressing **Capture Level**, which records the current (raw, EMA-smoothed)
+   module roll as the bias zero. A constant offset, so subtracting it before vs
+   after the EMA is identical — capture reads the already-smoothed resting value.
+2. **Roll direction invert** (`roll_invert`, config key `roll_invert`). A
+   Normal/Inverted toggle that negates the computed lateral correction, turning
+   the previously-buried sign assumption into a setting the operator verifies on a
+   slope.
+3. **Applied-correction telemetry** (`roll_corr_m` on `GpsFix` and in the
+   telemetry `IterRecord`). The signed lateral shift actually applied to each
+   fix's position (positive = shifted left of travel, i.e. bearing heading−90°),
+   after offset and invert. Previously the correction was silently baked into
+   lat/lon with no record; now it is visible in the `.jsonl` logs and the GUI, so
+   a wrong sign or bad offset is diagnosable directly instead of as mystery XTE.
+
+**Correction math (in `gps/parser.rs::try_build_fix`):**
+```
+effective_roll = smoothed_roll - roll_offset_deg
+if has_ins_attitude && antenna_height_m > 0 && |effective_roll| > 0.1°:
+    lateral = antenna_height_m * sin(effective_roll)
+    if roll_invert: lateral = -lateral
+    bearing = normalise(corrected_heading - 90°)   # heading-90 = leftward
+    position = apply_offset(lat, lon, bearing, lateral)   # negative dist reverses
+    roll_corr_m = lateral
+else:
+    roll_corr_m = 0.0
+```
+The skip-tiny-roll gate now tests `effective_roll`, not raw roll, so a calibrated
+bias of 2° correctly yields ~0 correction on the flat. With `roll_offset_deg = 0`
+and `roll_invert = false` the math reduces exactly to the pre-existing #028
+correction — the feature is a no-op until calibrated, so it is safe to ship before
+any capture is done.
+
+**Plumbing:** Two new shared atomics on the existing heading-offset/antenna-height
+pattern — `SharedRollOffset` (`Arc<AtomicI32>`, centidegrees) and
+`SharedRollInvert` (`Arc<AtomicBool>`) — created in `main.rs`, cloned into the GPS
+reader thread, and polled into the parser each sentence. The GUI holds local
+copies, loads both from SQLite on startup and pushes them to the atomics, and
+persists on change via `apply_roll_offset()` / `apply_roll_invert()`.
+
+**UI (Setup page, ROLL CORRECTION section):** below the existing antenna-height
+controls, a "Level calibration" block shows the current mounting bias with a
+**◎ Capture Level** button (enabled once attitude data is present) and a Clear
+button; a "Roll direction" block shows a Normal/Inverted toggle. The live readout
+and the SENSORS attitude readout now show *effective* roll (raw minus bias) and
+the *actually-applied* `roll_corr_m` from the fix, rather than recomputing from
+raw roll — so what the operator sees matches what was applied.
+
+**Required field procedure:**
+1. Park on the flattest, most level ground available; confirm the live roll is
+   stable; press Capture Level. Effective roll should drop to ~0°.
+2. On a known cross-slope, watch the live correction and XTE. If the correction
+   pushes XTE *away* from zero, press Direction: Inverted once. The `roll_corr_m`
+   telemetry then confirms the sign from the logs. This single observation
+   resolves the sign question for that machine permanently.
+
+**Why not a dynamic two-direction (drive-the-line-both-ways) auto-calibration:**
+considered and deferred. It would estimate bias, sign, and effective lever-arm
+automatically by overlaying reciprocal passes, but it is a multi-part build
+(track recording, pass-pair association, a solver, an error-prone operator
+procedure) and mostly automates values that can be set by hand in under a minute.
+The one thing it adds that the manual path can't — the sign check — is delivered
+far more cheaply by the explicit invert toggle plus the live/telemetry readout.
+Revisit if curved-line work or fleet scale makes per-machine manual calibration
+burdensome.
+
+**Alternatives considered:** static level capture only, no invert (rejected: leaves
+the sign unverifiable, which is the more dangerous of the two unknowns on slopes);
+changing `GpsFix.roll` to carry effective roll (rejected: changes the meaning of an
+existing field and the capture needs the raw value — instead the GUI derives
+effective roll locally from `roll - roll_offset_deg` and the new `roll_corr_m`
+carries the applied truth); storing the offset on the ESP32 like WAS cal (rejected:
+roll correction is entirely PC-side, so the calibration belongs with the PC config
+in SQLite).
+
+**Files touched:** `common/src/types.rs` (`roll_corr_m` on `GpsFix`),
+`gps/parser.rs` (effective-roll correction + invert + `roll_corr_m`, 5 tests),
+`gps/reader.rs` (two shared atomics + polling), `main.rs` (create + thread the
+atomics), `telemetry/logger.rs` (`roll_corr_m` in `IterRecord`),
+`guidance/steer_thread.rs` (populate it), `gui/app.rs` (controls, persistence,
+readouts). Also a small dead-code cleanup in `steer_thread.rs` (removed unused
+`current_implement_w` / `current_overlap` captures).
+
+**Companion work this session (not strictly part of this decision):** the AB-line
+sign-convention consolidation in `ab_line.rs` — `signed_line_offset()` /
+`travel_sign()` primitives, the return-pass `align_grid_to_position` fix, the new
+`snap_to_nearest_pass()`, and correction of the inverted sign-convention comments
+in `coords.rs` / `types.rs` (code was always correct; comments lied). See the
+commit history and `ab_line.rs` module docs for the full convention.
+
+
+---
+
+## #030 — Bound GPS config ack-wait loops with a wall-clock deadline
+
+**Date:** 1 May 2026 (Session 29; written up Session 30)
+**Status:** Accepted — hot-fixed live during seeding
+**Numbering note:** chronologically this is 1 May work and sits before #029 (30
+May), but it was written up later during a docs tidy. Decision numbers here are
+assignment order, not strictly date order.
+
+**Context:** During seeding the app came up with "no GPS fix in GUI". Diagnosed
+live via Windows-MCP / Filesystem-MCP on the tractor laptop while Tom drove. Root
+cause: the rate-set ack-wait loop in `ensure_module_config()` (`gps/reader.rs`)
+waited for the module's `PAIR001,050` acknowledgement using only a per-read
+timeout, with a fallback `_ => break`. But the LC29H BA streams ~11 NMEA
+sentences/second continuously (1 Hz GGA + 10 Hz PQTMINS), so every `port.read()`
+returned data within the timeout and the fallback never fired. The loop ran
+forever; the GPS reader thread never reached its main NMEA processing loop; no
+fixes ever reached the GUI or the steer thread. The distinctive symptom was the
+log stopping at `Trying 10Hz (100ms): $PAIR050,100*22` with the GPS thread then
+silent forever — it looked like a clean startup followed by a dead GPS, but was
+actually a hung config thread.
+
+**Decision:** Bound the ack-wait loop with a 500 ms `Instant`-based wall-clock
+deadline in addition to the per-read timeout (which was reduced 300 ms → 100 ms,
+no longer the safety net). After the deadline the loop exits and control flows
+normally through SAVEPAR → main read loop. On the rebuild, first fix arrived 1.2 s
+after launch. **General rule for this codebase: any `port.read()` ack-loop against
+a continuously-streaming device must have an `Instant`-based deadline — a per-read
+timeout alone is insufficient because the read never times out.**
+
+**Hardware finding documented alongside:** the LC29H BA NR11A02S firmware caps
+GGA/VTG output at 1 Hz regardless of `$PAIR050`. The module actually returns
+`PAIR001,050,1` ("unsupported") to `$PAIR050,100`, but the buffered-ack reader
+misses it in the NMEA flood and falls through to the "may still be applied" log
+path; SAVEPAR then persists the still-1 Hz state to NVS. **This is fine and matches
+the architecture** — `gps/parser.rs` uses GGA only for position and PQTMINS for
+10 Hz heading/velocity/attitude, and the interpolator dead-reckons between 1 Hz
+GGA fixes. Field coverage points landed at exactly 1.00 Hz (deltas 997–1003 ms
+across 50 consecutive points), confirming. This **resolves FT8 Finding 5** ("GPS
+effective rate ~1–2 Hz, not 10 Hz") as by-design hardware behaviour, not a bug.
+
+**Companion to #027:** both decisions are about not letting a blocking or looping
+construct in the I/O path stall the whole pipeline.
+
+**Alternatives considered:** parse the `PAIR001,050` response properly to detect
+the "unsupported" code and skip cleanly (a reasonable future improvement, but the
+deadline is the robust catch-all regardless of what the module returns); remove the
+`$PAIR050` send entirely on this firmware since it's a no-op that costs ~700 ms of
+startup (noted as a possible cleanup; left in place as harmless for now).
+
+**Open follow-up:** the log line "No ack for 10Hz (may still be applied)" is
+misleading — it should name the NR11 1 Hz cap explicitly so the next debugger
+doesn't lose an hour. Tracked in ACTIVE_CONTEXT.

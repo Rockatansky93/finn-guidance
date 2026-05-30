@@ -12,7 +12,9 @@ use super::field_view::FieldView;
 use crate::comms::serial::MotorHandle;
 use crate::coverage::db::{CoverageDb, SavedAbLine, SavedField};
 use crate::coverage::logger::CoverageLogger;
-use crate::gps::reader::{SharedAntennaHeight, SharedHeadingOffset};
+use crate::gps::reader::{
+    SharedAntennaHeight, SharedHeadingOffset, SharedRollInvert, SharedRollOffset,
+};
 use crate::guidance::ab_line::AbLineGuide;
 use crate::guidance::steer_thread::{
     AbLineData, SteerCommand, SteerDisplayState, SteerStateHandle,
@@ -120,6 +122,16 @@ pub struct GuidanceApp {
     antenna_height_shared: SharedAntennaHeight,
     /// Local copy of the antenna height in metres.
     antenna_height_m: f64,
+    /// Shared atomic roll mounting-bias offset (deg) — updated here, polled
+    /// by the GPS reader thread for roll correction.
+    roll_offset_shared: SharedRollOffset,
+    /// Local copy of the roll mounting-bias offset in degrees. Captured by
+    /// parking level and pressing "Capture Level".
+    roll_offset_deg: f64,
+    /// Shared flag inverting the roll-correction direction.
+    roll_invert_shared: SharedRollInvert,
+    /// Local copy of the roll-invert flag.
+    roll_invert: bool,
 
     // --- Nudge step size ---
     /// Coarse nudge step size in centimetres (persisted). The fine step is
@@ -166,6 +178,8 @@ impl GuidanceApp {
         implement_width: f64,
         heading_offset_shared: SharedHeadingOffset,
         antenna_height_shared: SharedAntennaHeight,
+        roll_offset_shared: SharedRollOffset,
+        roll_invert_shared: SharedRollInvert,
     ) -> Self {
         // Open the coverage database.  `CoverageLogger` also holds a reference
         // in some configurations; here we open a second handle for persistence.
@@ -273,6 +287,25 @@ impl GuidanceApp {
             (antenna_height_m * 100.0).round() as i32,
             std::sync::atomic::Ordering::Relaxed,
         );
+
+        // Load roll mounting-bias offset + invert flag from database, and push
+        // both to their shared atomics so the GPS reader's roll correction
+        // uses the calibrated values immediately on startup.
+        let roll_offset_deg = db
+            .as_ref()
+            .and_then(|d| d.get_config("roll_offset_deg"))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        roll_offset_shared.store(
+            (roll_offset_deg * 100.0).round() as i32,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let roll_invert = db
+            .as_ref()
+            .and_then(|d| d.get_config("roll_invert"))
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        roll_invert_shared.store(roll_invert, std::sync::atomic::Ordering::Relaxed);
 
         // Load pure-pursuit steering parameters from database.
         // Note: pre-pure-pursuit databases may have `steer_kp` / `steer_kh`
@@ -399,6 +432,10 @@ impl GuidanceApp {
             heading_offset_deg,
             antenna_height_shared,
             antenna_height_m,
+            roll_offset_shared,
+            roll_offset_deg,
+            roll_invert_shared,
+            roll_invert,
             nudge_step_cm,
             db,
             saved_fields,
@@ -531,6 +568,30 @@ impl GuidanceApp {
         );
         if let Some(db) = &self.db {
             let _ = db.set_config("antenna_height_m", &format!("{:.2}", self.antenna_height_m));
+        }
+    }
+
+    /// Push the current roll mounting-bias offset to the shared atomic (for
+    /// the GPS reader thread's roll correction) and persist to SQLite.
+    fn apply_roll_offset(&self) {
+        self.roll_offset_shared.store(
+            (self.roll_offset_deg * 100.0).round() as i32,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if let Some(db) = &self.db {
+            let _ = db.set_config("roll_offset_deg", &format!("{:.2}", self.roll_offset_deg));
+        }
+    }
+
+    /// Push the current roll-invert flag to the shared atomic and persist.
+    fn apply_roll_invert(&self) {
+        self.roll_invert_shared
+            .store(self.roll_invert, std::sync::atomic::Ordering::Relaxed);
+        if let Some(db) = &self.db {
+            let _ = db.set_config(
+                "roll_invert",
+                if self.roll_invert { "true" } else { "false" },
+            );
         }
     }
 }
@@ -788,17 +849,23 @@ impl GuidanceApp {
                 }
 
                 let nudge_cm = (self.guide.nudge_m * 100.0).round() as i32;
-                let nudge_colour = if nudge_cm == 0 {
+                // Display the nudge from the operator's seat. `nudge_m` is
+                // world-fixed in the A→B frame; the buttons present it
+                // cab-relative (swapping L/R on return passes), so the readout
+                // must match — a net cab-right nudge reads "R" in both travel
+                // directions. cab value = -nudge * travel_sign.
+                let cab_nudge_cm = if is_return { nudge_cm } else { -nudge_cm };
+                let nudge_colour = if cab_nudge_cm == 0 {
                     egui::Color32::GRAY
                 } else {
                     egui::Color32::from_rgb(255, 200, 60)
                 };
-                let nudge_text = if nudge_cm == 0 {
+                let nudge_text = if cab_nudge_cm == 0 {
                     "0".to_string()
-                } else if nudge_cm > 0 {
-                    format!("{}R", nudge_cm)
+                } else if cab_nudge_cm > 0 {
+                    format!("{}R", cab_nudge_cm)
                 } else {
-                    format!("{}L", nudge_cm.abs())
+                    format!("{}L", cab_nudge_cm.abs())
                 };
                 ui.label(
                     egui::RichText::new(nudge_text)
@@ -1171,18 +1238,19 @@ impl GuidanceApp {
         let seg_y = bar_rect.top() + gap;
 
         // Calculate where the three "line" dots should sit.
-        // XTE positive = vehicle is RIGHT of line, so the line is to the LEFT
-        // of the vehicle → dots shift left (negative segment index).
-        // XTE negative = vehicle is LEFT of line → dots shift right.
+        // Sign convention (see steering.rs / ab_line.rs): XTE positive =
+        // vehicle is LEFT of the line, so the line is to the RIGHT → dots
+        // shift right (positive segment index). XTE negative = vehicle RIGHT
+        // of line → line is to the left → dots shift left.
         let xtd_cm = self
             .current_error
             .as_ref()
             .map(|e| (e.distance_m * 100.0) as f64)
             .unwrap_or(0.0);
 
-        // XTE positive = vehicle is RIGHT of line, dots should show line to LEFT.
-        // XTE negative = vehicle is LEFT of line, dots should show line to RIGHT.
         // Dots represent where the line is — chase them to get on track.
+        // Positive XTE (vehicle left of line) → dots to the right; negative
+        // XTE (vehicle right of line) → dots to the left.
         let dot_pos_segs: f64 = if self.current_error.is_some() && self.guide.line.is_some() {
             (xtd_cm / self.lightbar_cm_per_seg).clamp(-SEGS_PER_SIDE as f64, SEGS_PER_SIDE as f64)
         } else {
@@ -1311,11 +1379,13 @@ impl GuidanceApp {
 
                     ui.add_space(6.0);
 
-                    // ── Align grid to here ─────────────────────────────────
-                    // Snaps the pass grid so the current GPS position falls exactly
-                    // on the nearest whole pass line. Nudge is cleared. The saved
-                    // AB line geometry is unchanged — only pass number shifts.
-                    // Use when changing implements or starting from a fence line.
+                    // ── Snap passes to here ────────────────────────────────
+                    // Renumbers the pass grid so the current GPS position falls
+                    // on the nearest whole pass line, and clears any nudge. The
+                    // saved AB line geometry is unchanged — only the pass number
+                    // shifts. Use when changing implements or starting from a
+                    // fence line. (For an exact sub-pass XTE zero, use the
+                    // "⊚ Snap" / align button instead.)
                     let can_align = self.guide.has_complete_line() && self.current_fix.is_some();
                     let align_btn = egui::Button::new(
                         egui::RichText::new("⊚ Snap Passes to Here").size(13.0)
@@ -1323,14 +1393,12 @@ impl GuidanceApp {
                     let align_resp = ui.add_enabled(can_align, align_btn);
                     if align_resp.clicked() {
                         if let Some(fix) = self.current_fix.clone() {
-                            match self.guide.align_grid_to_position(&fix) {
-                                Some(shift_m) => {
+                            match self.guide.snap_to_nearest_pass(&fix) {
+                                Some(new_pass) => {
                                     self.sync_guide_to_steer_thread();
                                     self.persist_nudge_and_pass();
-                                    let shift_cm = (shift_m * 100.0).round() as i32;
-                                    let nudge_cm = (self.guide.nudge_m * 100.0).round() as i32;
                                     self.ab_status_msg = Some((
-                                        format!("Line snapped {}cm (nudge now {}cm)", shift_cm, nudge_cm),
+                                        format!("Snapped to pass {} (nudge cleared)", new_pass),
                                         360,
                                     ));
                                 }
@@ -2093,11 +2161,18 @@ impl GuidanceApp {
                         if fix.roll.abs() > 0.01 || fix.pitch.abs() > 0.01 {
                             ui.add_space(4.0);
                             ui.label(egui::RichText::new("Attitude (DR):").size(12.0).strong());
-                            let roll_dir = if fix.roll > 0.5 { " (R down)" } else if fix.roll < -0.5 { " (L down)" } else { "" };
-                            ui.label(egui::RichText::new(format!("  Roll:  {:+.1}°{}", fix.roll, roll_dir)).size(12.0));
+                            // Effective roll = raw module roll minus the captured
+                            // mounting-bias offset — this is the true vehicle lean.
+                            let eff_roll = fix.roll - self.roll_offset_deg;
+                            let roll_dir = if eff_roll > 0.5 { " (R down)" } else if eff_roll < -0.5 { " (L down)" } else { "" };
+                            ui.label(egui::RichText::new(format!("  Roll:  {:+.1}°{}", eff_roll, roll_dir)).size(12.0));
+                            if self.roll_offset_deg.abs() > 0.05 {
+                                ui.label(egui::RichText::new(format!("   (raw {:+.1}°, bias {:+.1}°)", fix.roll, self.roll_offset_deg)).size(11.0).weak());
+                            }
                             ui.label(egui::RichText::new(format!("  Pitch: {:+.1}°", fix.pitch)).size(12.0));
                             if self.antenna_height_m > 0.0 {
-                                let lateral_cm = (self.antenna_height_m * fix.roll.to_radians().sin() * 100.0).round() as i32;
+                                // Show the correction actually applied to this fix.
+                                let lateral_cm = (fix.roll_corr_m * 100.0).round() as i32;
                                 let correction_colour = if lateral_cm.abs() > 20 {
                                     egui::Color32::from_rgb(255, 200, 60)
                                 } else {
@@ -2470,10 +2545,87 @@ impl GuidanceApp {
                         "Antenna height above axle. Measure from\nground to GPS antenna on the roof."
                     ).size(11.0).weak());
 
+                    ui.add_space(8.0);
+
+                    // ── Level calibration (mounting-bias zero) ───────────────
+                    // Park the tractor on flat, level ground and capture the
+                    // resting roll as the zero reference. This cancels a GPS
+                    // module that isn't bolted perfectly level — the single
+                    // biggest install-to-install difference. Stored per machine.
+                    ui.label(egui::RichText::new("Level calibration:").size(12.0).strong());
+                    let offset_colour = if self.roll_offset_deg.abs() < 0.05 {
+                        egui::Color32::GRAY
+                    } else {
+                        egui::Color32::from_rgb(255, 200, 60)
+                    };
+                    ui.label(egui::RichText::new(format!("Mounting bias: {:+.2}°", self.roll_offset_deg))
+                        .size(14.0).color(offset_colour));
+
+                    ui.horizontal(|ui| {
+                        let has_attitude = self
+                            .current_fix
+                            .as_ref()
+                            .map_or(false, |f| f.roll.abs() > 0.001 || f.pitch.abs() > 0.001);
+                        let capture_btn = egui::Button::new(
+                            egui::RichText::new("◎ Capture Level").size(13.0)
+                        ).min_size(egui::vec2(130.0, 30.0));
+                        if ui.add_enabled(has_attitude, capture_btn).clicked() {
+                            if let Some(fix) = &self.current_fix {
+                                // Capture the raw module roll as the bias zero.
+                                self.roll_offset_deg = fix.roll;
+                                self.apply_roll_offset();
+                                self.was_cal_msg = Some((
+                                    format!("Level captured: bias {:+.2}°", self.roll_offset_deg),
+                                    240,
+                                ));
+                            }
+                        }
+                        if self.roll_offset_deg.abs() > 0.001 {
+                            if ui.add(egui::Button::new(
+                                egui::RichText::new("Clear").size(13.0)
+                            ).min_size(egui::vec2(60.0, 30.0))).clicked() {
+                                self.roll_offset_deg = 0.0;
+                                self.apply_roll_offset();
+                            }
+                        }
+                    });
+                    ui.label(egui::RichText::new(
+                        "Park on flat, level ground, then capture.\nCancels a tilted antenna mount."
+                    ).size(11.0).weak());
+
+                    ui.add_space(6.0);
+
+                    // ── Roll direction (sign) ─────────────────────────────
+                    // The default assumes positive roll = right-side-down with
+                    // the antenna swinging right (corrected leftward). If a
+                    // given install reports the opposite sign, flip this.
+                    // Verify on a known cross-slope: the live correction below
+                    // should move XTE toward zero, not away.
+                    ui.label(egui::RichText::new("Roll direction:").size(12.0).strong());
+                    let dir_label = if self.roll_invert { "Inverted" } else { "Normal" };
+                    let dir_colour = if self.roll_invert {
+                        egui::Color32::from_rgb(255, 200, 60)
+                    } else {
+                        egui::Color32::from_rgb(100, 200, 255)
+                    };
+                    if ui.add(egui::Button::new(
+                        egui::RichText::new(format!("Direction: {}", dir_label)).size(13.0).color(dir_colour)
+                    ).min_size(egui::vec2(160.0, 30.0))).clicked() {
+                        self.roll_invert = !self.roll_invert;
+                        self.apply_roll_invert();
+                    }
+                    ui.label(egui::RichText::new(
+                        "Flip if the correction pushes the wrong way\non a slope. Verify with the live readout."
+                    ).size(11.0).weak());
+
                     // Show live roll correction when active
                     if self.antenna_height_m > 0.0 {
                         if let Some(fix) = &self.current_fix {
-                            let lateral_cm = (self.antenna_height_m * fix.roll.to_radians().sin() * 100.0).round() as i32;
+                            // Use the actually-applied correction from the fix
+                            // (reflects offset + invert), and show the effective
+                            // roll that produced it.
+                            let eff_roll = fix.roll - self.roll_offset_deg;
+                            let lateral_cm = (fix.roll_corr_m * 100.0).round() as i32;
                             let roll_colour = if lateral_cm.abs() > 20 {
                                 egui::Color32::from_rgb(255, 200, 60)
                             } else {
@@ -2481,7 +2633,7 @@ impl GuidanceApp {
                             };
                             ui.add_space(4.0);
                             ui.label(egui::RichText::new(
-                                format!("Live: roll {:+.1}° → {} cm correction", fix.roll, lateral_cm)
+                                format!("Live: roll {:+.1}° → {} cm correction", eff_roll, lateral_cm)
                             ).size(12.0).color(roll_colour));
                         }
                     }

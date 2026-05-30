@@ -64,12 +64,21 @@ fn main() {
     // for now start at 0.0 (disabled) and let the app update it.
     let antenna_height = gps::reader::new_shared_antenna_height(0.0);
 
+    // Shared roll calibration — GPS reader uses these for roll correction.
+    // roll_offset is the mounting-bias zero captured at install; roll_invert
+    // flips the correction direction. Both loaded from SQLite in the app
+    // constructor; start at neutral (0° offset, not inverted) here.
+    let roll_offset = gps::reader::new_shared_roll_offset(0.0);
+    let roll_invert = gps::reader::new_shared_roll_invert(false);
+
     // Start GPS serial reader thread
     // Decision #026: reads directly from LC29H BA (no sensor ESP32)
     // Sends fixes to BOTH the GUI and steer thread channels.
     let drop_counters_gps = drop_counters.clone();
     let heading_offset_gps = heading_offset.clone();
     let antenna_height_gps = antenna_height.clone();
+    let roll_offset_gps = roll_offset.clone();
+    let roll_invert_gps = roll_invert.clone();
     thread::spawn(move || {
         gps::reader::run_gps_reader(
             gps::reader::GpsConfig::default(),
@@ -79,6 +88,8 @@ fn main() {
             drop_counters_gps,
             heading_offset_gps,
             antenna_height_gps,
+            roll_offset_gps,
+            roll_invert_gps,
         );
     });
     tracing::info!("GPS serial reader thread launched");
@@ -140,6 +151,8 @@ fn main() {
                 12.0,
                 heading_offset,
                 antenna_height,
+                roll_offset,
+                roll_invert,
             )))
         }),
     );

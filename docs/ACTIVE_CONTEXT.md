@@ -5,12 +5,123 @@
 > Updated at the end of each working session.
 
 ## Last updated
-Session 29 — 1 May 2026 (Hot fix during seeding: PAIR050 ack-loop
-deadlock in `gps/reader.rs`; auto-steer observed working in real seeding)
+Session 30 — 30 May 2026 (AB-line sign-convention consolidation +
+manual roll calibration; Decision #029)
 
 ## What we're working on
 **Seeding is underway.** Development changes must be stable and not break
 what's working.
+
+**Session 30 — AB-line sign cleanup + manual roll calibration (30 May 2026):**
+
+Two pieces of work this session, both aimed at the gap between "functioning"
+and "working well" while seeding continues. All changes are additive or
+behaviour-preserving on the drive path; the only intentional behaviour change
+is the return-pass Snap fix (a bug fix).
+
+### Part 1 — AB-line sign-convention consolidation (`guidance/ab_line.rs`)
+
+The AB-line code re-derived the forward/return direction flip in several
+places, which made every sign-related change risky. Consolidated to two
+primitives that are now the single source of truth:
+- `signed_line_offset(fix)` — direction-independent signed offset from the
+  current target track (pass + nudge), in the fixed A→B frame. Zero = on track.
+- `travel_sign(fix)` — +1.0 forward (A→B), -1.0 return (B→A).
+
+`calculate_error` now returns `travel_sign × signed_line_offset` — **bit-for-bit
+identical output to before**, just factored through the primitives, so the
+drive path (steering, lightbar, telemetry) is unchanged.
+
+**Bug fixed:** `align_grid_to_position` (the "⊚ Snap" button) used the
+sign-flipped effective XTE on return passes, which *doubled* the error instead
+of zeroing it — broken on roughly half of all passes. It now absorbs
+`signed_line_offset` into the nudge with no heading logic, so it zeroes the
+displayed XTE on both forward and return passes. This is the one intentional
+drive-path behaviour change this session.
+
+**Also:**
+- New `snap_to_nearest_pass(fix)` — renumbers to the nearest whole pass and
+  clears nudge (coarse, pass-level). The Setup-page "⊚ Snap Passes to Here"
+  button was *documented* as doing this but was actually wired to
+  `align_grid_to_position`; it now calls `snap_to_nearest_pass`. The two Snap
+  operations are now genuinely distinct (exact sub-pass nudge vs coarse
+  renumber).
+- Nudge readout on the working page was inverted relative to the buttons
+  (pressing ► showed "L"). Readout now derives a cab-relative value so it
+  agrees with the cab-relative buttons.
+- `set_point_a` now zeroes nudge (was inconsistent with `load_ab_line`).
+- Minimum-line-length / sign-comment fixes: the "positive = right" comments in
+  `coords.rs` and `types.rs` were inverted — the code produces **positive =
+  LEFT**, matching `steering.rs`. Comments corrected; code unchanged. A lying
+  comment at the primitive layer is a real hazard in a sign-sensitive codebase.
+- 18 unit tests in `ab_line.rs` (was 0), including the return-pass align case
+  and the direction-independence invariants that the consolidation rests on.
+
+### Part 2 — Manual roll calibration (Decision #029)
+
+Roll compensation (#028) assumed the module reads 0° level and that the roll
+sign was known. Neither is true across installs. Added a manual calibration so
+each tractor captures its own mounting bias and sign:
+- **`roll_offset_deg`** (config key `roll_offset_deg`): mounting-bias zero.
+  Parser uses `effective_roll = smoothed_roll - roll_offset_deg`. Captured via
+  a **◎ Capture Level** button (park level, press) in the Setup-page ROLL
+  CORRECTION section.
+- **`roll_invert`** (config key `roll_invert`): Normal/Inverted toggle that
+  flips the correction sign. Verify on a slope.
+- **`roll_corr_m`** (new `GpsFix` field + telemetry `IterRecord` field): the
+  signed lateral correction actually applied to each fix (positive = shifted
+  left of travel). Now visible in `.jsonl` logs and the GUI instead of being
+  silently baked into lat/lon.
+
+With offset 0 and invert false the math reduces exactly to the prior #028
+correction — safe to ship before any capture. Two new shared atomics
+(`SharedRollOffset` = `Arc<AtomicI32>` centidegrees, `SharedRollInvert` =
+`Arc<AtomicBool>`) follow the existing heading-offset/antenna-height pattern.
+5 new parser tests cover the offset/invert/threshold arithmetic.
+
+**Field procedure (do once per tractor):**
+1. Park on flat, level ground → ROLL CORRECTION → confirm live roll is stable
+   → **Capture Level**. Effective roll should drop to ~0°.
+2. On a known cross-slope, watch the live correction and XTE. If the correction
+   pushes XTE *away* from zero, press **Direction: Inverted** once. `roll_corr_m`
+   in the logs confirms the sign afterward. Resolves the sign question for that
+   machine permanently.
+
+### Files changed this session
+- `common/src/types.rs` — `roll_corr_m` on `GpsFix`; corrected `distance_m`
+  sign comment on `CrossTrackError`
+- `common/src/coords.rs` — corrected `cross_track_distance_local` sign
+  doc/comment (positive = LEFT), renamed a test
+- `pc/src/guidance/ab_line.rs` — primitives, align fix, `snap_to_nearest_pass`,
+  `set_point_a` nudge reset, 18 tests
+- `pc/src/gps/parser.rs` — `roll_offset_deg` + `roll_invert`, effective-roll
+  correction, `roll_corr_m`, 5 tests
+- `pc/src/gps/reader.rs` — `SharedRollOffset` / `SharedRollInvert` + polling
+- `pc/src/main.rs` — create + thread the two roll atomics
+- `pc/src/telemetry/logger.rs` — `roll_corr_m` in `IterRecord`
+- `pc/src/guidance/steer_thread.rs` — populate `roll_corr_m`; removed dead
+  `current_implement_w` / `current_overlap` captures
+- `pc/src/gui/app.rs` — Snap-button rewire, nudge-readout fix, lightbar
+  comment fix, roll-calibration controls (Capture Level + Direction toggle),
+  persistence, effective-roll/applied-correction readouts
+
+### Build + test status
+- `cargo build` clean (no errors). 24 warnings, all pre-existing dead-code
+  except none from this work; the 4 `steer_thread.rs` unused-variable warnings
+  were fixed. `travel_sign` shows an unused warning by design (public primitive
+  for the future GUI consolidation).
+- `cargo test -p finn-guidance-pc`: all green except the known pre-existing
+  `was_centre_learner::tests::learns_drift_over_time` failure (unrelated,
+  not touched this session).
+
+### Pending from this session
+- [ ] Field: do the Capture Level + slope sign-check on the tractor; confirm
+      `roll_corr_m` moves XTE toward zero on a cross-slope.
+- [ ] Optional later cleanup: route the GUI nudge buttons/label through
+      `travel_sign()` so the primitive is actually consumed (clears its
+      unused-code warning and removes the last inline `is_return` flip).
+
+---
 
 **Session 29 — Hot fix during seeding (1 May 2026):**
 
@@ -136,12 +247,13 @@ with drop-on-full) holds up well in active use. Specifically:
 
 ### Pending
 - [ ] Tidy the misleading "may still be applied" log line (TODO above)
-- [ ] Mark FT8 Finding 5 as resolved ("by-design hardware behaviour,
-      not a bug") in this file
+- [x] Mark FT8 Finding 5 as resolved ("by-design hardware behaviour,
+      not a bug") — resolved; captured in Decision #030
 - [ ] Consider whether to remove the PAIR050 send entirely on LC29H BA
       NR11 — it's a no-op that costs ~700ms of startup time
-- [ ] Decision #028 write-up: "GPS reader rate-set ack-wait deadlock
-      due to NMEA flood" (companion to #027 channel discipline)
+- [x] Decision write-up for the ack-wait deadlock — done as **#030**
+      (Session 30). NOTE: originally slated as "#028" here, but #028 was
+      already taken by the DR-remediation entry, so it became #030.
 
 ---
 
@@ -352,10 +464,10 @@ Run 2 (4.5 km/h): max XTE 1.32m, frequent saturation
 The controller works reasonably at walking pace but degrades at field
 speed. Raising max_steer_angle is the primary fix.
 
-### Phase D.5 — Write up Decision #027 (READY TO WRITE)
+### Phase D.5 — Write up Decision #027 (DONE — Session 30)
 Field test 8 verified the fix — zero drops, no backpressure freezes.
-- [ ] Document the root cause, the fix, and the trade-off (drop vs block)
-      in DECISIONS.md as #027
+- [x] Document the root cause, the fix, and the trade-off (drop vs block)
+      in DECISIONS.md as #027 — done Session 30
 - [ ] Update STEERING_TUNING_GUIDE.md to mention drop-warn log interpretation
 - [ ] Document telemetry log format and analysis workflow
 
@@ -473,16 +585,22 @@ behaviour:
 
 ## Key decisions (see DECISIONS.md for full detail)
 - #001–#025: See DECISIONS.md
-- **#026: Hardware simplification — LC29H BA direct-connect + inner loop on
-  ESP32.** Implemented and field-validated in test 7.
-- **#027 (pending write-up)**: Drop-on-full channel sends in both serial
-  reader threads to prevent cascading stalls. Fix applied in Session 22;
-  write-up follows field verification.
-- **#028 (pending write-up, Session 29)**: Bounded wall-clock deadline on
-  GPS module config ack-wait loops. Per-read timeouts are insufficient
-  when the device streams continuous data — the loop never sees a
-  timeout, so its fallback never fires. Always pair `port.read()` ack-
-  loops with an `Instant`-based deadline.
+- **#026: Hardware simplification** — LC29H BA direct-connect + inner loop on
+  ESP32. Implemented and field-validated in test 7.
+- **#027: Drop-on-full channel sends** in both serial reader threads to prevent
+  cascading stalls (slow GUI consumer starving the steer thread through the
+  shared reader thread). Verified zero drops in FT8 + FT9. Written up.
+- **#028: LC29H BA DR remediation** — PQTMINS/PQTMIMU enabled with corrected
+  NR11 two-wheel field parsing; roll/pitch/heading sourced from PQTMINS,
+  position still from GGA. Written up.
+- **#029: Manual roll calibration** — per-machine mounting-bias capture
+  (`roll_offset_deg`, "Capture Level"), direction invert (`roll_invert`), and
+  applied-correction telemetry (`roll_corr_m`). Effective roll = smoothed roll
+  − captured bias. No-op until calibrated. Written up.
+- **#030: Bound GPS config ack-wait loops with a wall-clock deadline** — a
+  per-read timeout never fires against a continuously-streaming device, so the
+  config loop hung and starved the GPS thread. Also documents the NR11 1 Hz
+  GGA cap as by-design (resolves FT8 Finding 5). Written up.
 
 ## Hardware inventory (as of 24 April 2026)
 
@@ -533,14 +651,16 @@ planned integration path:
    parseable by worker nodes without regex.
 
 ## Next session should
-1. Read this file and DECISIONS.md #026
-2. **Session 29 follow-ups (low-effort, do these first):**
-   - Tidy the "may still be applied" log line in `gps/reader.rs` to
-     name the LC29H BA NR11 1Hz cap explicitly
-   - Write up Decision #028 (PAIR050 ack-wait deadlock)
+1. Read this file and the recent decisions in DECISIONS.md (#026–#030 are
+   the live architecture; #029 roll calibration and the #029 AB-line sign
+   convention are the newest).
+2. **Field validation owed from Session 30 (do when next in the cab):**
+   - Roll calibration: park level → Capture Level; then on a cross-slope
+     confirm the live correction / `roll_corr_m` moves XTE toward zero
+     (flip Direction if not). See Decision #029.
    - Consider turning telemetry back on by default
      (`telemetry_enabled = true`) so future field-data analysis is
-     possible without requiring a manual toggle
+     possible without requiring a manual toggle.
 3. **Hardware input: Momentary switch for auto-steer engage/disengage**
    (hardware-dependent, plan when components available)
    - Wire a momentary pushbutton to an ESP32 GPIO input (with pull-up)
@@ -567,11 +687,19 @@ planned integration path:
 6. **Add startup config push** — when motor port connects, send all
    stored config (WAS, PID, WASF, INVERT) to ESP32 to guarantee sync.
    Still worth doing even though the FT9 runaway is resolved.
-7. Write up Decision #027 in DECISIONS.md — fix is verified (FT8+FT9)
+7. **Small code TODO carried from Session 29:** tidy the misleading
+   "No ack for 10Hz (may still be applied)" log line in `gps/reader.rs`
+   to name the NR11 1Hz cap explicitly (see Decision #030). Optionally
+   drop the no-op `$PAIR050` send entirely (~700ms startup saving).
 8. Phase D.3 (Windows USB-serial power hardening) — still worth doing
-9. Investigate LC29H BA actual fix output rate (FT8 finding 5)
-   — **RESOLVED Session 29**: 1Hz GGA is hardware behaviour, not a bug.
-   Position is GGA-rate; PQTMINS provides 10Hz attitude/velocity.
+9. Optional: route the GUI nudge buttons/label through `ab_line.rs`'s
+   `travel_sign()` primitive so it's actually consumed (removes the last
+   inline `is_return` flip and clears its unused-code warning).
+
+**Write-ups now COMPLETE (were pending across Sessions 22–29):** Decision
+#027 (drop-on-full channels), #028 (DR remediation), #030 (ack-wait
+deadlock). FT8 Finding 5 resolved as by-design. The decision log is now
+gap-free #001–#030.
 
 **IMPORTANT CORRECTION for future sessions**: The field test 8 finding
 that recommended increasing max_steer_angle to 12-15° was wrong.
@@ -605,17 +733,19 @@ common/src/coords.rs           — haversine, bearing, cross-track distance
 common/src/protocol.rs         — FinnMessage, nmea_checksum, format_*
 firmware-motor-pio/            — ESP32 motor controller (Arduino/PlatformIO)
 docs/IMPLEMENTATION_PLAN.md    — full phase plan, task tracking
-docs/DECISIONS.md              — decision log (#001–#026; #027 pending)
+docs/DECISIONS.md              — decision log (#001–#030, complete)
 docs/INSTALLATION_GUIDE.md     — hardware wiring, PC setup, ESP32 flashing
 docs/STEERING_TUNING_GUIDE.md  — auto-steer setup (needs update post-#026)
 docs/ACTIVE_CONTEXT.md         — this file
 ```
 
 ## Important conventions
-- Use `codesnip:edit_snippet` for code changes where possible; if it
-  misbehaves, fall back to `filesystem:write_file` with a full re-write
-  (keep changes surgical).
-- GPS receiver is Quectel LC29H BA on ArduSimple board (10Hz, DR fusion)
+- Code edits are made via the Filesystem MCP (`edit_file` for surgical
+  changes, `write_file` for full rewrites). Keep changes surgical and
+  prefer `edit_file` with exact-match `oldText`. (Earlier docs referenced
+  `codesnip:edit_snippet`; that tool is no longer the path.)
+- GPS receiver is Quectel LC29H BA on ArduSimple board (1Hz GGA position,
+  10Hz PQTMINS attitude/velocity/heading — see #030)
 - GUI framework is egui 0.29 (eframe), rendering via Painter API
 - All coordinate math in `common/src/coords.rs`, types in
   `common/src/types.rs`
@@ -625,9 +755,14 @@ docs/ACTIVE_CONTEXT.md         — this file
 - Last-loaded AB line auto-restored on startup via `last_ab_line_id`
 - ESP32 firmware uses Arduino/PlatformIO (C++), built with
   `pio run --target upload`
-- Auto-steer sign convention: positive XTE = right of line → negative
-  desired angle (steer left). Positive heading error = pointed right of
-  line bearing.
+- **Sign convention (corrected Session 30 — see `ab_line.rs` module docs):**
+  `cross_track_distance_local` and `CrossTrackError::distance_m` are
+  **positive = vehicle LEFT of line, negative = RIGHT**, matching
+  `steering.rs`. (Older comments in `coords.rs`/`types.rs` said "positive =
+  right" — those were wrong and have been corrected; the code was always
+  positive = left.) The controller consumes `distance_m` as
+  `travel_sign × signed_line_offset`; positive heading error = pointed right
+  of the line bearing.
 - **Pure pursuit lookahead** = `lookahead_base + lookahead_speed_factor ×
   speed`, clamped to [2, 15] m. Exposed as inverted 1–10 sliders.
 - **Inner loop runs on motor ESP32** at 50-100Hz. PC sends desired angle

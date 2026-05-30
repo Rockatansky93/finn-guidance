@@ -59,6 +59,12 @@ pub struct IterRecord {
     /// EMA-smoothed roll in degrees (positive = right side down).
     /// Useful for diagnosing roll correction effectiveness.
     pub roll: f64,
+    /// Lateral roll correction applied to position this fix, in metres.
+    /// Signed: positive = shifted left of travel. The actually-applied value
+    /// (after roll-offset calibration + invert), so a wrong sign or bad
+    /// mounting offset shows up directly in the log instead of as unexplained
+    /// XTE drift on slopes.
+    pub roll_corr_m: f64,
 
     // ── Guidance ──
     pub pass: i32,

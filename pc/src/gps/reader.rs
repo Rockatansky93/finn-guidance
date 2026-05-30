@@ -31,7 +31,7 @@ use crossbeam_channel::Sender;
 use serialport::{self, SerialPortType};
 use std::io::BufReader;
 use std::io::{BufRead, Read, Write};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing;
@@ -73,6 +73,15 @@ pub type SharedHeadingOffset = Arc<AtomicI32>;
 /// Range: 0–10m = 0–1000.
 pub type SharedAntennaHeight = Arc<AtomicI32>;
 
+/// Shared atomic for the roll mounting-bias offset so the GUI can capture
+/// and adjust it at runtime. Stored as offset_deg × 100 (centidegrees) to
+/// fit in an AtomicI32. Range: ±45° = ±4500.
+pub type SharedRollOffset = Arc<AtomicI32>;
+
+/// Shared flag for inverting the roll-correction direction, settable from
+/// the GUI for installs whose module reports roll with the opposite sign.
+pub type SharedRollInvert = Arc<AtomicBool>;
+
 /// Create a new shared heading offset, initialised to the given value.
 pub fn new_shared_heading_offset(initial_deg: f64) -> SharedHeadingOffset {
     Arc::new(AtomicI32::new((initial_deg * 100.0).round() as i32))
@@ -81,6 +90,16 @@ pub fn new_shared_heading_offset(initial_deg: f64) -> SharedHeadingOffset {
 /// Create a new shared antenna height, initialised to the given value.
 pub fn new_shared_antenna_height(initial_m: f64) -> SharedAntennaHeight {
     Arc::new(AtomicI32::new((initial_m * 100.0).round() as i32))
+}
+
+/// Create a new shared roll offset (centidegrees), initialised to the given value.
+pub fn new_shared_roll_offset(initial_deg: f64) -> SharedRollOffset {
+    Arc::new(AtomicI32::new((initial_deg * 100.0).round() as i32))
+}
+
+/// Create a new shared roll-invert flag, initialised to the given value.
+pub fn new_shared_roll_invert(initial: bool) -> SharedRollInvert {
+    Arc::new(AtomicBool::new(initial))
 }
 
 /// Scan all available serial ports and return the first one that produces
@@ -438,6 +457,8 @@ pub fn run_gps_reader(
     drop_counters: SharedDropCounters,
     heading_offset: SharedHeadingOffset,
     antenna_height: SharedAntennaHeight,
+    roll_offset: SharedRollOffset,
+    roll_invert: SharedRollInvert,
 ) {
     // === Step 1: Resolve port name ===
     let port_name = if config.port_name == "auto" {
@@ -517,6 +538,12 @@ pub fn run_gps_reader(
                 // Poll the shared antenna height for roll correction.
                 nmea_parser.antenna_height_m =
                     antenna_height.load(Ordering::Relaxed) as f64 / 100.0;
+
+                // Poll the shared roll calibration (mounting-bias offset +
+                // invert flag) for roll correction.
+                nmea_parser.roll_offset_deg =
+                    roll_offset.load(Ordering::Relaxed) as f64 / 100.0;
+                nmea_parser.roll_invert = roll_invert.load(Ordering::Relaxed);
 
                 // Parse NMEA GPS sentences only — no FINN sentences on this port
                 if let Some(fix) = nmea_parser.parse_sentence(&sentence) {

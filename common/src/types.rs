@@ -32,6 +32,15 @@ pub struct GpsFix {
     #[serde(default = "f64_zero")]
     pub pitch: f64,
 
+    /// Lateral roll correction actually applied to this fix's position, in
+    /// metres. Signed: positive = position was shifted to the LEFT of travel
+    /// (bearing heading−90°), which is the correction for a right-side-down
+    /// lean. Zero when roll correction is disabled or below threshold.
+    /// This is the ground-truth applied value (after roll-offset calibration
+    /// and invert), not a recomputation — use it for diagnostics/telemetry.
+    #[serde(default = "f64_zero")]
+    pub roll_corr_m: f64,
+
     // === Diagnostic heading sources (for GUI comparison display) ===
     /// Raw VTG course-over-ground before offset (NaN if unavailable)
     #[serde(default = "f64_nan")]
@@ -122,7 +131,9 @@ pub enum GuidanceLine {
 /// Cross-track error: how far off the guidance line we are
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrossTrackError {
-    pub distance_m: f64,    // Metres from line (negative = left, positive = right)
+    pub distance_m: f64,    // Metres from line in the vehicle's travel frame
+                            // (positive = vehicle LEFT of line, negative = right;
+                            // see steering.rs / ab_line.rs sign convention)
     pub heading_error: f64, // Degrees difference from desired heading
     pub is_return_pass: bool, // True when travelling B→A (opposite to line direction)
 }

@@ -58,6 +58,16 @@ pub struct NmeaState {
     /// Antenna height above ground in metres. Used to compute the lateral
     /// offset from roll: offset = antenna_height * sin(roll). Set via GUI.
     pub antenna_height_m: f64,
+    /// Roll mounting-bias offset in degrees, subtracted from the smoothed
+    /// roll before the correction is computed. Captured at install time by
+    /// parking the tractor level and recording the resting roll — this
+    /// cancels out a GPS module that isn't bolted perfectly level. Set via GUI.
+    pub roll_offset_deg: f64,
+    /// Invert the roll-correction direction. The default assumes positive
+    /// roll = right-side-down with the antenna swinging right (corrected
+    /// leftward). If a given install's module orientation reports the
+    /// opposite sign, set this true to flip the correction. Set via GUI.
+    pub roll_invert: bool,
 
     // === Diagnostic heading sources (for GUI comparison display) ===
     /// Last raw VTG heading before offset applied (NaN if no VTG received)
@@ -81,6 +91,8 @@ impl NmeaState {
             has_ins_attitude: false,
             roll_ema_alpha: 0.15,
             antenna_height_m: 0.0,
+            roll_offset_deg: 0.0,
+            roll_invert: false,
             last_vtg_heading: f64::NAN,
             last_ins_heading: f64::NAN,
         }
@@ -260,23 +272,40 @@ impl NmeaState {
         // laterally by `antenna_height * sin(roll)`. We subtract this
         // offset to get the position at ground/axle level.
         //
-        // Convention: positive roll = right side down. When right side is
-        // down, the antenna moves RIGHT relative to the ground contact
-        // point. We correct by shifting the position LEFT (perpendicular
-        // counter-clockwise from heading), i.e. bearing = heading - 90°.
-        let (corrected_lat, corrected_lon) = if self.has_ins_attitude
+        // `effective_roll` removes the mounting-bias offset captured at
+        // install (roll_offset_deg), so a module bolted on at a slight
+        // angle doesn't inject a constant lateral error on level ground.
+        //
+        // Convention: positive effective roll = right side down. When the
+        // right side is down, the antenna moves RIGHT relative to the ground
+        // contact point, so we correct by shifting the position LEFT
+        // (perpendicular, bearing = heading - 90°). `roll_invert` flips this
+        // for installs whose module reports roll with the opposite sign.
+        //
+        // The signed lateral correction is stored on the fix as `roll_corr_m`
+        // (positive = shifted left of travel) so the applied value is visible
+        // in telemetry and the GUI rather than being silently baked in.
+        let effective_roll = self.smoothed_roll - self.roll_offset_deg;
+        let (corrected_lat, corrected_lon, roll_corr_m) = if self.has_ins_attitude
             && self.antenna_height_m > 0.0
-            && self.smoothed_roll.abs() > 0.1
-        // Skip tiny roll (< 0.1°)
+            && effective_roll.abs() > 0.1
+        // Skip tiny effective roll (< 0.1°)
         {
-            let lateral_offset_m = self.antenna_height_m * self.smoothed_roll.to_radians().sin();
+            let mut lateral_offset_m =
+                self.antenna_height_m * effective_roll.to_radians().sin();
+            if self.roll_invert {
+                lateral_offset_m = -lateral_offset_m;
+            }
             // Shift perpendicular to heading: heading - 90° = leftward.
-            // lateral_offset_m is positive when roll is positive (right down),
-            // meaning the antenna moved right, so we correct leftward.
+            // A positive lateral_offset_m (right-side-down lean, antenna moved
+            // right) is corrected leftward; a negative one shifts right
+            // (apply_offset handles negative distance as a reversed bearing).
             let correction_bearing = normalise_heading(corrected_heading - 90.0);
-            apply_offset(lat, lon, correction_bearing, lateral_offset_m)
+            let (clat, clon) =
+                apply_offset(lat, lon, correction_bearing, lateral_offset_m);
+            (clat, clon, lateral_offset_m)
         } else {
-            (lat, lon)
+            (lat, lon, 0.0)
         };
 
         let fix = GpsFix {
@@ -291,6 +320,7 @@ impl NmeaState {
             timestamp_ms: now_ms,
             roll: self.smoothed_roll,
             pitch: self.last_pitch,
+            roll_corr_m,
             diag_vtg_heading: self.last_vtg_heading,
             diag_ins_heading: self.last_ins_heading,
         };
@@ -374,5 +404,97 @@ mod tests {
         assert!(state.last_ins_heading.is_nan());
         assert!(!state.heading_from_ins);
         assert!(state.has_ins_attitude);
+    }
+
+    // ── Roll-correction calibration ────────────────────────────────────
+    // The lateral correction is `antenna_height * sin(effective_roll)`,
+    // negated when `roll_invert` is set, where
+    // `effective_roll = smoothed_roll - roll_offset_deg`. These tests pin
+    // that arithmetic and the offset/invert behaviour. The fix-emission
+    // wiring (storing the value in `roll_corr_m`) is exercised separately.
+
+    /// Mirror of the correction magnitude computed in `try_build_fix`.
+    fn roll_corr(state: &NmeaState) -> f64 {
+        let effective_roll = state.smoothed_roll - state.roll_offset_deg;
+        if !state.has_ins_attitude
+            || state.antenna_height_m <= 0.0
+            || effective_roll.abs() <= 0.1
+        {
+            return 0.0;
+        }
+        let mut lateral = state.antenna_height_m * effective_roll.to_radians().sin();
+        if state.roll_invert {
+            lateral = -lateral;
+        }
+        lateral
+    }
+
+    #[test]
+    fn roll_correction_basic_magnitude() {
+        let mut state = NmeaState::new();
+        state.antenna_height_m = 3.0;
+        state.parse_pqtmins(
+            "$PQTMINS,1,1,0,0,0,0,0,0,10.00,0.00,0.00*00",
+        );
+        // 3.0 * sin(10°) ≈ 0.5209 m, positive (right-side-down → shift left)
+        assert!((roll_corr(&state) - 0.5209).abs() < 0.001, "got {}", roll_corr(&state));
+    }
+
+    #[test]
+    fn roll_offset_cancels_mounting_bias() {
+        // Module bolted on at 2° tilt. On "level" ground it reads 2°.
+        // With roll_offset_deg = 2.0, the effective roll is ~0 → no correction.
+        let mut state = NmeaState::new();
+        state.antenna_height_m = 3.0;
+        state.roll_offset_deg = 2.0;
+        state.parse_pqtmins(
+            "$PQTMINS,1,1,0,0,0,0,0,0,2.00,0.00,0.00*00",
+        );
+        assert!(roll_corr(&state).abs() < 1e-9, "bias not cancelled: {}", roll_corr(&state));
+
+        // A real 5° lean on top of the 2° bias → effective 3° of correction.
+        state.parse_pqtmins(
+            "$PQTMINS,1,1,0,0,0,0,0,0,5.00,0.00,0.00*00",
+        );
+        // Note: smoothed_roll is EMA'd, so seed a fresh state for an exact check.
+        let mut fresh = NmeaState::new();
+        fresh.antenna_height_m = 3.0;
+        fresh.roll_offset_deg = 2.0;
+        fresh.parse_pqtmins("$PQTMINS,1,1,0,0,0,0,0,0,5.00,0.00,0.00*00");
+        let expected = 3.0 * (3.0_f64).to_radians().sin();
+        assert!((roll_corr(&fresh) - expected).abs() < 0.001, "got {}", roll_corr(&fresh));
+    }
+
+    #[test]
+    fn roll_invert_flips_sign() {
+        let mut normal = NmeaState::new();
+        normal.antenna_height_m = 3.0;
+        normal.parse_pqtmins("$PQTMINS,1,1,0,0,0,0,0,0,8.00,0.00,0.00*00");
+
+        let mut inverted = NmeaState::new();
+        inverted.antenna_height_m = 3.0;
+        inverted.roll_invert = true;
+        inverted.parse_pqtmins("$PQTMINS,1,1,0,0,0,0,0,0,8.00,0.00,0.00*00");
+
+        assert!((roll_corr(&normal) + roll_corr(&inverted)).abs() < 1e-9,
+            "invert should negate: {} vs {}", roll_corr(&normal), roll_corr(&inverted));
+        assert!(roll_corr(&normal) > 0.0);
+    }
+
+    #[test]
+    fn roll_correction_disabled_when_height_zero() {
+        let mut state = NmeaState::new();
+        state.antenna_height_m = 0.0; // disabled
+        state.parse_pqtmins("$PQTMINS,1,1,0,0,0,0,0,0,15.00,0.00,0.00*00");
+        assert_eq!(roll_corr(&state), 0.0);
+    }
+
+    #[test]
+    fn roll_correction_skips_tiny_effective_roll() {
+        let mut state = NmeaState::new();
+        state.antenna_height_m = 3.0;
+        // 0.05° is below the 0.1° threshold → no correction.
+        state.parse_pqtmins("$PQTMINS,1,1,0,0,0,0,0,0,0.05,0.00,0.00*00");
+        assert_eq!(roll_corr(&state), 0.0);
     }
 }
