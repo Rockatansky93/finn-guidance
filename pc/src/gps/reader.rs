@@ -396,7 +396,10 @@ fn ensure_module_config(port: &mut Box<dyn serialport::SerialPort>, fix_rate_hz:
                 }
             }
         } else {
-            tracing::info!("  No ack for {}Hz (may still be applied)", rate);
+            tracing::info!(
+                "  No PAIR050 ack for {}Hz; LC29H BA NR11 keeps GGA at 1Hz while PQTMINS provides 10Hz attitude/velocity",
+                rate
+            );
             rate_set = true;
             break;
         }
@@ -541,8 +544,7 @@ pub fn run_gps_reader(
 
                 // Poll the shared roll calibration (mounting-bias offset +
                 // invert flag) for roll correction.
-                nmea_parser.roll_offset_deg =
-                    roll_offset.load(Ordering::Relaxed) as f64 / 100.0;
+                nmea_parser.roll_offset_deg = roll_offset.load(Ordering::Relaxed) as f64 / 100.0;
                 nmea_parser.roll_invert = roll_invert.load(Ordering::Relaxed);
 
                 // Parse NMEA GPS sentences only — no FINN sentences on this port

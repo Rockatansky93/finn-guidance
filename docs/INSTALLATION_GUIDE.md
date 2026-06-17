@@ -1,468 +1,187 @@
-# FINN Guidance — Installation Guide
+# FINN Guidance - Installation Guide
 
-This guide covers everything needed to go from bare hardware to a working FINN
-Guidance system: wiring the ESP32 modules, installing the PC software, flashing
-the firmware, and verifying that everything is talking.
+Reviewed: 30 May 2026
 
----
+This guide describes the maintained tractor installation: LC29H BA connected
+directly to the field laptop, plus one motor ESP32 for steering.
 
-## 1. Hardware overview
+The older two-ESP32 sensor-module path is not the maintained installation. It
+is retained in history only.
 
-The system uses two ESP32 DevKit modules connected to a field laptop via USB.
-There is no WiFi, no buck converter, and no external power supply beyond the
-laptop USB ports and a 12V battery for the steering motor.
-
-### Components
+## 1. Hardware Overview
 
 | Component | Purpose |
-|-----------|---------|
-| ESP32 #1 (Sensor Module) | Reads wheel angle sensor, BNO055 IMU, GPS passthrough |
-| ESP32 #2 (Motor Controller) | Drives IBT-2 H-bridge for steering motor |
-| Quectel LC29H DA (on ArduSimple board) | GPS receiver, NMEA output at 1Hz |
-| BNO055 breakout | 9DOF IMU for roll/pitch/heading |
-| 10kΩ potentiometer | Wheel angle sensor (WAS) |
-| IBT-2 H-bridge module | Motor driver for steering motor |
-| 12V battery | Steering motor power (direct to IBT-2) |
-| Field laptop (Dell Latitude 7390 2-in-1) | Runs PC guidance software |
+| --- | --- |
+| Field laptop / tablet | Runs the Rust guidance app. |
+| Quectel LC29H BA on ArduSimple board | Tractor GNSS, heading, velocity, roll, and pitch. |
+| ESP32 DevKit running `firmware-motor-pio` | Reads wheel angle sensor and drives the steering motor. |
+| Wheel angle sensor | Reports actual steering angle to the motor ESP32. |
+| IBT-2 / BTS7960 H-bridge | Drives the steering motor. |
+| Steering motor | Turns the steering wheel or steering column mechanism. |
 
----
+The laptop has two USB serial devices:
 
-## 2. Wiring
+- LC29H BA direct USB serial for GPS / attitude data.
+- Motor ESP32 USB serial for FINN steering commands and telemetry.
 
-### 2.1 ESP32 #1 — Sensor Module
+## 2. Maintained Data Flow
 
-Connect via USB-A cable to laptop.
+```text
+LC29H BA -> PC app
+  GGA: position and fix metadata, 1 Hz on current NR11 firmware
+  PQTMINS: heading, velocity, roll, and pitch, 10 Hz
 
-| ESP32 GPIO | Connect to | Notes |
-|------------|-----------|-------|
-| GPIO 34 | WAS pot wiper (middle pin) | ADC input, 0–3.3V |
-| GPIO 33 | WAS pot pin 1 (high side) | Set HIGH at boot = 3.3V reference |
-| GND | WAS pot pin 3 (low side) | Completes pot circuit |
-| GPIO 21 | BNO055 SDA | I2C data, 3.3V logic |
-| GPIO 22 | BNO055 SCL | I2C clock, 3.3V logic |
-| GPIO 16 | ArduSimple TX (3.3V header) | GPS NMEA into ESP32 |
-| GPIO 17 | ArduSimple RX (3.3V header) | Config commands to GPS |
-| VIN (5V) | ArduSimple 5V | Powers GPS module |
-| GND | Common ground | Shared across all devices |
+PC app -> Motor ESP32
+  FINNSTEER: target wheel angle, motor limits, engage state
 
-**WAS pot wiring detail:**
-
-```
-GPIO 33 (3.3V HIGH) ──► Pot pin 1
-                         Pot wiper ──► GPIO 34 (ADC)
-                         Pot pin 3 ──► GND
+Motor ESP32 -> PC app
+  FINNMTR / FINNACK: wheel angle, PWM, config acknowledgements, heartbeat
 ```
 
-Use shielded two-core microphone cable (XLR cable) for the pot connection
-between the ESP32 and the steering column:
+There is no separate sensor ESP32 in the maintained tractor stack. Wheel angle
+sensor readings come from the motor ESP32.
 
-- Core 1 → 3.3V (GPIO 33)
-- Core 2 → Wiper signal (GPIO 34)
-- Shield → GND
+## 3. Motor ESP32 Wiring
 
-Terminate the shield at the ESP32 end only to avoid ground loops.
-
-**BNO055 wiring:**
-
-| BNO055 pin | Connect to |
-|------------|-----------|
-| VIN | ESP32 3V3 pin |
-| GND | ESP32 GND |
-| SDA | ESP32 GPIO 21 |
-| SCL | ESP32 GPIO 22 |
-
-No external pull-up resistors needed for short cable runs — the ESP32 internal
-pull-ups are sufficient.
-
-**GPS wiring — IMPORTANT:**
-
-Use the **3.3V serial header** on the ArduSimple board, NOT the 5V header.
-The ESP32 GPIO pins are 3.3V logic and connecting to a 5V serial output will
-damage them. The ArduSimple board has clearly labelled 3.3V and 5V headers.
-
-### 2.2 ESP32 #2 — Motor Controller
-
-Connect via USB-B cable to laptop.
+Connect the motor ESP32 to the laptop by USB.
 
 | ESP32 GPIO | Connect to | Notes |
-|------------|-----------|-------|
-| GPIO 25 | IBT-2 RPWM | PWM for steer right |
-| GPIO 26 | IBT-2 LPWM | PWM for steer left |
-| GPIO 27 | IBT-2 R_EN | Right enable, HIGH to run |
-| GPIO 14 | IBT-2 L_EN | Left enable, HIGH to run |
-| VIN (5V) | IBT-2 VCC | Powers IBT-2 logic |
-| GND | IBT-2 GND | Shared ground |
+| --- | --- | --- |
+| GPIO 34 | WAS wiper | ADC input, 0-3.3 V only. |
+| GPIO 33 | WAS high side | 3.3 V reference controlled by firmware. |
+| GND | WAS low side | Common sensor ground. |
+| GPIO 25 | IBT-2 RPWM | PWM for one motor direction. |
+| GPIO 26 | IBT-2 LPWM | PWM for the other motor direction. |
+| GPIO 27 | IBT-2 R_EN | Enable line. |
+| GPIO 14 | IBT-2 L_EN | Enable line. |
+| VIN / 5V | IBT-2 VCC | Logic supply only. |
+| GND | IBT-2 GND | Shared logic ground. |
 
-**IBT-2 motor supply:**
+IBT-2 motor supply:
 
 | IBT-2 terminal | Connect to |
-|----------------|-----------|
-| B+ | 12V battery positive |
-| B- | 12V battery negative / chassis ground |
-| M+ | Steering motor terminal 1 |
-| M- | Steering motor terminal 2 |
+| --- | --- |
+| B+ | Motor supply positive. |
+| B- | Motor supply negative / chassis ground. |
+| M+ | Steering motor terminal 1. |
+| M- | Steering motor terminal 2. |
 
-The motor supply (12V) is completely separate from the logic supply (5V from
-ESP32 VIN). They share a common ground.
+Keep motor power wiring sized for the steering motor current. Keep low-voltage
+signal wiring physically separate from motor power wiring where practical.
 
-### 2.3 Power distribution
+## 4. GPS Connection
 
-```
-Laptop USB-A ──► ESP32 #1 (sensor)
-                   ├── 3V3 pin  → BNO055 VIN
-                   ├── GPIO 33  → WAS pot high side (3.3V)
-                   └── VIN (5V) → ArduSimple GPS board
+Connect the LC29H BA / ArduSimple board directly to the field laptop by USB.
 
-Laptop USB-B ──► ESP32 #2 (motor controller)
-                   └── VIN (5V) → IBT-2 logic VCC
+The guidance app auto-detects the GPS serial port unless a specific port is
+configured. Current LC29H BA NR11 firmware is expected to keep GGA position at
+1 Hz while providing 10 Hz attitude/velocity through PQTMINS. That split is
+normal for this stack.
 
-12V Battery  ──► IBT-2 B+/B- (motor supply, high current)
-```
+Do not route the BA through an ESP32 sensor module for the current tractor
+installation.
 
-No buck converter is needed. Both ESP32s are USB-powered from the laptop.
-The 5V on the VIN pins back-feeds to the GPS and IBT-2 logic. This has been
-bench-tested and confirmed working.
+## 5. PC Software
 
----
-
-## 3. PC software installation
-
-### 3.1 Prerequisites
-
-Install the Rust toolchain on the field laptop:
+Install Rust from https://rustup.rs, then build the app:
 
 ```bash
-# Install rustup (Rust toolchain manager)
-# Download from https://rustup.rs or run:
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Verify installation
-rustup --version
-cargo --version
-```
-
-### 3.2 Clone and build
-
-```bash
-git clone <your-repo-url> finn-guidance
+git clone https://github.com/Rockatansky93/finn-guidance.git
 cd finn-guidance
-
-# Build the PC guidance application (release mode for performance)
-cargo build --release
+cargo build --release -p finn-guidance-pc
 ```
 
-The first build downloads and compiles all dependencies. Subsequent builds are
-fast (a few seconds for code-only changes).
-
-### 3.3 Run the PC application
+Run it:
 
 ```bash
-cargo run --release
+cargo run --release -p finn-guidance-pc
 ```
 
-The application will auto-detect the GPS receiver on whichever COM port it
-appears on. No manual port configuration is needed.
+For Linux serial permissions and desktop notes, see
+[`LINUX_INSTALLATION_GUIDE.md`](LINUX_INSTALLATION_GUIDE.md).
 
----
+## 6. Flash Motor Firmware
 
-## 4. ESP32 firmware installation
-
-The ESP32 firmware uses Arduino/PlatformIO (C++). Each ESP32 module has its own
-PlatformIO project directory.
-
-### 4.1 Install PlatformIO
-
-This is a one-time setup on whichever machine you use for flashing (can be the
-field laptop or a separate development PC).
-
-```bash
-# Install PlatformIO CLI
-pip install platformio
-
-# Verify installation
-pio --version
-```
-
-PlatformIO will automatically download the ESP32 Arduino framework (~200MB) on
-the first build. No additional toolchain installation is needed.
-
-### 4.2 Flash the Sensor Module (ESP32 #1)
-
-Plug in **only** ESP32 #1 via USB so PlatformIO can auto-detect the correct port.
-
-```bash
-cd finn-guidance/firmware-sensor-pio
-
-# Build and flash
-pio run --target upload
-
-# Open a serial monitor to verify output (Ctrl+C to exit)
-pio device monitor
-```
-
-You should see output like:
-
-```
-FINN Sensor Module starting...
-GPIO 33 set HIGH — WAS pot powered (3.3V)
-ADC1 CH6 (GPIO 34) configured — WAS input
-I2C0 configured — SDA=21, SCL=22, 400kHz
-BNO055 initialised in NDOF mode
-UART2 configured — RX=16, TX=17, 115200 baud (GPS)
-All peripherals initialised. Entering main loop.
-$FINNWAS,2048,1650*4A
-$FINNIMU,1.2,-0.5,182.3,3,3,2,1*3B
-$GPGGA,123456.00,3402.1234,S,13845.6789,E,1,12,0.8,234.5,M,...*XX
-$FINNHB,2000*1C
-```
-
-If the BNO055 is not connected, you will see a warning but the firmware
-continues running and sends WAS and GPS data:
-
-```
-BNO055: no response on I2C
-BNO055 init failed — IMU data will be zeros. Check wiring.
-```
-
-### 4.3 Flash the Motor Controller (ESP32 #2)
-
-Unplug ESP32 #1. Plug in **only** ESP32 #2.
+Install PlatformIO, then flash the maintained motor firmware:
 
 ```bash
 cd finn-guidance/firmware-motor-pio
-
-# Build and flash
 pio run --target upload
+```
 
-# Open a serial monitor to verify output (Ctrl+C to exit)
+Open the serial monitor if you need to confirm startup:
+
+```bash
 pio device monitor
 ```
 
-You should see status messages at 5Hz:
+Expected behavior:
 
-```
-FINN Motor Controller starting...
-IBT-2 enable lines LOW (motor disabled)
-PWM configured — RPWM=GPIO25, LPWM=GPIO26, 20kHz 8-bit
-All peripherals initialised. Entering main loop.
-$FINNMTR,0,0,200*XX
-$FINNMTR,0,0,400*XX
-```
+- The motor ESP32 sends heartbeat / motor telemetry.
+- The PC app finds the motor port.
+- The motor watchdog holds PWM at zero until valid steering commands arrive.
 
-The motor stays disabled (PWM=0, enabled=0) until it receives a valid steer
-command.
+## 7. Bench Checks Before Field Use
 
-### 4.4 Specifying a COM port
+Before engaging auto-steer in the field:
 
-If auto-detection fails (e.g. multiple serial devices connected), specify the
-port explicitly:
+1. Confirm the app can see GPS fixes from the LC29H BA.
+2. Confirm the app can see the motor ESP32.
+3. Calibrate wheel angle sensor centre, left lock, and right lock.
+4. Confirm actual wheel angle moves in the expected direction.
+5. Confirm PWM goes to zero when the app is closed or steering is disengaged.
+6. Confirm motor direction with the wheels off the ground or with a safe test
+   setup before applying force in the paddock.
 
-```bash
-# Windows
-pio run --target upload --upload-port COM3
-pio device monitor --port COM3
+## 8. Roll Calibration
 
-# Linux
-pio run --target upload --upload-port /dev/ttyUSB0
-pio device monitor --port /dev/ttyUSB0
-```
+Manual roll calibration is present in the app and still needs field validation
+on the current tractor build.
 
-To find available ports on Windows, check Device Manager under
-"Ports (COM & LPT)", or run `mode` in a terminal.
+Procedure:
 
-### 4.5 First build downloads the framework
+1. Park on flat, level ground.
+2. Open Setup -> ROLL CORRECTION.
+3. Wait for the live roll reading to settle.
+4. Press Capture Level.
+5. On a known cross-slope, check whether `roll_corr_m` moves cross-track error
+   toward zero.
+6. If the correction pushes the line the wrong way, toggle roll direction once
+   and test again.
 
-The first `pio run` for each firmware project downloads the ESP32 Arduino
-framework (~200MB) and compiles it. This takes a few minutes. Subsequent builds
-only recompile your code and take seconds.
+Keep telemetry enabled for this validation run if practical.
 
-### 4.6 Modifying firmware
+## 9. Troubleshooting
 
-The firmware source files are:
+### GPS opens but position appears to update at 1 Hz
 
-- `firmware-sensor-pio/src/main.cpp` — sensor module
-- `firmware-motor-pio/src/main.cpp` — motor controller
+This is expected on the current LC29H BA NR11 firmware. GGA position is 1 Hz;
+PQTMINS supplies 10 Hz heading, velocity, roll, and pitch. The app interpolates
+between position fixes.
 
-After editing, rebuild and flash with `pio run --target upload` from the
-relevant project directory.
+### Log says PAIR050 was not acknowledged
 
----
+That usually means the LC29H BA firmware does not accept the requested GGA rate
+change. It is not a reason to stop field work if GGA and PQTMINS are both
+arriving.
 
-## 5. Serial protocol reference
+### Auto-steer will not engage
 
-All communication between the ESP32 modules and the PC is text-based NMEA-style.
-You can debug any connection with a standard serial monitor (PuTTY, the Arduino
-serial monitor, or `pio device monitor`).
+Check:
 
-### 5.1 Sensor Module → PC (USB-A)
+- AB line loaded.
+- Motor ESP32 detected.
+- Wheel angle sensor calibrated.
+- GPS fix available.
+- Current speed is above the steering speed gate.
 
-| Sentence | Fields | Rate |
-|----------|--------|------|
-| `$GPGGA,...*XX` | GPS position (passthrough from LC29H) | 1Hz |
-| `$GPVTG,...*XX` | GPS velocity (passthrough from LC29H) | 1Hz |
-| `$FINNWAS,<raw_adc>,<voltage_mv>*XX` | Wheel angle sensor | 20Hz |
-| `$FINNIMU,<roll>,<pitch>,<heading>,<cal_sys>,<cal_gyro>,<cal_accel>,<cal_mag>*XX` | BNO055 IMU | 20Hz |
-| `$FINNHB,<uptime_ms>*XX` | Heartbeat | Every 2s |
+### WAS data lost
 
-**WAS fields:** `raw_adc` is 0–4095 (12-bit), `voltage_mv` is 0–3300.
+Check the motor ESP32 USB cable, the WAS wiring, and the motor firmware serial
+output. In the maintained tractor stack, WAS data comes from the motor ESP32,
+not a separate sensor ESP32.
 
-**IMU fields:** angles in degrees, calibration values 0–3 (3 = fully calibrated).
+### Wheels turn the wrong way
 
-### 5.2 PC → Motor Controller (USB-B)
-
-| Sentence | Fields | Rate |
-|----------|--------|------|
-| `$FINNSTEER,<pwm_value>*XX` | Steer command | ~20Hz from PID |
-
-`pwm_value` ranges from -255 (full left) to +255 (full right). 0 = stop.
-
-### 5.3 Motor Controller → PC (USB-B)
-
-| Sentence | Fields | Rate |
-|----------|--------|------|
-| `$FINNMTR,<current_pwm>,<enabled>,<uptime_ms>*XX` | Motor status | 5Hz |
-
-`enabled` is 1 (motor active) or 0 (motor disabled by watchdog or startup).
-
-### 5.4 Checksum
-
-All `$FINN*` sentences use standard NMEA XOR checksum: XOR every byte between
-`$` and `*`, rendered as two uppercase hex digits. Same algorithm used by GPS
-sentences.
-
-### 5.5 Safety: motor watchdog
-
-The motor controller stops the motor (PWM=0, enable lines LOW) if no valid
-`$FINNSTEER` command is received within 500ms. This means:
-
-- If the PC application crashes, the motor stops
-- If the USB cable is unplugged, the motor stops
-- If the serial connection hangs, the motor stops
-
-The motor re-enables automatically when valid commands resume.
-
----
-
-## 6. Testing and verification
-
-### 6.1 Bench test — sensor module
-
-1. Flash `firmware-sensor-pio` and open `pio device monitor`
-2. Verify `$FINNWAS` values change when you turn the pot
-3. Verify `$FINNIMU` heading changes when you rotate the BNO055
-4. Verify `$GPGGA` sentences appear (GPS needs sky view or will show no-fix)
-5. Verify `$FINNHB` appears every 2 seconds
-
-### 6.2 Bench test — motor controller
-
-1. Flash `firmware-motor-pio` and open `pio device monitor`
-2. Verify `$FINNMTR,0,0,...` status messages (motor disabled)
-3. In a second terminal, open the same COM port and send:
-   `$FINNSTEER,100*2B` (calculate correct checksum)
-4. Motor should spin in one direction
-5. Send `$FINNSTEER,-100*54`
-6. Motor should reverse
-7. Stop sending commands — motor should stop within 500ms (watchdog)
-
-### 6.3 Bench test — full system
-
-1. Plug both ESP32s into the laptop
-2. Run the PC guidance application: `cargo run --release`
-3. Verify GPS fix appears in the status bar
-4. Verify WAS and IMU readings appear in the SENSORS section (Setup page)
-5. Verify motor status shows "Motor ESP32 connected" in MOTOR TEST section
-
-### 6.4 WAS calibration
-
-1. With both ESP32s connected and the app running, go to Setup page
-2. Scroll to WAS CALIBRATION section
-3. Turn the steering wheel so wheels are straight → press "Set Centre"
-4. Turn to full left lock → press "Set Left Lock"
-5. Turn to full right lock → press "Set Right Lock"
-6. Status should show "Calibrated" with L/C/R values (e.g. L:1617 C:1832 R:2031)
-7. Verify the calibrated angle in the SENSORS section reads ~0° when straight
-
-### 6.5 Motor direction
-
-1. Go to Setup → MOTOR TEST section
-2. Press the +50 preset button
-3. Observe which way the wheels turn
-4. If wheels turn RIGHT: direction is correct (no change needed)
-5. If wheels turn LEFT: go to MOTOR DIRECTION and press "Invert Motor Direction"
-6. Re-test to confirm +50 PWM now steers RIGHT
-
-### 6.6 Auto-steer
-
-After WAS calibration and motor direction are confirmed:
-
-1. Load or create an AB line
-2. Drive onto the line at working speed (>2 km/h)
-3. Tap ⊕ AUTO-STEER on the working page
-4. For tuning guidance, see `docs/STEERING_TUNING_GUIDE.md`
-
----
-
-## 7. Troubleshooting
-
-**`pio run` fails with "No device found":**
-Check that the ESP32 is plugged in. Try a different USB cable — some cables are
-charge-only with no data lines. Check Device Manager for new COM ports when you
-plug in.
-
-**`pio run` fails to download the ESP32 framework:**
-Check your internet connection. The first build downloads ~200MB. Retry if it
-times out.
-
-**BNO055 not responding (`no response on I2C`):**
-Check SDA/SCL wiring (GPIO 21/22). Ensure the BNO055 board is powered from the
-ESP32 3V3 pin (not 5V). Check that the AD0 pin on the BNO055 is not pulled high
-(default address 0x28 assumes AD0 low).
-
-**GPS shows no fix (`$GPGGA` with empty position fields):**
-The GPS needs clear sky view. It will not get a fix indoors. For bench testing
-the passthrough, the empty-position sentences confirm the wiring is correct.
-
-**WAS reads 0 or 4095 constantly:**
-Check that GPIO 33 is connected to the pot high side and GND to the low side.
-Verify with a multimeter that there is ~3.3V across the pot terminals. If the
-readings are noisy, check the shield termination on the mic cable.
-
-**Motor doesn't respond to steer commands:**
-Verify the checksum in your `$FINNSTEER` command is correct. Check that
-`$FINNMTR` shows `enabled=1` after sending a command. If it stays at 0, the
-command parsing is failing — check for correct `$` prefix and `*XX` suffix.
-
-**Motor runs but immediately stops:**
-The 500ms watchdog requires continuous commands. For manual testing, send
-commands in a loop or increase `WATCHDOG_TIMEOUT_MS` temporarily in the firmware.
-
-**Auto-steer disengages with "WAS data lost":**
-The WAS timeout triggers after 5 seconds without a `$FINNWAS` reading. Check
-the USB cable from the sensor ESP32 — vibration in the tractor cab can cause
-intermittent connections. Try a shorter cable or secure the connection with tape.
-Brief dropouts (under 2 seconds) are tolerated with a warning (amber indicator).
-
-**Auto-steer disengages with "GPS fix lost":**
-The GPS fix timeout is 2 seconds. Check the GPS antenna connection and ensure
-clear sky view. Passing under trees or near large metal structures can cause
-momentary fix loss.
-
-**Wheels don't straighten when returning to line:**
-Ensure the WAS calibration is correct (check SENSORS section — the calibrated
-angle should read 0° ±2° when wheels are straight). The inner loop uses WAS
-feedback to drive wheels back to the target angle. If the WAS reading is wrong,
-the inner loop can't straighten the wheels.
-
-**AUTO-STEER button is greyed out:**
-All four preconditions must be met: (1) AB line loaded, (2) Motor ESP32
-connected, (3) WAS centre calibrated, (4) WAS left and right lock calibrated.
-Check each in the Setup page.
-
-**Multiple serial devices causing auto-detect issues:**
-Use `--upload-port COMx` (Windows) or `--upload-port /dev/ttyUSBx` (Linux) to
-specify the port explicitly. See section 4.4.
-
-**ESP32 not detected on any COM port:**
-Try a different USB cable — some cables are charge-only with no data lines.
-Check Device Manager for new COM ports when you plug in. Some ESP32 DevKit
-boards use a CP2102 or CH340 USB-serial chip that may need a driver installed.
+Disengage immediately. Use the motor direction control in Setup, then repeat a
+slow bench test before field use.

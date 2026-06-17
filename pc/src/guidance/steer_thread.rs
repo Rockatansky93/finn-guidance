@@ -477,10 +477,7 @@ pub fn run_steer_thread(
                                             }
                                         }
                                         Err(e) => {
-                                            tracing::warn!(
-                                                "Failed to send WASCNT update: {}",
-                                                e
-                                            );
+                                            tracing::warn!("Failed to send WASCNT update: {}", e);
                                         }
                                     }
                                 }

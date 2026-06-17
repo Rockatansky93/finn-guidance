@@ -354,12 +354,15 @@ impl GuidanceApp {
                         guide.load_ab_line(line.a_lat, line.a_lon, line.b_lat, line.b_lon);
                         current_line_id = Some(line_id);
                         // Restore persisted nudge and pass number for this line
-                        if let Some(nudge_str) = db_ref.get_config(&format!("nudge_m:{}", line_id)) {
+                        if let Some(nudge_str) = db_ref.get_config(&format!("nudge_m:{}", line_id))
+                        {
                             if let Ok(nudge) = nudge_str.parse::<f64>() {
                                 guide.nudge_m = nudge;
                             }
                         }
-                        if let Some(pass_str) = db_ref.get_config(&format!("pass_number:{}", line_id)) {
+                        if let Some(pass_str) =
+                            db_ref.get_config(&format!("pass_number:{}", line_id))
+                        {
                             if let Ok(pass) = pass_str.parse::<i32>() {
                                 guide.pass_number = pass;
                                 guide.pass_offset_m = guide.pass_spacing() * pass as f64;
@@ -822,7 +825,10 @@ impl GuidanceApp {
                 // On return passes, swap left/right so buttons match the cab perspective.
                 let step_m = self.nudge_step_cm as f64 / 100.0;
                 let step_label = self.nudge_step_cm.to_string();
-                let is_return = self.current_error.as_ref().map_or(false, |e| e.is_return_pass);
+                let is_return = self
+                    .current_error
+                    .as_ref()
+                    .map_or(false, |e| e.is_return_pass);
                 if ui
                     .add(
                         egui::Button::new(
@@ -832,7 +838,11 @@ impl GuidanceApp {
                     )
                     .clicked()
                 {
-                    if is_return { self.guide.nudge_right(step_m); } else { self.guide.nudge_left(step_m); }
+                    if is_return {
+                        self.guide.nudge_right(step_m);
+                    } else {
+                        self.guide.nudge_left(step_m);
+                    }
                     self.sync_guide_to_steer_thread();
                     self.persist_nudge_and_pass();
                 }
@@ -843,7 +853,11 @@ impl GuidanceApp {
                     )
                     .clicked()
                 {
-                    if is_return { self.guide.nudge_right(0.01); } else { self.guide.nudge_left(0.01); }
+                    if is_return {
+                        self.guide.nudge_right(0.01);
+                    } else {
+                        self.guide.nudge_left(0.01);
+                    }
                     self.sync_guide_to_steer_thread();
                     self.persist_nudge_and_pass();
                 }
@@ -881,7 +895,11 @@ impl GuidanceApp {
                     )
                     .clicked()
                 {
-                    if is_return { self.guide.nudge_left(0.01); } else { self.guide.nudge_right(0.01); }
+                    if is_return {
+                        self.guide.nudge_left(0.01);
+                    } else {
+                        self.guide.nudge_right(0.01);
+                    }
                     self.sync_guide_to_steer_thread();
                     self.persist_nudge_and_pass();
                 }
@@ -894,7 +912,11 @@ impl GuidanceApp {
                     )
                     .clicked()
                 {
-                    if is_return { self.guide.nudge_left(step_m); } else { self.guide.nudge_right(step_m); }
+                    if is_return {
+                        self.guide.nudge_left(step_m);
+                    } else {
+                        self.guide.nudge_right(step_m);
+                    }
                     self.sync_guide_to_steer_thread();
                     self.persist_nudge_and_pass();
                 }

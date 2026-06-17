@@ -5,12 +5,40 @@
 > Updated at the end of each working session.
 
 ## Last updated
-Session 30 — 30 May 2026 (AB-line sign-convention consolidation +
-manual roll calibration; Decision #029)
+Session 31 — 30 May 2026 (Phase 1 unification docs, release channels, and
+LC29H BA log wording)
 
 ## What we're working on
 **Seeding is underway.** Development changes must be stable and not break
 what's working.
+
+**Session 31 — Phase 1 unification cleanup (30 May 2026):**
+
+The Phase 1 code has been committed to GitHub, but the field laptop is
+intentionally still running the older working build until the tractor can be
+tested. That keeps rollback simple if the newer changes misbehave.
+
+Non-field-test Phase 1 items completed:
+- Current hardware direction documented in `docs/HARDWARE_ARCHITECTURE.md`:
+  LC29H BA direct to laptop plus motor ESP32 inner loop.
+- Coverage handover documented in `docs/COVERAGE_OWNERSHIP.md`: guidance owns
+  coverage now; `finn-pilot` becomes primary coverage authority only after
+  shaft-speed and implement-state validation.
+- Release channels documented in `docs/RELEASE_CHANNELS.md`: field
+  prototype/internal, public lightbar, auto-steer experimental, and pilot /
+  implement experimental.
+- Installation guide rewritten around the maintained one-ESP32 tractor stack.
+- Misleading LC29H BA NR11 PAIR050 log line changed so it no longer implies
+  10 Hz GGA may have been applied.
+
+Telemetry decision for now: keep the runtime default conservative until the
+delayed field test is complete. Enable telemetry for validation runs where
+practical, especially roll calibration and cross-slope checks, then revisit
+whether any release channel should force telemetry on by default.
+
+Still pending from Phase 1:
+- Field-test manual roll calibration.
+- Confirm `roll_corr_m` improves cross-slope behavior.
 
 **Session 30 — AB-line sign cleanup + manual roll calibration (30 May 2026):**
 
@@ -181,11 +209,10 @@ FT8 Finding 5 ("GPS effective rate is ~1-2Hz, not 10Hz") was therefore
 not a bug — it was the actual hardware behaviour. The interpolator was
 already handling it correctly. This finding can be marked resolved.
 
-**TODO**: change the misleading log line in `ensure_module_config()`
-from "No ack for 10Hz (may still be applied)" to something honest like
-"PAIR050 not acknowledged by LC29H BA NR11; 10Hz position not supported
-on this firmware — PQTMINS provides 10Hz attitude/velocity, GGA stays
-at 1Hz by design". Save the next debugger an hour.
+**Resolved in Session 31**: the misleading log line in
+`ensure_module_config()` no longer says "may still be applied". It now makes
+the LC29H BA NR11 behavior explicit: GGA remains 1 Hz while PQTMINS provides
+10 Hz attitude/velocity.
 
 ### Field observation — auto-steer working in real seeding
 
@@ -246,7 +273,7 @@ with drop-on-full) holds up well in active use. Specifically:
   908 came up clean and started receiving fixes within 1.2 seconds.
 
 ### Pending
-- [ ] Tidy the misleading "may still be applied" log line (TODO above)
+- [x] Tidy the misleading "may still be applied" log line (done in Session 31)
 - [x] Mark FT8 Finding 5 as resolved ("by-design hardware behaviour,
       not a bug") — resolved; captured in Decision #030
 - [ ] Consider whether to remove the PAIR050 send entirely on LC29H BA

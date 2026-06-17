@@ -9,6 +9,11 @@
 >
 > Use `codesnip:edit_snippet` for all code changes. Never rewrite entire files.
 
+> **Historical note:** this file contains the original phased build plan and
+> older hardware assumptions. For the maintained tractor hardware direction,
+> read `docs/HARDWARE_ARCHITECTURE.md` first: LC29H BA direct to the laptop plus
+> the motor ESP32 inner loop.
+
 ## Overview
 
 Build a Rust-based GPS guidance system for agricultural equipment in phases,

@@ -291,8 +291,7 @@ impl NmeaState {
             && effective_roll.abs() > 0.1
         // Skip tiny effective roll (< 0.1°)
         {
-            let mut lateral_offset_m =
-                self.antenna_height_m * effective_roll.to_radians().sin();
+            let mut lateral_offset_m = self.antenna_height_m * effective_roll.to_radians().sin();
             if self.roll_invert {
                 lateral_offset_m = -lateral_offset_m;
             }
@@ -301,8 +300,7 @@ impl NmeaState {
             // right) is corrected leftward; a negative one shifts right
             // (apply_offset handles negative distance as a reversed bearing).
             let correction_bearing = normalise_heading(corrected_heading - 90.0);
-            let (clat, clon) =
-                apply_offset(lat, lon, correction_bearing, lateral_offset_m);
+            let (clat, clon) = apply_offset(lat, lon, correction_bearing, lateral_offset_m);
             (clat, clon, lateral_offset_m)
         } else {
             (lat, lon, 0.0)
@@ -416,10 +414,7 @@ mod tests {
     /// Mirror of the correction magnitude computed in `try_build_fix`.
     fn roll_corr(state: &NmeaState) -> f64 {
         let effective_roll = state.smoothed_roll - state.roll_offset_deg;
-        if !state.has_ins_attitude
-            || state.antenna_height_m <= 0.0
-            || effective_roll.abs() <= 0.1
-        {
+        if !state.has_ins_attitude || state.antenna_height_m <= 0.0 || effective_roll.abs() <= 0.1 {
             return 0.0;
         }
         let mut lateral = state.antenna_height_m * effective_roll.to_radians().sin();
@@ -433,11 +428,13 @@ mod tests {
     fn roll_correction_basic_magnitude() {
         let mut state = NmeaState::new();
         state.antenna_height_m = 3.0;
-        state.parse_pqtmins(
-            "$PQTMINS,1,1,0,0,0,0,0,0,10.00,0.00,0.00*00",
-        );
+        state.parse_pqtmins("$PQTMINS,1,1,0,0,0,0,0,0,10.00,0.00,0.00*00");
         // 3.0 * sin(10°) ≈ 0.5209 m, positive (right-side-down → shift left)
-        assert!((roll_corr(&state) - 0.5209).abs() < 0.001, "got {}", roll_corr(&state));
+        assert!(
+            (roll_corr(&state) - 0.5209).abs() < 0.001,
+            "got {}",
+            roll_corr(&state)
+        );
     }
 
     #[test]
@@ -447,22 +444,26 @@ mod tests {
         let mut state = NmeaState::new();
         state.antenna_height_m = 3.0;
         state.roll_offset_deg = 2.0;
-        state.parse_pqtmins(
-            "$PQTMINS,1,1,0,0,0,0,0,0,2.00,0.00,0.00*00",
+        state.parse_pqtmins("$PQTMINS,1,1,0,0,0,0,0,0,2.00,0.00,0.00*00");
+        assert!(
+            roll_corr(&state).abs() < 1e-9,
+            "bias not cancelled: {}",
+            roll_corr(&state)
         );
-        assert!(roll_corr(&state).abs() < 1e-9, "bias not cancelled: {}", roll_corr(&state));
 
         // A real 5° lean on top of the 2° bias → effective 3° of correction.
-        state.parse_pqtmins(
-            "$PQTMINS,1,1,0,0,0,0,0,0,5.00,0.00,0.00*00",
-        );
+        state.parse_pqtmins("$PQTMINS,1,1,0,0,0,0,0,0,5.00,0.00,0.00*00");
         // Note: smoothed_roll is EMA'd, so seed a fresh state for an exact check.
         let mut fresh = NmeaState::new();
         fresh.antenna_height_m = 3.0;
         fresh.roll_offset_deg = 2.0;
         fresh.parse_pqtmins("$PQTMINS,1,1,0,0,0,0,0,0,5.00,0.00,0.00*00");
         let expected = 3.0 * (3.0_f64).to_radians().sin();
-        assert!((roll_corr(&fresh) - expected).abs() < 0.001, "got {}", roll_corr(&fresh));
+        assert!(
+            (roll_corr(&fresh) - expected).abs() < 0.001,
+            "got {}",
+            roll_corr(&fresh)
+        );
     }
 
     #[test]
@@ -476,8 +477,12 @@ mod tests {
         inverted.roll_invert = true;
         inverted.parse_pqtmins("$PQTMINS,1,1,0,0,0,0,0,0,8.00,0.00,0.00*00");
 
-        assert!((roll_corr(&normal) + roll_corr(&inverted)).abs() < 1e-9,
-            "invert should negate: {} vs {}", roll_corr(&normal), roll_corr(&inverted));
+        assert!(
+            (roll_corr(&normal) + roll_corr(&inverted)).abs() < 1e-9,
+            "invert should negate: {} vs {}",
+            roll_corr(&normal),
+            roll_corr(&inverted)
+        );
         assert!(roll_corr(&normal) > 0.0);
     }
 

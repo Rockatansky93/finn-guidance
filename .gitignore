@@ -17,6 +17,8 @@
 .idea/
 *.swp
 *.swo
+__pycache__/
+*.pyc
 
 # OS
 .DS_Store

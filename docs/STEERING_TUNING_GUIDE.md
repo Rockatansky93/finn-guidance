@@ -144,7 +144,7 @@ What each value tells you:
 | H: | Heading error from line bearing | Should be near 0° when tracking well, large during approach |
 
 **Green overlay** = normal operation.
-**Amber overlay** = WAS data is stale (no reading for >2 seconds). The system continues steering using the last known wheel angle. Usually a brief serial hiccup — it should recover. If it stays amber for more than a few seconds, check the sensor ESP32 USB cable.
+**Amber overlay** = WAS data is stale (no reading for >2 seconds). The system continues steering using the last known wheel angle. Usually a brief serial hiccup — it should recover. If it stays amber for more than a few seconds, check the motor ESP32 USB cable and WAS wiring.
 
 
 ## Safety Systems
@@ -153,7 +153,7 @@ The controller will automatically disengage and send PWM 0 if:
 
 - **GPS fix lost** — no real GPS fix for more than 2 seconds. The amber status message will show "Auto-steer OFF: GPS fix lost". Check GPS antenna connection and sky view.
 
-- **WAS data lost** — no wheel angle reading for more than 5 seconds. Brief dropouts (under 2 seconds) are tolerated with a warning. Extended loss means the sensor ESP32 has disconnected.
+- **WAS data lost** — no wheel angle reading for more than 5 seconds. Brief dropouts (under 2 seconds) are tolerated with a warning. Extended loss means the motor ESP32 has stopped sending WAS telemetry or the WAS wiring has failed.
 
 - **Manual disengage** — tap ⊗ STEER OFF at any time. This is always available, no matter what state the system is in.
 
@@ -170,7 +170,7 @@ After a safety disengage, you can re-engage immediately by tapping ⊕ AUTO-STEE
 This is the heading error problem. The tractor approaches at an angle, XTE hits zero, wheels straighten, but the tractor keeps going at that angle. Check H: in the overlay — if it's large (>5°) when the tractor crosses the line, you need more Kh. Increase by 0.1 at a time. If Kh is already at 0, that's the problem — it should be at least 0.3–0.5.
 
 **"Auto-steer OFF: WAS data lost" keeps triggering**
-The WAS timeout was increased to 5 seconds to handle brief serial hiccups. If it still triggers, check the USB cable from the sensor ESP32 — vibration in the tractor cab can cause intermittent connections. Try a shorter cable or secure the connection with tape.
+The WAS timeout was increased to 5 seconds to handle brief serial hiccups. If it still triggers, check the USB cable from the motor ESP32 and inspect the WAS wiring. Vibration in the tractor cab can cause intermittent connections. Try a shorter cable or secure the connection with tape.
 
 **Tractor weaves side to side**
 Outer loop Kp is too high. Reduce by 5 at a time until the oscillation stops. With standalone GPS, 15-25 is often the practical ceiling.

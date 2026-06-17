@@ -468,7 +468,11 @@ mod tests {
     fn on_line_reads_zero() {
         let g = guide();
         let e = g.calculate_error(&fix_at(MID_LAT, A_LON, FWD)).unwrap();
-        assert!(e.distance_m.abs() < 0.05, "on-line XTE was {}", e.distance_m);
+        assert!(
+            e.distance_m.abs() < 0.05,
+            "on-line XTE was {}",
+            e.distance_m
+        );
         assert!(!e.is_return_pass);
     }
 
@@ -499,7 +503,11 @@ mod tests {
 
         assert!(!fwd.is_return_pass);
         assert!(ret.is_return_pass);
-        assert!(ret.distance_m > 0.0, "return XTE should flip to +, was {}", ret.distance_m);
+        assert!(
+            ret.distance_m > 0.0,
+            "return XTE should flip to +, was {}",
+            ret.distance_m
+        );
         assert!(
             (fwd.distance_m + ret.distance_m).abs() < 1e-6,
             "forward/return XTE should be equal & opposite: {} vs {}",
@@ -507,14 +515,22 @@ mod tests {
             ret.distance_m
         );
         // Heading error stays small on the return pass (bearing flipped 180°).
-        assert!(ret.heading_error.abs() < 1.0, "return heading_error {}", ret.heading_error);
+        assert!(
+            ret.heading_error.abs() < 1.0,
+            "return heading_error {}",
+            ret.heading_error
+        );
     }
 
     #[test]
     fn signed_line_offset_is_direction_independent() {
         let g = guide();
-        let off_fwd = g.signed_line_offset(&fix_at(MID_LAT, LON_EAST, FWD)).unwrap();
-        let off_ret = g.signed_line_offset(&fix_at(MID_LAT, LON_EAST, RET)).unwrap();
+        let off_fwd = g
+            .signed_line_offset(&fix_at(MID_LAT, LON_EAST, FWD))
+            .unwrap();
+        let off_ret = g
+            .signed_line_offset(&fix_at(MID_LAT, LON_EAST, RET))
+            .unwrap();
         assert!(
             (off_fwd - off_ret).abs() < 1e-9,
             "signed_line_offset must not depend on heading: {} vs {}",
@@ -537,7 +553,11 @@ mod tests {
         let shift = g.align_grid_to_position(&fix);
         assert!(shift.is_some());
         let e = g.calculate_error(&fix).unwrap();
-        assert!(e.distance_m.abs() < 1e-6, "post-align XTE was {}", e.distance_m);
+        assert!(
+            e.distance_m.abs() < 1e-6,
+            "post-align XTE was {}",
+            e.distance_m
+        );
     }
 
     #[test]
@@ -601,7 +621,10 @@ mod tests {
         let after_right = g.nudge_m;
         g.nudge_left(0.5); // back to zero
         assert!(g.nudge_m.abs() < 1e-9);
-        assert!(after_right < 0.0, "nudge_right should move toward -offset side");
+        assert!(
+            after_right < 0.0,
+            "nudge_right should move toward -offset side"
+        );
     }
 
     #[test]
@@ -639,7 +662,10 @@ mod tests {
         let mut g = guide();
         let mut fix = fix_at(MID_LAT, LON_EAST, FWD);
         fix.speed = 0.0;
-        assert!(g.update_auto_pass(&fix).is_none(), "must not snap at standstill");
+        assert!(
+            g.update_auto_pass(&fix).is_none(),
+            "must not snap at standstill"
+        );
     }
 
     #[test]
@@ -661,7 +687,11 @@ mod tests {
         let new_pass = g.snap_to_nearest_pass(&fix);
         assert_eq!(new_pass, Some(-1));
         assert_eq!(g.pass_number, -1);
-        assert!(g.nudge_m.abs() < 1e-9, "nudge should be cleared, was {}", g.nudge_m);
+        assert!(
+            g.nudge_m.abs() < 1e-9,
+            "nudge should be cleared, was {}",
+            g.nudge_m
+        );
         // Residual XTE is the operator's offset from the nearest row: ≤ half a spacing.
         let e = g.calculate_error(&fix).unwrap();
         assert!(e.distance_m.abs() <= g.pass_spacing() / 2.0 + 0.01);

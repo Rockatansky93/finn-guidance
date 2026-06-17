@@ -197,8 +197,8 @@ impl WasCentreLearner {
 
             // Clamp to manual_centre ± MAX_OFFSET_FROM_MANUAL.
             let lo = (self.manual_centre as i32 - MAX_OFFSET_FROM_MANUAL).max(0) as f64;
-            let hi = (self.manual_centre as i32 + MAX_OFFSET_FROM_MANUAL).min(u16::MAX as i32)
-                as f64;
+            let hi =
+                (self.manual_centre as i32 + MAX_OFFSET_FROM_MANUAL).min(u16::MAX as i32) as f64;
             let clamped = new_f.clamp(lo, hi);
 
             self.learned_centre_f = clamped;

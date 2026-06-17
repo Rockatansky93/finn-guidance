@@ -10,7 +10,7 @@ coverage recording, and closed-loop auto-steer.
 
 ```text
 PC / tablet running Rust app
-  - reads GPS NMEA from USB serial
+  - reads LC29H BA GGA/PQTMINS from USB serial
   - parses FINN motor telemetry from USB serial
   - displays field view and guidance in egui
   - stores jobs, fields, AB lines, config, and coverage in SQLite
@@ -23,6 +23,10 @@ Motor ESP32 running PlatformIO/Arduino firmware
   - closes the inner steering loop
   - enforces motor watchdog safety
 ```
+
+The maintained tractor hardware direction is LC29H BA direct to the laptop plus
+one motor ESP32. The older separate sensor ESP32 path is retained only as
+reference material.
 
 ## Project Structure
 
@@ -38,9 +42,10 @@ finn-guidance/
     src/coverage/             SQLite coverage/job/field storage
     src/position/             position tracking and interpolation
     src/telemetry/            steering telemetry logs
-  firmware-motor-pio/         ESP32 motor controller firmware
-  firmware-sensor-pio/        older ESP32 sensor firmware, retained for reference
+  firmware-motor-pio/         maintained ESP32 motor controller firmware
+  firmware-sensor-pio/        archived older ESP32 sensor firmware reference
   docs/                       installation, tuning, context, and design notes
+  scripts/upload_field_run.py summarize and register field-run logs in Core
 ```
 
 ## Status
@@ -59,9 +64,26 @@ Main implemented features:
 - motor ESP32 serial protocol and watchdog-aware steering commands
 - closed-loop steering work in progress
 
-See [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) and
-[docs/ACTIVE_CONTEXT.md](docs/ACTIVE_CONTEXT.md) for the latest field-test
-state and next work.
+See [docs/ACTIVE_CONTEXT.md](docs/ACTIVE_CONTEXT.md) for the latest field-test
+state and next work. The main Phase 1 architecture docs are:
+
+- [Current hardware architecture](docs/HARDWARE_ARCHITECTURE.md)
+- [Coverage ownership](docs/COVERAGE_OWNERSHIP.md)
+- [Release channels](docs/RELEASE_CHANNELS.md)
+- [Implementation plan](docs/IMPLEMENTATION_PLAN.md)
+
+## FINN Core Upload
+
+After a run, the field laptop can register the latest steering telemetry and
+coverage database summary with FINN Core:
+
+```bash
+python scripts/upload_field_run.py --core-url http://<core-pc>:8000 --field-name "North paddock"
+```
+
+The command keeps full files on the laptop and stores local file URIs plus
+summaries in Core, where analysis tasks and the field-run dashboard can use
+them.
 
 ## Hardware
 
@@ -74,9 +96,14 @@ state and next work.
 
 ### GPS Receiver
 
-- Quectel LC29H on ArduSimple board
-- NMEA output: GGA and VTG
+- Quectel LC29H BA on ArduSimple board
+- Direct USB serial connection to the laptop
+- GGA position/fix metadata at 1 Hz on current NR11 firmware
+- PQTMINS heading, velocity, roll, and pitch at 10 Hz
 - RTK corrections via NTRIP for centimetre-level accuracy
+
+The LC29H DA path is fine for future implement-side `finn-pilot` work, but the
+tractor auto-steer stack should be treated as BA-critical.
 
 ### Motor Controller
 

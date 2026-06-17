@@ -191,11 +191,14 @@ mod tests {
         // the direction of travel → positive XTE.
         let xtd = cross_track_distance_local(
             -33.5, 138.6001, // point slightly east
-            -33.0, 138.6,    // A (north)
-            -34.0, 138.6,    // B (south)
+            -33.0, 138.6, // A (north)
+            -34.0, 138.6, // B (south)
         );
         // At -33.5° latitude, 0.0001° longitude ≈ 9.3m
-        assert!(xtd > 5.0 && xtd < 15.0, "Local XTD was {xtd}m, expected ~9m");
+        assert!(
+            xtd > 5.0 && xtd < 15.0,
+            "Local XTD was {xtd}m, expected ~9m"
+        );
     }
 
     #[test]
@@ -204,13 +207,13 @@ mod tests {
         // This is the key advantage over the spherical formula.
         let xtd_mid = cross_track_distance_local(
             -33.5, 138.6001, // midpoint, slightly east
-            -33.0, 138.6,    // A
-            -34.0, 138.6,    // B
+            -33.0, 138.6, // A
+            -34.0, 138.6, // B
         );
         let xtd_past = cross_track_distance_local(
             -36.0, 138.6001, // well past B, same east offset
-            -33.0, 138.6,    // A
-            -34.0, 138.6,    // B
+            -33.0, 138.6, // A
+            -34.0, 138.6, // B
         );
         // On an infinite line, the XTE at the same longitude offset should be
         // essentially the same regardless of how far along the line we are.
