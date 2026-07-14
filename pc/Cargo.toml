@@ -3,6 +3,8 @@ name = "finn-guidance-pc"
 version = "0.1.0"
 edition = "2021"
 description = "FINN Guidance PC application - GPS, guidance display, and steering control"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Rockatansky93/finn-guidance"
 
 [dependencies]
 finn-guidance-common = { path = "../common" }

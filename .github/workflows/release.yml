@@ -1,0 +1,109 @@
+name: Release
+
+# Builds finn-guidance-pc for Windows and Linux and attaches the binaries
+# to a GitHub Release whenever a version tag (v0.1.0, v0.2.0, ...) is pushed.
+#
+# Usage:
+#   git tag v0.1.0
+#   git push origin v0.1.0
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build (Windows x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release -p finn-guidance-pc
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = "${env:GITHUB_REF_NAME}"
+          New-Item -ItemType Directory -Path package | Out-Null
+          Copy-Item target/release/finn-guidance-pc.exe package/finn-guidance.exe
+          Copy-Item README.md package/
+          if (Test-Path LICENSE) { Copy-Item LICENSE package/ }
+          Compress-Archive -Path package/* -DestinationPath "finn-guidance-$version-windows-x64.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: finn-guidance-*-windows-x64.zip
+
+  build-linux:
+    name: Build (Linux x64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        # libudev/pkg-config for the serialport crate,
+        # the rest for eframe/egui (winit + glow backends).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libudev-dev \
+            libgtk-3-dev libxkbcommon-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libssl-dev
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release -p finn-guidance-pc
+
+      - name: Package
+        run: |
+          version="${GITHUB_REF_NAME}"
+          mkdir package
+          cp target/release/finn-guidance-pc package/finn-guidance
+          cp README.md package/
+          [ -f LICENSE ] && cp LICENSE package/
+          tar -czf "finn-guidance-${version}-linux-x64.tar.gz" -C package .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: finn-guidance-*-linux-x64.tar.gz
+
+  release:
+    name: Create GitHub Release
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            finn-guidance-*-windows-x64.zip
+            finn-guidance-*-linux-x64.tar.gz
+          generate_release_notes: true
+          draft: false
+          prerelease: false
