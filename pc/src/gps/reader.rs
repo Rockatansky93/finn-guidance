@@ -102,11 +102,115 @@ pub fn new_shared_roll_invert(initial: bool) -> SharedRollInvert {
     Arc::new(AtomicBool::new(initial))
 }
 
+/// How long to listen on each port (per baud) before giving up and moving on.
+/// This is a hard wall-clock bound so a single quiet or misbehaving port can
+/// never stall the whole scan.
+const PROBE_WINDOW: Duration = Duration::from_millis(2500);
+
+/// Baud rates to try when sniffing, in addition to the caller's configured
+/// rate. 115200 is the LC29H BA default; 9600 is the common factory fallback
+/// on units that have never been configured.
+const PROBE_BAUDS: &[u32] = &[115200, 9600];
+
+/// Outcome of probing a single port at a single baud rate.
+enum ProbeResult {
+    /// Saw GPS NMEA markers ($G / $PAIR / $PQTM).
+    Gps,
+    /// Saw a FINN motor sentence — this is the motor ESP32, not the GPS.
+    MotorEsp32,
+    /// Port opened but nothing recognisable arrived within the probe window.
+    NoData,
+    /// Could not open the port (busy, permission denied, etc.).
+    OpenFailed(String),
+}
+
+fn describe_port(t: &SerialPortType) -> String {
+    match t {
+        SerialPortType::UsbPort(info) => {
+            format!("USB ({})", info.product.as_deref().unwrap_or("unknown"))
+        }
+        SerialPortType::PciPort => "PCI".to_string(),
+        SerialPortType::BluetoothPort => "Bluetooth".to_string(),
+        SerialPortType::Unknown => "Unknown".to_string(),
+    }
+}
+
+/// Listen on a single port for up to `PROBE_WINDOW`, scanning the raw byte
+/// stream for GPS NMEA markers ($G / $PAIR / $PQTM) or the motor marker
+/// ($FINN).
+///
+/// IMPORTANT: this deliberately does NOT use `BufRead::lines()`.
+/// `lines()` / `read_line()` require valid UTF-8 and block until a newline
+/// arrives. During a sniff we routinely see partial lines, wrong-baud garbage
+/// (non-UTF-8), and — worst of all — devices that stream bytes with no `\n`
+/// at all. Against such a stream `read_line()` never returns, so the old
+/// `for line in reader.lines()` loop would block on that one port forever and
+/// the scan would appear to "probe one port and find nothing". Reading raw
+/// bytes with a wall-clock deadline makes every port take a bounded amount of
+/// time regardless of what it emits.
+fn probe_port_for_gps(port_name: &str, baud_rate: u32) -> ProbeResult {
+    let mut port = match serialport::new(port_name, baud_rate)
+        .timeout(Duration::from_millis(200))
+        .open()
+    {
+        Ok(p) => p,
+        Err(e) => return ProbeResult::OpenFailed(e.to_string()),
+    };
+
+    let deadline = std::time::Instant::now() + PROBE_WINDOW;
+    let mut acc = String::new();
+    let mut buf = [0u8; 512];
+
+    while std::time::Instant::now() < deadline {
+        match port.read(&mut buf) {
+            Ok(0) => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(n) => {
+                // Lossy decode is fine: NMEA markers are ASCII, so they survive
+                // even if surrounding bytes are garbage from a baud mismatch.
+                acc.push_str(&String::from_utf8_lossy(&buf[..n]));
+                // Keep only the tail so the scan stays cheap on chatty ports,
+                // while still spanning read boundaries (a marker split across
+                // two reads is preserved because we never clear mid-window).
+                if acc.len() > 4096 {
+                    let cut = acc.len() - 4096;
+                    acc.drain(..cut);
+                }
+                // Check motor first: a FINN port must be skipped, not claimed.
+                if acc.contains("$FINNMTR") || acc.contains("$FINNACK") {
+                    return ProbeResult::MotorEsp32;
+                }
+                if acc.contains("$G") || acc.contains("$PAIR") || acc.contains("$PQTM") {
+                    return ProbeResult::Gps;
+                }
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                // Expected when the port is momentarily quiet. Keep waiting
+                // until the wall-clock deadline instead of bailing out.
+                continue;
+            }
+            Err(_) => {
+                // Genuine read error (device unplugged, etc.) — stop this port.
+                break;
+            }
+        }
+    }
+
+    ProbeResult::NoData
+}
+
 /// Scan all available serial ports and return the first one that produces
 /// GPS NMEA data (not FINN motor sentences).
 ///
-/// Strategy: open each port, read for up to 2 seconds, check for $G prefixed
-/// lines. Skip any port that sends $FINNMTR (motor ESP32).
+/// Strategy: enumerate every port, then for each port listen for up to
+/// `PROBE_WINDOW` (raw bytes, hard time bound) looking for $G/$PAIR/$PQTM.
+/// Ports emitting $FINN are the motor ESP32 and are skipped. If nothing is
+/// found at the configured baud, the whole scan is retried at the fallback
+/// baud rates in `PROBE_BAUDS`.
 fn auto_detect_gps_port(baud_rate: u32) -> Option<String> {
     let ports = match serialport::available_ports() {
         Ok(p) => p,
@@ -117,79 +221,80 @@ fn auto_detect_gps_port(baud_rate: u32) -> Option<String> {
     };
 
     if ports.is_empty() {
-        tracing::warn!("No serial ports found on this system");
+        tracing::warn!(
+            "No serial ports found on this system — is the GPS USB cable plugged \
+             in and is the USB-serial driver installed?"
+        );
         return None;
     }
 
-    tracing::info!("Scanning {} serial port(s) for GPS module...", ports.len());
+    // Log the full port list up front so field logs show exactly what the OS
+    // exposed. If this shows only one COM port, the GPS isn't enumerating and
+    // the problem is a cable/driver issue, not the scanner.
+    let inventory: Vec<String> = ports
+        .iter()
+        .map(|p| format!("{} [{}]", p.port_name, describe_port(&p.port_type)))
+        .collect();
+    tracing::info!(
+        "Found {} serial port(s): {}",
+        ports.len(),
+        inventory.join(", ")
+    );
 
-    // Sort: USB ports first
+    // Sort: USB ports first (the GPS is a USB-serial device).
     let mut sorted_ports = ports;
     sorted_ports.sort_by_key(|p| match &p.port_type {
         SerialPortType::UsbPort(_) => 0,
         _ => 1,
     });
 
-    for port_info in &sorted_ports {
-        let port_name = &port_info.port_name;
-        let type_desc = match &port_info.port_type {
-            SerialPortType::UsbPort(info) => {
-                format!("USB ({})", info.product.as_deref().unwrap_or("unknown"))
-            }
-            SerialPortType::PciPort => "PCI".to_string(),
-            SerialPortType::BluetoothPort => "Bluetooth".to_string(),
-            SerialPortType::Unknown => "Unknown".to_string(),
-        };
-
-        tracing::info!("  Probing {} [{}]...", port_name, type_desc);
-
-        let port = match serialport::new(port_name, baud_rate)
-            .timeout(Duration::from_millis(500))
-            .open()
-        {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!("    Could not open {}: {}", port_name, e);
-                continue;
-            }
-        };
-
-        let reader = BufReader::new(port);
-        let mut found_nmea = false;
-        let mut is_motor_esp32 = false;
-
-        for line in reader.lines().take(40) {
-            match line {
-                Ok(sentence) => {
-                    if sentence.starts_with("$FINNMTR") || sentence.starts_with("$FINNACK") {
-                        tracing::info!("    {} is motor ESP32 (saw $FINN) — skipping", port_name);
-                        is_motor_esp32 = true;
-                        break;
-                    }
-                    if sentence.starts_with("$G")
-                        || sentence.starts_with("$PAIR")
-                        || sentence.starts_with("$PQTM")
-                    {
-                        if !found_nmea {
-                            tracing::info!("    Found GPS NMEA on {}", port_name);
-                            found_nmea = true;
-                        }
-                    }
-                }
-                Err(_) => continue,
-            }
-        }
-
-        if found_nmea && !is_motor_esp32 {
-            tracing::info!("    GPS module detected on {}", port_name);
-            return Some(port_name.clone());
-        }
-
-        if !found_nmea && !is_motor_esp32 {
-            tracing::debug!("    No NMEA data on {}", port_name);
+    // Build the baud list: caller's configured rate first, then fallbacks.
+    let mut bauds: Vec<u32> = vec![baud_rate];
+    for &b in PROBE_BAUDS {
+        if !bauds.contains(&b) {
+            bauds.push(b);
         }
     }
 
+    for &baud in &bauds {
+        tracing::info!(
+            "Scanning {} port(s) at {} baud...",
+            sorted_ports.len(),
+            baud
+        );
+        for port_info in &sorted_ports {
+            let port_name = &port_info.port_name;
+            tracing::info!(
+                "  Probing {} @ {} baud [{}]...",
+                port_name,
+                baud,
+                describe_port(&port_info.port_type)
+            );
+
+            match probe_port_for_gps(port_name, baud) {
+                ProbeResult::Gps => {
+                    tracing::info!("    GPS module detected on {} @ {} baud", port_name, baud);
+                    return Some(port_name.clone());
+                }
+                ProbeResult::MotorEsp32 => {
+                    tracing::info!("    {} is motor ESP32 (saw $FINN) — skipping", port_name);
+                }
+                ProbeResult::NoData => {
+                    tracing::debug!("    No recognisable data on {} @ {} baud", port_name, baud);
+                }
+                ProbeResult::OpenFailed(e) => {
+                    tracing::debug!("    Could not open {}: {}", port_name, e);
+                }
+            }
+        }
+    }
+
+    tracing::warn!(
+        "Scanned all ports at {:?} with no GPS NMEA seen. If the module LED is \
+         on, check: the COM port isn't held open by another app, the USB-serial \
+         driver is installed, and the module's baud rate.",
+        bauds
+    );
     None
 }
 

@@ -17,7 +17,7 @@ use crate::telemetry::SharedDropCounters;
 use crossbeam_channel::Sender;
 use finn_guidance_common::protocol::{self, FinnMessage};
 use serialport::{self, SerialPortType};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -102,6 +102,61 @@ impl MotorHandle {
     }
 }
 
+/// How long to listen on each port before giving up. Hard wall-clock bound so
+/// a quiet or newline-less port can never stall the scan.
+const MOTOR_PROBE_WINDOW: Duration = Duration::from_millis(2500);
+
+/// Listen on a single port for up to `MOTOR_PROBE_WINDOW`, scanning the raw
+/// byte stream for a $FINN motor marker.
+///
+/// Like the GPS sniffer, this avoids `BufRead::lines()`: `read_line()` needs
+/// valid UTF-8 and blocks until a newline arrives, so a port that streams
+/// bytes without `\n` (or wrong-baud garbage) would hang the scan on that one
+/// port forever. Raw reads with a deadline keep every port bounded.
+fn probe_port_for_motor(port_name: &str, baud_rate: u32) -> Option<bool> {
+    let mut port = match serialport::new(port_name, baud_rate)
+        .timeout(Duration::from_millis(200))
+        .open()
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!("    Could not open {}: {}", port_name, e);
+            return None;
+        }
+    };
+
+    let deadline = std::time::Instant::now() + MOTOR_PROBE_WINDOW;
+    let mut acc = String::new();
+    let mut buf = [0u8; 512];
+
+    while std::time::Instant::now() < deadline {
+        match port.read(&mut buf) {
+            Ok(0) => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(n) => {
+                acc.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if acc.len() > 4096 {
+                    let cut = acc.len() - 4096;
+                    acc.drain(..cut);
+                }
+                if acc.contains("$FINNMTR") || acc.contains("$FINNACK") {
+                    return Some(true);
+                }
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+
+    Some(false)
+}
+
 /// Auto-detect the motor ESP32 serial port.
 ///
 /// Scans USB serial ports, skipping `exclude_port` (the GPS module).
@@ -129,33 +184,16 @@ fn auto_detect_motor_port(baud_rate: u32, exclude_port: &str) -> Option<String> 
 
         tracing::info!("  Probing {} for motor ESP32...", name);
 
-        let port = match serialport::new(name, baud_rate)
-            .timeout(Duration::from_millis(500))
-            .open()
-        {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!("    Could not open {}: {}", name, e);
-                continue;
+        match probe_port_for_motor(name, baud_rate) {
+            Some(true) => {
+                tracing::info!("    Found motor ESP32 on {}", name);
+                return Some(name.clone());
             }
-        };
-
-        let reader = BufReader::new(port);
-
-        for line in reader.lines().take(30) {
-            if let Ok(sentence) = line {
-                if sentence.starts_with("$FINNMTR") {
-                    tracing::info!(
-                        "    Found motor ESP32 on {} — {}",
-                        name,
-                        &sentence[..sentence.len().min(60)]
-                    );
-                    return Some(name.clone());
-                }
+            Some(false) => {
+                tracing::debug!("    No $FINNMTR on {}", name);
             }
+            None => { /* open failed — already logged */ }
         }
-
-        tracing::debug!("    No $FINNMTR on {}", name);
     }
 
     None
